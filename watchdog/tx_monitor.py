@@ -115,6 +115,7 @@ def monitor_tx(
             status_p = get_runtime_status_dir() / status_p.name
 
     while True:
+        ser = None
         try:
             # Open serial in a way that avoids DTR transitions (which reset many Arduino boards).
             # `serial.Serial(port=...)` may toggle DTR as part of open on some platforms/drivers.
@@ -304,6 +305,12 @@ def monitor_tx(
                     st.last_ms = ms
 
         except Exception as e:
+            # Clean up serial if open() succeeded but with ser: block wasn't entered
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
             now_ts = time.time()
             now_mono = time.monotonic()
             if (now_mono - st.last_missing_mono) >= emit_cooldown_s:
