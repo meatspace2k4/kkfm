@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aircheck</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0b0b0f;color:#f5f5f5;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;padding:1.5rem;}
+button{padding:15px 30px;font-size:1.2rem;border-radius:8px;border:0;cursor:pointer;background:#3b82f6;color:white;transition:background .2s;}
+button:hover{background:#2563eb;}
+button:disabled{background:#4b5563;cursor:not-allowed;}
+.status{margin-top:1rem;color:#9ca3af;font-size:.9rem;}
+</style>
+</head>
+<body>
+<h1>Aircheck</h1>
+<button id="playBtn">▶ Start Radio</button>
+<div id="status" class="status">Ready</div>
+<script>
+const workletCode = `
+class PCMProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.current = null;
+    this.offset = 0;
+    this.queue = [];
+    this.port.onmessage = (event) => {
+      if (event.data) this.queue.push(event.data);
+    };
+  }
+  process(inputs, outputs) {
+    const left = outputs[0][0];
+    const right = outputs[0][1];
+    for (let i = 0; i < left.length; i++) {
+      if (!this.current || this.offset >= this.current.length) {
+        if (this.queue.length === 0) {
+          left[i] = 0;
+          right[i] = 0;
+          continue;
+        }
+        this.current = this.queue.shift();
+        this.offset = 0;
+      }
+      left[i] = this.current[this.offset++];
+      right[i] = this.current[this.offset++];
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-processor', PCMProcessor);
+`;
+
+const btn = document.getElementById('playBtn');
+const status = document.getElementById('status');
+
+btn.onclick = async () => {
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.innerText = 'Connecting...';
+  try {
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+    
+    let pcmNode;
+    if (audioCtx.audioWorklet) {
+        const blob = new Blob([workletCode], { type: 'application/javascript' });
+        await audioCtx.audioWorklet.addModule(URL.createObjectURL(blob));
+        const workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor', { outputChannelCount: [2] });
+        workletNode.connect(audioCtx.destination);
+        pcmNode = workletNode;
+    } else {
+        console.warn('AudioWorklet not available, falling back to ScriptProcessorNode');
+        const scriptNode = audioCtx.createScriptProcessor(4096, 0, 2);
+        const queue = [];
+        let current = null;
+        let offset = 0;
+        
+        scriptNode.onaudioprocess = (e) => {
+            const left = e.outputBuffer.getChannelData(0);
+            const right = e.outputBuffer.getChannelData(1);
+            const len = left.length;
+            for (let i = 0; i < len; i++) {
+                if (!current || offset >= current.length) {
+                    if (queue.length === 0) {
+                        left[i] = 0;
+                        right[i] = 0;
+                        continue;
+                    }
+                    current = queue.shift();
+                    offset = 0;
+                }
+                left[i] = current[offset++];
+                right[i] = current[offset++];
+            }
+        };
+        scriptNode.connect(audioCtx.destination);
+        pcmNode = {
+            port: {
+                postMessage: (data) => {
+                    queue.push(data);
+                }
+            }
+        };
+    }
+
+    const response = await fetch('/stream');
+    if (!response.body) throw new Error('ReadableStream unsupported');
+    const reader = response.body.getReader();
+    status.innerText = 'Streaming…';
+    btn.innerText = 'Live';
+
+    let headerBytesRemaining = 44;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+
+      let chunk = value;
+      if (headerBytesRemaining > 0) {
+        if (chunk.byteLength <= headerBytesRemaining) {
+          headerBytesRemaining -= chunk.byteLength;
+          continue;
+        }
+        chunk = chunk.subarray(headerBytesRemaining);
+        headerBytesRemaining = 0;
+      }
+
+      const sampleCount = (chunk.byteLength >> 1);
+      const evenSamples = sampleCount & ~1;
+      if (evenSamples <= 0) continue;
+      const int16 = new Int16Array(chunk.buffer, chunk.byteOffset, evenSamples);
+      const floatChunk = new Float32Array(evenSamples);
+      for (let i = 0; i < evenSamples; i++) {
+        floatChunk[i] = int16[i] / 32768.0;
+      }
+      pcmNode.port.postMessage(floatChunk, [floatChunk.buffer]);
+    }
+  } catch (err) {
+    console.error(err);
+    status.innerText = 'Error: ' + err.message;
+    btn.disabled = false;
+    btn.innerText = '▶ Retry';
+  }
+};
+</script>
+</body>
+</html>
