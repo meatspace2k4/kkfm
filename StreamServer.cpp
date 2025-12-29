@@ -231,7 +231,11 @@ void StreamServer::send_index(int fd, bool head_only) {
         ss << f.rdbuf();
         payload = ss.str();
     } else {
-        log_error("Failed to load browser/index.html (cwd: " + std::string(get_current_dir_name()) + ")");
+        // get_current_dir_name() returns malloc'd memory; must free it
+        char* cwd = get_current_dir_name();
+        std::string cwd_str = cwd ? cwd : "(unknown)";
+        free(cwd);
+        log_error("Failed to load browser/index.html (cwd: " + cwd_str + ")");
         send_not_found(fd);
         return;
     }
