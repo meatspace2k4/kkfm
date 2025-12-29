@@ -10,6 +10,8 @@
 #include <iostream>
 #include <cstring>
 #include <cerrno>
+#include <mutex>
+#include <set>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -68,6 +70,11 @@ class StreamServer {
     std::thread accept_thread;
     int listen_fd;
     uint16_t port;
+
+    // Track active client file descriptors for graceful shutdown
+    std::mutex clients_mutex;
+    std::set<int> active_client_fds;
+    std::atomic<int> active_client_count{0};
 
 public:
     explicit StreamServer(PCMBuffer& buf)

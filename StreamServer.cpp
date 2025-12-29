@@ -53,6 +53,24 @@ void StreamServer::stop() {
         listen_fd = -1;
     }
     if (accept_thread.joinable()) accept_thread.join();
+
+    // Shutdown all active client sockets to unblock their threads
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        for (int fd : active_client_fds) {
+            ::shutdown(fd, SHUT_RDWR);
+        }
+    }
+
+    // Wait for all client handlers to finish (with timeout)
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (active_client_count.load() > 0) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            log_error("[WEB] Timeout waiting for client threads to finish");
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 }
 
 void StreamServer::accept_loop() {
@@ -70,6 +88,12 @@ void StreamServer::accept_loop() {
             log_error("[WEB] accept: " + std::string(std::strerror(errno)));
             continue;
         }
+        // Track client fd before spawning thread
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            active_client_fds.insert(client);
+        }
+        active_client_count.fetch_add(1);
         std::thread(&StreamServer::handle_client, this, client).detach();
     }
 }
@@ -101,12 +125,26 @@ bool StreamServer::handle_range_probe(int fd, const ByteRangeRequest& range) {
 }
 
 void StreamServer::handle_client(int client_fd) {
+    // RAII guard to ensure cleanup on all exit paths
+    struct ClientGuard {
+        StreamServer* server;
+        int fd;
+        ClientGuard(StreamServer* s, int f) : server(s), fd(f) {}
+        ~ClientGuard() {
+            ::close(fd);
+            {
+                std::lock_guard<std::mutex> lock(server->clients_mutex);
+                server->active_client_fds.erase(fd);
+            }
+            server->active_client_count.fetch_sub(1);
+        }
+    } guard(this, client_fd);
+
     configure_client_socket(client_fd);
     std::string method;
     std::string path;
     std::string headers;
     if (!read_request(client_fd, method, path, headers)) {
-        ::close(client_fd);
         return;
     }
     std::string range_value = get_header_value(headers, "Range");
@@ -122,7 +160,6 @@ void StreamServer::handle_client(int client_fd) {
         method = "GET";
     } else if (method != "GET") {
         send_not_found(client_fd);
-        ::close(client_fd);
         return;
     }
 
@@ -134,7 +171,6 @@ void StreamServer::handle_client(int client_fd) {
         send_index(client_fd, head_only);
     } else if (is_stream_path(path)) {
         if (!range_value.empty() && handle_range_probe(client_fd, range_req)) {
-            ::close(client_fd);
             return;
         }
         log_info(C_BLUE "[WEB] " C_RESET "Stream client " C_GREEN "connected" C_RESET);
@@ -143,7 +179,6 @@ void StreamServer::handle_client(int client_fd) {
     } else {
         send_not_found(client_fd);
     }
-    ::close(client_fd);
 }
 
 void StreamServer::configure_client_socket(int fd) {
