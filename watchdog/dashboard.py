@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import signal
 import subprocess
 import time
 import curses
@@ -16,6 +18,41 @@ import re
 import errno
 
 from .paths import get_runtime_status_dir
+
+
+# Track whether terminal needs restoration (for signal handlers)
+_terminal_active = False
+_original_terminal_settings = None
+
+
+def _restore_terminal() -> None:
+    """Restore terminal to normal state, safe to call multiple times."""
+    global _terminal_active, _original_terminal_settings
+    if not _terminal_active:
+        return
+    _terminal_active = False
+    try:
+        # Restore terminal settings if we saved them
+        if _original_terminal_settings is not None:
+            import termios
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _original_terminal_settings)
+    except Exception:
+        pass
+    try:
+        # Ensure cursor is visible and terminal is in normal mode
+        sys.stdout.write("\033[?25h")  # Show cursor
+        sys.stdout.write("\033[?1049l")  # Exit alternate screen buffer
+        sys.stdout.write("\033[0m")  # Reset attributes
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def _signal_handler(signum: int, frame: Any) -> None:
+    """Handle SIGTERM/SIGINT to restore terminal before exit."""
+    _restore_terminal()
+    # Re-raise as KeyboardInterrupt for clean exit from curses.wrapper
+    raise KeyboardInterrupt(f"Received signal {signum}")
 
 
 @dataclass
@@ -207,6 +244,36 @@ def _fmt_kv(label: str, val: Any, width: int) -> str:
 
 
 def run_dashboard(*, out_dir: str, refresh_s: float = 1.0, ssh_target: Optional[str] = None) -> int:
+    global _terminal_active, _original_terminal_settings
+
+    # Set up signal handlers for graceful terminal restoration
+    old_sigterm = signal.signal(signal.SIGTERM, _signal_handler)
+    old_sigint = signal.signal(signal.SIGINT, _signal_handler)
+    atexit.register(_restore_terminal)
+
+    # Save terminal settings before curses takes over
+    try:
+        import termios
+        _original_terminal_settings = termios.tcgetattr(sys.stdin.fileno())
+    except Exception:
+        _original_terminal_settings = None
+
+    _terminal_active = True
+
+    try:
+        return _run_dashboard_impl(
+            out_dir=out_dir,
+            refresh_s=refresh_s,
+            ssh_target=ssh_target,
+        )
+    finally:
+        _restore_terminal()
+        # Restore original signal handlers
+        signal.signal(signal.SIGTERM, old_sigterm)
+        signal.signal(signal.SIGINT, old_sigint)
+
+
+def _run_dashboard_impl(*, out_dir: str, refresh_s: float, ssh_target: Optional[str]) -> int:
     out_path = Path(out_dir)
     tx_status: Path = out_path / "tx_status.json"
     log_status: Path = out_path / "log_status.json"
