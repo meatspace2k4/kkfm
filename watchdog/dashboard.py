@@ -1440,6 +1440,24 @@ while True:
                 if not sorted_anomalies and y < max_y:
                     stdscr.addnstr(y, 4, "No anomalies detected. System healthy.", max(0, max_x - 5))
                 else:
+                    def word_wrap(text: str, width: int) -> list:
+                        """Split text into lines of at most `width` chars, breaking at word boundaries."""
+                        if width <= 0:
+                            return [text] if text else []
+                        lines = []
+                        while text:
+                            if len(text) <= width:
+                                lines.append(text)
+                                break
+                            # Find last space within width
+                            break_at = text.rfind(' ', 0, width + 1)
+                            if break_at <= 0:
+                                # No space found, hard break
+                                break_at = width
+                            lines.append(text[:break_at])
+                            text = text[break_at:].lstrip()
+                        return lines
+                    
                     for r in sorted_anomalies:
                         if y >= max_y: break
                         sev = r.get("severity", "info").lower()
@@ -1452,25 +1470,65 @@ while True:
                         else:
                             color = curses.color_pair(4)
                         
+                        # Format timestamp as 24h date/time
+                        ts = r.get("ts", 0)
+                        try:
+                            ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
+                        except Exception:
+                            ts_str = "??:??:??"
+                        
+                        code = r.get("code", "")
+                        msg = r.get("message", "")
+                        
+                        # Format: "HH:MM:SS SEVERITY CODE: message..."
+                        # Aligned like EVENT/BWAV/SIGN/COMM section (starts at col 4)
+                        # Timestamp (8 chars) : SEVERITY (8 chars) CODE: message
+                        stdscr.addnstr(y, 4, f"{ts_str:<8} ", max(0, max_x - 5))
+                        cur_x = stdscr.getyx()[1]
+                        
                         stdscr.attron(color | curses.A_BOLD)
-                        stdscr.addnstr(y, 1, f" {sev.upper():<8} ", max(0, max_x - 2))
+                        if cur_x < max_x:
+                            stdscr.addnstr(f"{sev.upper():<8} ", max(0, max_x - cur_x - 1))
                         stdscr.attroff(color | curses.A_BOLD)
                         
-                        try:
-                            cur_x = stdscr.getyx()[1]
-                            if cur_x < max_x:
-                                # Calculate age for display
-                                now_ts = time.time()
-                                ts = r.get("ts", 0)
-                                age = now_ts - ts
-                                age_str = f"{age:.0f}s ago" if age < 60 else f"{age/60:.0f}m ago"
-                                
-                                # If very old (> 5 mins), maybe dim it or mark as resolved? 
-                                # For now just show it as the last known state.
-                                stdscr.addnstr(f" {r.get('code')} (Last: {age_str}): {r.get('message')}", max(0, max_x - cur_x - 1))
-                        except curses.error:
-                            pass
-                        y += 1
+                        cur_x = stdscr.getyx()[1]
+                        # Code + message inline
+                        full_text = f"{code}: {msg}" if msg else code
+                        remaining_width = max(0, max_x - cur_x - 1)
+                        # Continuation lines: align with CODE start + 2 spaces indent
+                        cont_col = cur_x + 2
+                        cont_width = max(1, max_x - cont_col - 1)
+                        
+                        # First line uses remaining_width, continuation lines are indented
+                        if len(full_text) <= remaining_width:
+                            stdscr.addnstr(full_text, remaining_width)
+                            y += 1
+                        else:
+                            # Find word break for first line
+                            break_at = full_text.rfind(' ', 0, remaining_width + 1)
+                            if break_at <= 0:
+                                break_at = remaining_width
+                            stdscr.addnstr(full_text[:break_at], remaining_width)
+                            y += 1
+                            text_left = full_text[break_at:].lstrip()
+                            
+                            # Wrap remainder, indented from CODE start
+                            while text_left and y < max_y:
+                                line_to_print = ""
+                                if len(text_left) <= cont_width:
+                                    line_to_print = text_left
+                                    text_left = ""
+                                else:
+                                    brk = text_left.rfind(' ', 0, cont_width + 1)
+                                    if brk <= 0:
+                                        brk = cont_width
+                                    line_to_print = text_left[:brk]
+                                    text_left = text_left[brk:].lstrip()
+                                try:
+                                    stdscr.addstr(y, cont_col, line_to_print[:cont_width])
+                                except curses.error:
+                                    pass
+                                y += 1
 
                 stdscr.refresh()
                 time.sleep(max(0.1, float(refresh_s)))
