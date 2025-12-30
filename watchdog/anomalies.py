@@ -53,6 +53,9 @@ class AnomalyCode(str, Enum):
     TX_RECOVERY = "TX_RECOVERY"
     TX_SERIAL_ERROR = "TX_SERIAL_ERROR"
     TX_OVERMODULATION = "TX_OVERMODULATION"  # Audio level too high
+    TX_RESTART_ATTEMPT = "TX_RESTART_ATTEMPT"  # Watchdog attempting DTR reset
+    TX_RESTART_FAILED = "TX_RESTART_FAILED"  # Restart attempt did not restore audio
+    TX_RECOVERY_FAILED = "TX_RECOVERY_FAILED"  # All restart attempts exhausted (fault state)
 
     # Service log passthrough
     AIRCHECK_LOG_ERROR = "AIRCHECK_LOG_ERROR"

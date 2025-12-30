@@ -1037,7 +1037,20 @@ while True:
                                 audio_present = False
 
                         if telemetry_fresh:
-                            if audio_present:
+                            # Check for fault state first (highest priority display)
+                            # TODO: Maybe add distinct color/style for fault state?
+                            if tx.get("in_fault_state"):
+                                label = "FAULT"
+                                color = curses.color_pair(2)  # Red/error color
+                                last_tx_label = label
+                                last_tx_color = color
+                            elif tx.get("recovery_in_progress"):
+                                attempt = tx.get("recovery_attempt_count", 0)
+                                label = f"RECOVERING ({attempt})"
+                                color = curses.color_pair(3)  # Yellow/warn color
+                                last_tx_label = label
+                                last_tx_color = color
+                            elif audio_present:
                                 tx_silence_since_ts = None
                                 label = "AUDIO"
                                 color = curses.color_pair(1)

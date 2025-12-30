@@ -5,12 +5,13 @@ import time
 import json
 import os
 import uuid
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Callable
 from pathlib import Path
 
 from .anomalies import Anomaly, AnomalyCode, Severity
 from .paths import get_runtime_status_dir
+from .restart_tx_sketch import _reset_via_dtr, _reset_via_1200_baud_touch
 
 try:
     import serial  # type: ignore
@@ -38,6 +39,13 @@ class TxState:
     last_recover_mono: float = 0.0
     last_status_write_mono: float = 0.0
     last_overmod_mono: float = 0.0
+    # Auto-recovery state
+    recovery_attempt_count: int = 0
+    recovery_in_progress: bool = False
+    recovery_started_mono: float = 0.0
+    audio_present_streak: int = 0  # Consecutive audio-present telemetry lines
+    in_fault_state: bool = False  # True when all recovery attempts exhausted
+    last_restart_attempt_mono: float = 0.0
 
 
 def _mk(
@@ -48,6 +56,64 @@ def _mk(
     raw: Optional[str] = None,
 ) -> Anomaly:
     return Anomaly(code=code, severity=severity, ts=now_ts, message=message, raw=raw)
+
+
+# ---------------------------------------------------------------------------
+# Auto-recovery configuration
+# ---------------------------------------------------------------------------
+# After 30s of missing heartbeat (dead air threshold), attempt DTR reset.
+# Each reset attempt gets a grace window to confirm audio is flowing again.
+# We require 2 consecutive audio-present telemetry samples (~1-2s) to confirm.
+# After 3 failed attempts, enter fault state (emit TX_RECOVERY_FAILED CRITICAL).
+
+try:
+    TX_DEAD_AIR_THRESHOLD_S = float(os.environ.get("WATCHDOG_TX_DEAD_AIR_S", "30.0"))
+except Exception:
+    TX_DEAD_AIR_THRESHOLD_S = 30.0
+
+try:
+    TX_MAX_RESTART_ATTEMPTS = int(os.environ.get("WATCHDOG_TX_MAX_RESTART_ATTEMPTS", "3"))
+except Exception:
+    TX_MAX_RESTART_ATTEMPTS = 3
+
+try:
+    TX_RECOVERY_CONFIRM_WINDOW_S = float(os.environ.get("WATCHDOG_TX_RECOVERY_CONFIRM_S", "30.0"))
+except Exception:
+    TX_RECOVERY_CONFIRM_WINDOW_S = 30.0
+
+try:
+    TX_AUDIO_PRESENT_STREAK_REQUIRED = int(os.environ.get("WATCHDOG_TX_AUDIO_STREAK", "2"))
+except Exception:
+    TX_AUDIO_PRESENT_STREAK_REQUIRED = 2
+
+
+def _attempt_tx_reset(
+    port: str,
+    baudrate: int,
+    attempt_num: int,
+    out_cb: Callable[[Anomaly], None],
+) -> bool:
+    """Attempt to reset the TX Arduino. Returns True if reset command succeeded."""
+    now_ts = time.time()
+    
+    # Emit restart attempt anomaly
+    out_cb(
+        _mk(
+            AnomalyCode.TX_RESTART_ATTEMPT,
+            Severity.INFO,
+            now_ts,
+            message=f"Attempting TX Arduino reset (attempt {attempt_num}/{TX_MAX_RESTART_ATTEMPTS}) on {port}",
+        )
+    )
+    
+    # Try DTR reset first (works for Uno)
+    res = _reset_via_dtr(port=port, baudrate=baudrate, pulse_s=0.25)
+    if res.ok:
+        return True
+    
+    # Fallback to 1200-baud touch (works for Leonardo/Micro)
+    res = _reset_via_1200_baud_touch(port=port, pulse_s=0.25)
+    return res.ok
 
 
 def monitor_tx(
@@ -112,6 +178,35 @@ def monitor_tx(
     if status_p is not None and os.environ.get("WATCHDOG_STATUS_TO_DISK") != "1":
         sp = str(status_p)
         if not (sp.startswith("/run/") or sp.startswith("/dev/shm/") or sp.startswith("/tmp/")):
+            status_p = get_runtime_status_dir() / Path(status_path).name
+
+    # ---------------------------------------------------------------------------
+    # Restore fault state from previous tx_status.json (survives watchdog restart)
+    # ---------------------------------------------------------------------------
+    # If we were in fault state before restart, we should stay in fault state.
+    # The admin must either fix the issue or manually clear the state.
+    if status_p is not None:
+        try:
+            if status_p.exists():
+                prev_status = json.loads(status_p.read_text(encoding="utf-8").strip())
+                if prev_status.get("in_fault_state"):
+                    st.in_fault_state = True
+                    st.recovery_attempt_count = prev_status.get("recovery_attempt_count", TX_MAX_RESTART_ATTEMPTS)
+                    # Emit anomaly so admin sees fault state persisted across restart
+                    out_cb(
+                        _mk(
+                            AnomalyCode.TX_RECOVERY_FAILED,
+                            Severity.CRITICAL,
+                            time.time(),
+                            message=(
+                                f"TX fault state restored from previous session on {port}. "
+                                f"Previous recovery attempts: {st.recovery_attempt_count}. "
+                                f"Administrator intervention still required."
+                            ),
+                        )
+                    )
+        except Exception:
+            pass  # If we can't read previous state, start fresh
             status_p = get_runtime_status_dir() / status_p.name
 
     while True:
@@ -206,11 +301,10 @@ def monitor_tx(
                         if (now_mono - st.last_missing_mono) >= emit_cooldown_s:
                             st.last_missing_mono = now_mono
 
-                            # Escalate missing-telemetry severity; even short gaps are suspicious.
+                            # Escalate missing-telemetry severity; max severity is ERROR.
+                            # CRITICAL is reserved for TX_RECOVERY_FAILED (fault state).
                             missing_dur = now_mono - st.last_telem_mono
-                            if missing_dur >= 30.0:
-                                sev = Severity.CRITICAL
-                            elif missing_dur >= 10.0:
+                            if missing_dur >= 10.0:
                                 sev = Severity.ERROR
                             else:
                                 sev = Severity.WARN
@@ -226,6 +320,59 @@ def monitor_tx(
                                     ),
                                 )
                             )
+                        
+                        # ---------------------------------------------------------------------------
+                        # Auto-recovery: attempt DTR reset after sustained heartbeat failure
+                        # ---------------------------------------------------------------------------
+                        # Only attempt recovery if:
+                        # 1. Not already in fault state (all attempts exhausted)
+                        # 2. Not currently in a recovery confirmation window
+                        # 3. Missing heartbeat duration exceeds dead air threshold (30s)
+                        # 4. Haven't attempted a restart too recently (avoid rapid-fire resets)
+                        missing_dur = now_mono - st.last_telem_mono
+                        min_restart_interval = TX_RECOVERY_CONFIRM_WINDOW_S + 5.0  # Don't restart during confirmation
+                        
+                        if (
+                            not st.in_fault_state
+                            and not st.recovery_in_progress
+                            and missing_dur >= TX_DEAD_AIR_THRESHOLD_S
+                            and (now_mono - st.last_restart_attempt_mono) >= min_restart_interval
+                            and st.recovery_attempt_count < TX_MAX_RESTART_ATTEMPTS
+                        ):
+                            st.recovery_attempt_count += 1
+                            st.recovery_in_progress = True
+                            st.recovery_started_mono = now_mono
+                            st.last_restart_attempt_mono = now_mono
+                            st.audio_present_streak = 0
+                            
+                            # Close serial before reset attempt to release the port
+                            try:
+                                ser.close()
+                            except Exception:
+                                pass
+                            
+                            reset_ok = _attempt_tx_reset(port, baudrate, st.recovery_attempt_count, out_cb)
+                            
+                            if not reset_ok:
+                                # Reset command itself failed - log and continue to next attempt
+                                out_cb(
+                                    _mk(
+                                        AnomalyCode.TX_RESTART_FAILED,
+                                        Severity.ERROR,
+                                        time.time(),
+                                        message=(
+                                            f"TX restart attempt {st.recovery_attempt_count}/{TX_MAX_RESTART_ATTEMPTS} "
+                                            f"failed to execute on {port}"
+                                        ),
+                                    )
+                                )
+                                st.recovery_in_progress = False
+                            
+                            # Give sketch time to boot before re-opening serial
+                            time.sleep(2.0)
+                            
+                            # Re-open will happen in the outer exception handler / retry loop
+                            raise Exception("Restarting serial connection after TX reset attempt")
 
                     if line is None:
                         continue
@@ -246,6 +393,90 @@ def monitor_tx(
                     else:
                         audio_present = inlevel >= audio_inlevel_threshold
                         audio_present_kind = "level"
+
+                    # ---------------------------------------------------------------------------
+                    # Recovery confirmation: track audio presence after restart attempts
+                    # ---------------------------------------------------------------------------
+                    if st.recovery_in_progress:
+                        recovery_elapsed = now_mono - st.recovery_started_mono
+                        
+                        if audio_present:
+                            st.audio_present_streak += 1
+                            
+                            # Confirmed: N consecutive audio-present samples = recovery success
+                            if st.audio_present_streak >= TX_AUDIO_PRESENT_STREAK_REQUIRED:
+                                st.recovery_in_progress = False
+                                st.recovery_attempt_count = 0  # Reset for future failures
+                                st.audio_present_streak = 0
+                                out_cb(
+                                    _mk(
+                                        AnomalyCode.TX_RECOVERY,
+                                        Severity.INFO,
+                                        now_ts,
+                                        message=(
+                                            f"TX auto-recovery succeeded after DTR reset on {port} "
+                                            f"(audio confirmed with {TX_AUDIO_PRESENT_STREAK_REQUIRED} samples)"
+                                        ),
+                                    )
+                                )
+                        else:
+                            # Reset streak on any non-audio sample
+                            st.audio_present_streak = 0
+                            
+                            # Check if recovery confirmation window expired
+                            if recovery_elapsed >= TX_RECOVERY_CONFIRM_WINDOW_S:
+                                st.recovery_in_progress = False
+                                
+                                out_cb(
+                                    _mk(
+                                        AnomalyCode.TX_RESTART_FAILED,
+                                        Severity.ERROR,
+                                        now_ts,
+                                        message=(
+                                            f"TX restart attempt {st.recovery_attempt_count}/{TX_MAX_RESTART_ATTEMPTS} "
+                                            f"did not restore audio within {TX_RECOVERY_CONFIRM_WINDOW_S:.0f}s on {port}"
+                                        ),
+                                    )
+                                )
+                                
+                                # Check if all attempts exhausted -> enter fault state
+                                if st.recovery_attempt_count >= TX_MAX_RESTART_ATTEMPTS:
+                                    st.in_fault_state = True
+                                    out_cb(
+                                        _mk(
+                                            AnomalyCode.TX_RECOVERY_FAILED,
+                                            Severity.CRITICAL,
+                                            now_ts,
+                                            message=(
+                                                f"TX recovery failed after {TX_MAX_RESTART_ATTEMPTS} attempts on {port}. "
+                                                f"System in FAULT state. Administrator intervention required. "
+                                                f"Web streaming may still be operational."
+                                            ),
+                                        )
+                                    )
+                    
+                    # If audio naturally recovers while in fault state, clear fault
+                    # (allows admin to fix without watchdog restart, or self-healing)
+                    # TODO: Maybe require admin acknowledgment before clearing fault state?
+                    elif st.in_fault_state and audio_present:
+                        st.audio_present_streak += 1
+                        if st.audio_present_streak >= TX_AUDIO_PRESENT_STREAK_REQUIRED:
+                            st.in_fault_state = False
+                            st.recovery_attempt_count = 0
+                            st.audio_present_streak = 0
+                            out_cb(
+                                _mk(
+                                    AnomalyCode.TX_RECOVERY,
+                                    Severity.INFO,
+                                    now_ts,
+                                    message=(
+                                        f"TX audio naturally recovered on {port} after fault state. "
+                                        f"Fault state cleared."
+                                    ),
+                                )
+                            )
+                    elif st.in_fault_state:
+                        st.audio_present_streak = 0
 
                     # Heartbeat/status file for external monitoring.
                     # Keep write frequency low (SD wear); prefer a tmpfs path if possible.
@@ -271,6 +502,10 @@ def monitor_tx(
                                 # `overmod` is latched to avoid missing spikes between writes.
                                 "overmod": 1 if (now_mono - st.last_overmod_mono) <= overmod_hold_s else 0,
                                 "overmod_sample": over,
+                                # Fault state for dashboard display
+                                "in_fault_state": st.in_fault_state,
+                                "recovery_in_progress": st.recovery_in_progress,
+                                "recovery_attempt_count": st.recovery_attempt_count,
                             }
                             status_p.parent.mkdir(parents=True, exist_ok=True)
                             # Use a unique tmp name to avoid collisions across processes.
