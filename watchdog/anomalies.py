@@ -35,6 +35,11 @@ class AnomalyCode(str, Enum):
     DAC_RING_UNDERRUN = "DAC_RING_UNDERRUN"
     RADIO_DEAD_AIR = "RADIO_DEAD_AIR"
 
+    # Extended playback anomalies (for comprehensive testing)
+    PLAYBACK_STALL = "PLAYBACK_STALL"  # Audio position not advancing
+    VOLUME_SILENT = "VOLUME_SILENT"  # Output samples all zero
+    OVERLAY_TIMING_ERROR = "OVERLAY_TIMING_ERROR"  # Intro/song timing drift
+
     # Asset integrity
     FILE_ZERO_BYTES = "FILE_ZERO_BYTES"
     FILE_TOO_SMALL = "FILE_TOO_SMALL"
@@ -47,6 +52,7 @@ class AnomalyCode(str, Enum):
     TX_SKETCH_RESTART = "TX_SKETCH_RESTART"
     TX_RECOVERY = "TX_RECOVERY"
     TX_SERIAL_ERROR = "TX_SERIAL_ERROR"
+    TX_OVERMODULATION = "TX_OVERMODULATION"  # Audio level too high
 
     # Service log passthrough
     AIRCHECK_LOG_ERROR = "AIRCHECK_LOG_ERROR"
@@ -58,6 +64,9 @@ class AnomalyCode(str, Enum):
     AIRCHECK_AUTO_RESTARTED = "AIRCHECK_AUTO_RESTARTED"
     AIRCHECK_AUTO_RESTART_FAILED = "AIRCHECK_AUTO_RESTART_FAILED"
     AIRCHECK_AUTO_RESTART_SUPPRESSED = "AIRCHECK_AUTO_RESTART_SUPPRESSED"
+
+    # Test-injected anomalies (for E2E testing)
+    TEST_INJECTED = "TEST_INJECTED"  # Generic test anomaly
 
 
 @dataclass(frozen=True)
