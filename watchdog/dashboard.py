@@ -1495,7 +1495,7 @@ while True:
                         # Code + message inline
                         full_text = f"{code}: {msg}" if msg else code
                         remaining_width = max(0, max_x - cur_x - 1)
-                        # Continuation lines: align with CODE start + 2 spaces indent
+                        # Continuation lines: align with CODE start + 4 spaces indent
                         cont_col = cur_x + 2
                         cont_width = max(1, max_x - cont_col - 1)
                         
