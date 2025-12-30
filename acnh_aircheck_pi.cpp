@@ -3,11 +3,17 @@
  * can listen in real-time without needing a local audio device.
  */
 
+#ifndef KKFM_TEST_MODE
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstringop-overflow"
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 #pragma GCC diagnostic pop
+#else
+// Test mode: provide minimal stubs for miniaudio types
+#include "test_mocks.h"
+#endif
+
 #include "assets.h"
 #include "StreamServer.h"
 
@@ -1758,6 +1764,9 @@ const char* overlay_plan_name(OverlayPlan plan) {
 }
 
 class Radio {
+#ifdef UNIT_TEST
+public:  // Allow test access to private members in unit test mode
+#endif
     Mixer& mixer;
     CalendarManager calendar;
     TempoMap tempo;
@@ -1771,7 +1780,6 @@ class Radio {
         std::uniform_int_distribution<size_t> dist(0, count - 1);
         return &bin[dist(rng)];
     }
-
     std::shared_ptr<AudioCtx> get_ctx(const AssetMeta* meta) {
         if (!meta) return nullptr;
         auto it = ctx_cache.find(meta);

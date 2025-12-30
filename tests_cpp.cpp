@@ -6,11 +6,15 @@
 #include <memory>
 #include <stdexcept>
 
+// Enable test mode for compile-time mocking of audio hardware
+#define KKFM_TEST_MODE
+
 // Mock assets_blob for testing
 extern "C" { const uint8_t assets_blob[1024] = {0}; }
 
 #define UNIT_TEST
-#include "acnh_aircheck_pi_final.cpp"
+#include "acnh_aircheck_pi.cpp"
+// Note: test_mocks.h is included by acnh_aircheck_pi.cpp when KKFM_TEST_MODE is defined
 
 bool g_verbose = false;
 
