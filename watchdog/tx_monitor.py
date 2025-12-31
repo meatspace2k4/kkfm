@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import time
 import json
 import os
@@ -17,6 +18,107 @@ try:
     import serial  # type: ignore
 except Exception:  # pragma: no cover
     serial = None
+
+
+# ---------------------------------------------------------------------------
+# Service status check (to avoid recovery attempts during maintenance)
+# ---------------------------------------------------------------------------
+# The TX watchdog should not attempt Arduino recovery if the main audio service
+# is intentionally stopped for maintenance. This prevents false positives.
+
+MAIN_SERVICE_UNIT = os.environ.get("WATCHDOG_MAIN_SERVICE_UNIT", "acnh-aircheck.service")
+
+
+def _is_main_service_running() -> bool:
+    """Check if the main audio service is running (active).
+    
+    Returns True if the service is running, False if stopped/inactive/failed,
+    or True if we can't determine (fail-open to allow recovery).
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", MAIN_SERVICE_UNIT],
+            timeout=5.0,
+            capture_output=True,
+        )
+        # Exit code 0 = active, non-zero = inactive/failed/unknown
+        return result.returncode == 0
+    except Exception:
+        # If we can't check, assume running (fail-open)
+        return True
+
+
+def _is_main_service_enabled() -> bool:
+    """Check if the main audio service is enabled (will auto-start on boot).
+    
+    Returns True if enabled, False if disabled/masked.
+    If we can't determine, returns True (fail-open).
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-enabled", "--quiet", MAIN_SERVICE_UNIT],
+            timeout=5.0,
+            capture_output=True,
+        )
+        # Exit code 0 = enabled, non-zero = disabled/masked/etc
+        return result.returncode == 0
+    except Exception:
+        return True
+
+
+def _start_main_service(out_cb: Callable[[Anomaly], None]) -> bool:
+    """Attempt to start the main audio service.
+    
+    Returns True if the start command succeeded, False otherwise.
+    """
+    now_ts = time.time()
+    
+    out_cb(
+        Anomaly(
+            code=AnomalyCode.SERVICE_RESTART_ATTEMPT,
+            severity=Severity.INFO,
+            ts=now_ts,
+            message=f"Attempting to start {MAIN_SERVICE_UNIT}",
+        )
+    )
+    
+    try:
+        result = subprocess.run(
+            ["sudo", "systemctl", "start", MAIN_SERVICE_UNIT],
+            timeout=30.0,
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            out_cb(
+                Anomaly(
+                    code=AnomalyCode.SERVICE_RECOVERY_SUCCESS,
+                    severity=Severity.INFO,
+                    ts=time.time(),
+                    message=f"{MAIN_SERVICE_UNIT} started successfully",
+                )
+            )
+            return True
+        else:
+            out_cb(
+                Anomaly(
+                    code=AnomalyCode.SERVICE_RESTART_FAILED,
+                    severity=Severity.ERROR,
+                    ts=time.time(),
+                    message=f"Failed to start {MAIN_SERVICE_UNIT}: exit code {result.returncode}",
+                    raw=result.stderr.decode("utf-8", errors="replace") if result.stderr else None,
+                )
+            )
+            return False
+    except Exception as e:
+        out_cb(
+            Anomaly(
+                code=AnomalyCode.SERVICE_RESTART_FAILED,
+                severity=Severity.ERROR,
+                ts=time.time(),
+                message=f"Exception starting {MAIN_SERVICE_UNIT}: {e}",
+            )
+        )
+        return False
 
 
 TELEMETRY_RE = re.compile(
@@ -46,6 +148,27 @@ class TxState:
     audio_present_streak: int = 0  # Consecutive audio-present telemetry lines
     in_fault_state: bool = False  # True when all recovery attempts exhausted
     last_restart_attempt_mono: float = 0.0
+    # Silence tracking (separate from heartbeat missing)
+    silence_started_mono: float = 0.0  # When sustained silence began
+    last_silence_emit_mono: float = 0.0  # Cooldown for TX_SILENCE_DETECTED
+    # Heartbeat recovery tracking
+    was_missing_heartbeat: bool = False  # Track if we were in missing-heartbeat state
+    # Service-level recovery tracking
+    service_recovery_attempt_count: int = 0
+    last_service_recovery_mono: float = 0.0
+
+
+# Maximum service recovery attempts before giving up
+try:
+    SERVICE_MAX_RESTART_ATTEMPTS = int(os.environ.get("WATCHDOG_SERVICE_MAX_RESTART_ATTEMPTS", "3"))
+except Exception:
+    SERVICE_MAX_RESTART_ATTEMPTS = 3
+
+# Minimum interval between service restart attempts
+try:
+    SERVICE_RESTART_INTERVAL_S = float(os.environ.get("WATCHDOG_SERVICE_RESTART_INTERVAL_S", "60.0"))
+except Exception:
+    SERVICE_RESTART_INTERVAL_S = 60.0
 
 
 def _mk(
@@ -287,6 +410,20 @@ def monitor_tx(
 
                         m = TELEMETRY_RE.match(line)
                         if m:
+                            # Check if we're recovering from missing heartbeat
+                            if st.was_missing_heartbeat and st.armed:
+                                gap_duration = now_mono - st.last_telem_mono
+                                st.was_missing_heartbeat = False
+                                out_cb(
+                                    _mk(
+                                        AnomalyCode.TX_HEARTBEAT_RECOVERED,
+                                        Severity.INFO,
+                                        now_ts,
+                                        message=(
+                                            f"Arduino telemetry resumed on {port} after {gap_duration:.1f}s gap"
+                                        ),
+                                    )
+                                )
                             st.last_telem_mono = now_mono
                         else:
                             # Ignore non-telemetry chatter.
@@ -298,6 +435,7 @@ def monitor_tx(
 
                     # Periodic missing-heartbeat check.
                     if st.armed and (now_mono - st.last_telem_mono) > heartbeat_timeout_s:
+                        st.was_missing_heartbeat = True  # Track for recovery detection
                         if (now_mono - st.last_missing_mono) >= emit_cooldown_s:
                             st.last_missing_mono = now_mono
 
@@ -329,15 +467,43 @@ def monitor_tx(
                         # 2. Not currently in a recovery confirmation window
                         # 3. Missing heartbeat duration exceeds dead air threshold (30s)
                         # 4. Haven't attempted a restart too recently (avoid rapid-fire resets)
+                        # 5. Main audio service is actually running (not in maintenance)
                         missing_dur = now_mono - st.last_telem_mono
                         min_restart_interval = TX_RECOVERY_CONFIRM_WINDOW_S + 5.0  # Don't restart during confirmation
                         
+                        # Check if main service is running before attempting recovery
+                        main_service_running = _is_main_service_running()
+                        main_service_enabled = _is_main_service_enabled()
+                        
+                        # ---------------------------------------------------------------------------
+                        # Service-level recovery: if service is enabled but not running, start it
+                        # ---------------------------------------------------------------------------
+                        if (
+                            not main_service_running
+                            and main_service_enabled
+                            and missing_dur >= TX_DEAD_AIR_THRESHOLD_S
+                            and st.service_recovery_attempt_count < SERVICE_MAX_RESTART_ATTEMPTS
+                            and (now_mono - st.last_service_recovery_mono) >= SERVICE_RESTART_INTERVAL_S
+                        ):
+                            st.service_recovery_attempt_count += 1
+                            st.last_service_recovery_mono = now_mono
+                            
+                            if _start_main_service(out_cb):
+                                # Service started, reset TX recovery counters
+                                st.recovery_attempt_count = 0
+                                st.service_recovery_attempt_count = 0
+                                # Give service time to start producing audio
+                                time.sleep(5.0)
+                                continue
+                        
+                        # TX-level recovery: only if service is running
                         if (
                             not st.in_fault_state
                             and not st.recovery_in_progress
                             and missing_dur >= TX_DEAD_AIR_THRESHOLD_S
                             and (now_mono - st.last_restart_attempt_mono) >= min_restart_interval
                             and st.recovery_attempt_count < TX_MAX_RESTART_ATTEMPTS
+                            and main_service_running  # Skip TX recovery if service is stopped
                         ):
                             st.recovery_attempt_count += 1
                             st.recovery_in_progress = True
@@ -393,6 +559,103 @@ def monitor_tx(
                     else:
                         audio_present = inlevel >= audio_inlevel_threshold
                         audio_present_kind = "level"
+
+                    # ---------------------------------------------------------------------------
+                    # Silence tracking: detect sustained silence over TX (separate from heartbeat)
+                    # ---------------------------------------------------------------------------
+                    # This catches the case where telemetry is flowing but no audio is present.
+                    if audio_present:
+                        # Audio is present, reset silence tracking
+                        st.silence_started_mono = 0.0
+                    else:
+                        # No audio - track how long
+                        if st.silence_started_mono == 0.0:
+                            st.silence_started_mono = now_mono
+                        
+                        silence_duration = now_mono - st.silence_started_mono
+                        
+                        # Emit TX_SILENCE_DETECTED after threshold (with cooldown)
+                        if silence_duration >= TX_DEAD_AIR_THRESHOLD_S:
+                            if (now_mono - st.last_silence_emit_mono) >= emit_cooldown_s:
+                                st.last_silence_emit_mono = now_mono
+                                out_cb(
+                                    _mk(
+                                        AnomalyCode.TX_SILENCE_DETECTED,
+                                        Severity.ERROR,
+                                        now_ts,
+                                        message=(
+                                            f"Sustained silence on TX for {silence_duration:.1f}s on {port} "
+                                            f"(telemetry present but no audio detected)"
+                                        ),
+                                    )
+                                )
+                            
+                            # Trigger recovery cascade (same as heartbeat missing)
+                            # Only if not already in fault state and not in recovery
+                            # Also skip if main service is stopped (maintenance mode)
+                            min_restart_interval = TX_RECOVERY_CONFIRM_WINDOW_S + 5.0
+                            main_service_running = _is_main_service_running()
+                            main_service_enabled = _is_main_service_enabled()
+                            
+                            # ---------------------------------------------------------------------------
+                            # Service-level recovery: if service is enabled but not running, start it
+                            # ---------------------------------------------------------------------------
+                            if (
+                                not main_service_running
+                                and main_service_enabled
+                                and st.service_recovery_attempt_count < SERVICE_MAX_RESTART_ATTEMPTS
+                                and (now_mono - st.last_service_recovery_mono) >= SERVICE_RESTART_INTERVAL_S
+                            ):
+                                st.service_recovery_attempt_count += 1
+                                st.last_service_recovery_mono = now_mono
+                                
+                                if _start_main_service(out_cb):
+                                    # Service started, reset TX recovery counters
+                                    st.recovery_attempt_count = 0
+                                    st.service_recovery_attempt_count = 0
+                                    st.silence_started_mono = 0.0
+                                    # Give service time to start producing audio
+                                    time.sleep(5.0)
+                                    continue
+                            
+                            # TX-level recovery: only if service is running
+                            if (
+                                not st.in_fault_state
+                                and not st.recovery_in_progress
+                                and (now_mono - st.last_restart_attempt_mono) >= min_restart_interval
+                                and st.recovery_attempt_count < TX_MAX_RESTART_ATTEMPTS
+                                and main_service_running  # Skip TX recovery if service is stopped
+                            ):
+                                st.recovery_attempt_count += 1
+                                st.recovery_in_progress = True
+                                st.recovery_started_mono = now_mono
+                                st.last_restart_attempt_mono = now_mono
+                                st.audio_present_streak = 0
+                                
+                                # Close serial before reset attempt to release the port
+                                try:
+                                    ser.close()
+                                except Exception:
+                                    pass
+                                
+                                reset_ok = _attempt_tx_reset(port, baudrate, st.recovery_attempt_count, out_cb)
+                                
+                                if not reset_ok:
+                                    out_cb(
+                                        _mk(
+                                            AnomalyCode.TX_RESTART_FAILED,
+                                            Severity.ERROR,
+                                            time.time(),
+                                            message=(
+                                                f"TX restart attempt {st.recovery_attempt_count}/{TX_MAX_RESTART_ATTEMPTS} "
+                                                f"failed to execute on {port} (silence-triggered)"
+                                            ),
+                                        )
+                                    )
+                                    st.recovery_in_progress = False
+                                
+                                time.sleep(2.0)
+                                raise Exception("Restarting serial connection after TX reset attempt (silence)")
 
                     # ---------------------------------------------------------------------------
                     # Recovery confirmation: track audio presence after restart attempts

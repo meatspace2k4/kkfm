@@ -19,6 +19,7 @@ from .assets_check import (
     check_assets_h_sizes,
     scan_stream_bwav_dir,
 )
+from .anomalies import Anomaly, AnomalyCode, Severity
 from .detector import Detector
 from .events import Event, EventType
 from .log_parser import parse_event
@@ -203,14 +204,22 @@ def _journal_json_to_message_and_ts(raw: str) -> tuple[str | None, float | None]
 
 def cmd_monitor_logs(args: argparse.Namespace) -> int:
     runtime_dir = get_runtime_status_dir()
-    # Default behavior for systemd services: clear volatile runtime state on start
-    # so restarts don't show stale alerts/events.
+    # Default behavior for systemd services: clear stale status/flags on start,
+    # but PRESERVE anomaly history so admins can see what happened before restart.
     # Opt out with WATCHDOG_CLEAR_RUNTIME_ON_START=0.
     clear_on_start_default = "1" if os.environ.get("RUNTIME_DIRECTORY") else "0"
     if os.environ.get("WATCHDOG_CLEAR_RUNTIME_ON_START", clear_on_start_default) == "1":
-        _clear_all_runtime_state_for_uid(clear_status=True, clear_anomalies=True, clear_flags=True)
+        _clear_all_runtime_state_for_uid(clear_status=True, clear_anomalies=False, clear_flags=True)
 
     rep = Reporter(out_dir=args.out_dir)
+    
+    # Emit startup anomaly so the admin can see when the watchdog (re)started
+    rep.emit(Anomaly(
+        code=AnomalyCode.WATCHDOG_STARTED,
+        severity=Severity.INFO,
+        ts=time.time(),
+        message=f"Log watchdog started (PID {os.getpid()}). Monitoring {args.unit}.",
+    ))
     det = Detector(
         start_timeout_s=float(getattr(args, "start_timeout", 60.0)),
         end_timeout_s=float(getattr(args, "end_timeout", 45.0)),
@@ -438,11 +447,20 @@ def cmd_monitor_logs(args: argparse.Namespace) -> int:
 
 def cmd_monitor_tx(args: argparse.Namespace) -> int:
     runtime_dir = get_runtime_status_dir()
+    # Preserve anomaly history across reboots - only clear stale status/flags
     clear_on_start_default = "1" if os.environ.get("RUNTIME_DIRECTORY") else "0"
     if os.environ.get("WATCHDOG_CLEAR_RUNTIME_ON_START", clear_on_start_default) == "1":
-        _clear_all_runtime_state_for_uid(clear_status=True, clear_anomalies=True, clear_flags=True)
+        _clear_all_runtime_state_for_uid(clear_status=True, clear_anomalies=False, clear_flags=True)
 
     rep = Reporter(out_dir=args.out_dir)
+
+    # Emit startup anomaly so the admin can see when the TX watchdog (re)started
+    rep.emit(Anomaly(
+        code=AnomalyCode.WATCHDOG_STARTED,
+        severity=Severity.INFO,
+        ts=time.time(),
+        message=f"TX watchdog started (PID {os.getpid()}). Monitoring {args.port}.",
+    ))
 
     def emit(a) -> None:
         rep.emit(a)

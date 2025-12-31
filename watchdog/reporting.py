@@ -92,14 +92,18 @@ class Reporter:
         except Exception:
             is_temp_out_dir = False
 
-        # Defaults: avoid SD/USB wear by writing volatile outputs to tmpfs runtime dirs.
-        # Opt back into disk writing with:
-        # - WATCHDOG_ANOMALIES_TO_DISK=1
-        # - WATCHDOG_FLAGS_TO_DISK=1
+        # Defaults: 
+        # - ANOMALIES: persist to disk by default so they survive reboots (important for debugging)
+        # - FLAGS: write to tmpfs to avoid SD/USB wear (they're transient signals)
+        # Override with:
+        # - WATCHDOG_ANOMALIES_TO_DISK=0 (tmpfs, loses history on reboot)
+        # - WATCHDOG_FLAGS_TO_DISK=1 (persist flags)
         anomalies_env = os.environ.get("WATCHDOG_ANOMALIES_TO_DISK")
         flags_env = os.environ.get("WATCHDOG_FLAGS_TO_DISK")
 
-        self._anomalies_to_disk = (anomalies_env == "1") if anomalies_env is not None else is_temp_out_dir
+        # Anomalies default to DISK (persist across reboots) unless in test environment
+        self._anomalies_to_disk = (anomalies_env != "0") if anomalies_env is not None else (not is_temp_out_dir)
+        # Flags default to tmpfs (transient) unless explicitly enabled
         self._flags_to_disk = (flags_env == "1") if flags_env is not None else is_temp_out_dir
 
         # Stdout printing is opt-in to keep journald clean.

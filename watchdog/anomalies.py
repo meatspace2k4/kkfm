@@ -49,6 +49,8 @@ class AnomalyCode(str, Enum):
 
     # Transmitter (Arduino/Si4713)
     TX_HEARTBEAT_MISSING = "TX_HEARTBEAT_MISSING"
+    TX_HEARTBEAT_RECOVERED = "TX_HEARTBEAT_RECOVERED"  # Telemetry resumed after gap
+    TX_SILENCE_DETECTED = "TX_SILENCE_DETECTED"  # Sustained silence over TX
     TX_SKETCH_RESTART = "TX_SKETCH_RESTART"
     TX_RECOVERY = "TX_RECOVERY"
     TX_SERIAL_ERROR = "TX_SERIAL_ERROR"
@@ -56,6 +58,11 @@ class AnomalyCode(str, Enum):
     TX_RESTART_ATTEMPT = "TX_RESTART_ATTEMPT"  # Watchdog attempting DTR reset
     TX_RESTART_FAILED = "TX_RESTART_FAILED"  # Restart attempt did not restore audio
     TX_RECOVERY_FAILED = "TX_RECOVERY_FAILED"  # All restart attempts exhausted (fault state)
+
+    # Watchdog health (watching the watchers)
+    WATCHDOG_STARTED = "WATCHDOG_STARTED"  # Watchdog service started (logs boot/restart)
+    WATCHDOG_STALE = "WATCHDOG_STALE"  # A watchdog's status file is stale
+    WATCHDOG_RESTARTED = "WATCHDOG_RESTARTED"  # Watchdog process restarted (epoch changed)
 
     # Service log passthrough
     AIRCHECK_LOG_ERROR = "AIRCHECK_LOG_ERROR"
@@ -67,6 +74,11 @@ class AnomalyCode(str, Enum):
     AIRCHECK_AUTO_RESTARTED = "AIRCHECK_AUTO_RESTARTED"
     AIRCHECK_AUTO_RESTART_FAILED = "AIRCHECK_AUTO_RESTART_FAILED"
     AIRCHECK_AUTO_RESTART_SUPPRESSED = "AIRCHECK_AUTO_RESTART_SUPPRESSED"
+    
+    # Service-level recovery (TX watchdog starting main service)
+    SERVICE_RESTART_ATTEMPT = "SERVICE_RESTART_ATTEMPT"  # Attempting to start main service
+    SERVICE_RECOVERY_SUCCESS = "SERVICE_RECOVERY_SUCCESS"  # Main service started successfully
+    SERVICE_RESTART_FAILED = "SERVICE_RESTART_FAILED"  # Failed to start main service
 
     # Test-injected anomalies (for E2E testing)
     TEST_INJECTED = "TEST_INJECTED"  # Generic test anomaly

@@ -18,6 +18,7 @@ import re
 import errno
 
 from .paths import get_runtime_status_dir
+from .health_check import WatchdogHealthMonitor, read_status_file
 
 
 # Track whether terminal needs restoration (for signal handlers)
@@ -792,6 +793,7 @@ while True:
             orange = curses.COLOR_YELLOW
 
         curses.init_pair(7, orange, -1)
+        curses.init_pair(13, curses.COLOR_MAGENTA, -1)  # Purple for CRITICAL
         curses.curs_set(0)
         stdscr.nodelay(True)
 
@@ -819,6 +821,21 @@ while True:
         prev_jingle_playing: bool = False
         prev_comm_playing: bool = False
 
+        # Watchdog health monitoring (watching the watchers)
+        # Collects anomalies but doesn't persist them directly - dashboard is read-only
+        watchdog_health_anomalies: list = []
+        def _collect_health_anomaly(a) -> None:
+            watchdog_health_anomalies.append(a)
+        
+        health_monitor = WatchdogHealthMonitor(
+            emit_cb=_collect_health_anomaly,
+            tx_status_path=tx_status,
+            log_status_path=log_status,
+        )
+        last_health_check_mono = 0.0
+        health_check_interval_s = 10.0  # Check every 10s
+        watchdog_status_display: dict = {}
+
         while True:
             try:
                 ch = stdscr.getch()
@@ -843,6 +860,15 @@ while True:
                 if ssh_target and remote_stream:
                     ssh_status = remote_stream.status_line()
                     ssh_level = remote_stream.link_level()
+
+                # Periodic watchdog health check (watching the watchers)
+                now_mono = time.monotonic()
+                if (now_mono - last_health_check_mono) >= health_check_interval_s:
+                    last_health_check_mono = now_mono
+                    watchdog_status_display = health_monitor.check()
+                    # Note: anomalies collected in watchdog_health_anomalies list
+                    # In a full implementation, these would be forwarded to the reporter
+                    # For now, the dashboard just displays the status
 
                 level = 0
                 if ssh_target and remote_stream:
@@ -1254,8 +1280,6 @@ while True:
                                         last_bwav_src = "CACHE"
                                     elif "[FILE]" in rr or "[BWAV]" in rr:
                                         last_bwav_src = "FILE"
-                        
-                        stdscr.addnstr(y, 4, f"{'EVENT':<8}: ", max(0, max_x - 5))
 
                         event_ts: Optional[float]
                         try:
@@ -1268,7 +1292,7 @@ while True:
                             event_age_s = None
 
                         if wd_active and not log_stale:
-                            # Type indicator (aligned like BWAV/SIGN/COMM)
+                            # Type indicator first, then label
                             level = "IDLE"
                             if isinstance(le, dict):
                                 lvl = le.get("level")
@@ -1299,11 +1323,19 @@ while True:
                             elif level == "CRIT":
                                 level_attr = curses.color_pair(2) | curses.A_BOLD
 
-                            cur_x = stdscr.getyx()[1]
-                            if cur_x < max_x:
+                            # Fixed column positions for alignment
+                            label_col = 4
+                            status_col = 11
+                            content_col = 19
+                            
+                            # Print LOGS: label at col 4
+                            stdscr.addnstr(y, label_col, "LOGS:", max(0, max_x - label_col - 1))
+                            
+                            # Print level at fixed col 11
+                            if status_col < max_x:
                                 if level_attr:
                                     stdscr.attron(level_attr)
-                                stdscr.addnstr(f"{level[:7]:<7} ", max(0, max_x - cur_x - 1))
+                                stdscr.addnstr(y, status_col, f"{level[:7]:<8}", max(0, max_x - status_col - 1))
                                 if level_attr:
                                     stdscr.attroff(level_attr)
 
@@ -1323,9 +1355,8 @@ while True:
                                         group1 = etype or "-"
 
                                     stdscr.attron(curses.color_pair(4))
-                                    cur_x = stdscr.getyx()[1]
-                                    if cur_x < max_x:
-                                        stdscr.addnstr(group1, max(0, max_x - cur_x - 1))
+                                    if content_col < max_x:
+                                        stdscr.addnstr(y, content_col, group1, max(0, max_x - content_col - 1))
                                     stdscr.attroff(curses.color_pair(4))
 
                                     le_name = le.get("name")
@@ -1367,54 +1398,83 @@ while True:
                         y += 1
 
                         if y < max_y:
-                            stdscr.addnstr(y, 4, f"{'BWAV':<8}: ", max(0, max_x - 5))
+                            # Fixed column positions for alignment
+                            label_col = 4
+                            status_col = 11
+                            content_col = 19
+                            
                             if isinstance(last_bwav_name, str) and last_bwav_name:
                                 src_label = (last_bwav_src or "FILE")[:7]
                                 shown = _pretty_bwav_label(last_bwav_name)
+                                # Print BWAV: at col 4
+                                stdscr.addnstr(y, label_col, "BWAV:", max(0, max_x - label_col - 1))
+                                # Print src_label at col 10
                                 stdscr.attron(curses.color_pair(4))
-                                cur_x = stdscr.getyx()[1]
-                                if cur_x < max_x:
-                                    stdscr.addnstr(f"{src_label:<7} {shown[:40]}", max(0, max_x - cur_x - 1))
+                                if status_col < max_x:
+                                    stdscr.addnstr(y, status_col, f"{src_label:<8}", max(0, max_x - status_col - 1))
                                 stdscr.attroff(curses.color_pair(4))
+                                # Print file name at col 18
+                                if content_col < max_x:
+                                    stdscr.addnstr(y, content_col, f"{shown[:40]}", max(0, max_x - content_col - 1))
                             else:
-                                cur_x = stdscr.getyx()[1]
-                                if cur_x < max_x:
-                                    stdscr.addnstr("IDLE", max(0, max_x - cur_x - 1))
+                                stdscr.addnstr(y, label_col, "BWAV:", max(0, max_x - label_col - 1))
+                                if status_col < max_x:
+                                    stdscr.addnstr(y, status_col, "IDLE", max(0, max_x - status_col - 1))
                             y += 1
                         
-                        for kind, data in [("SIGN", jing), ("COMM", com)]:
+                        for kind, data in [("JING", jing), ("COMM", com)]:
                             if y >= max_y: break
-                            stdscr.addnstr(y, 4, f"{kind:<8}: ", max(0, max_x - 5))
+                            # Fixed column positions for alignment
+                            label_col = 4
+                            status_col = 11
+                            content_col = 19
+                            
                             if data.get("started_name"):
+                                # Print label at col 4
+                                stdscr.addnstr(y, label_col, f"{kind}:", max(0, max_x - label_col - 1))
+                                # Print PLAYING at col 10
                                 stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-                                shown = _pretty_bwav_label(data.get("started_name"))
-                                cur_x = stdscr.getyx()[1]
-                                if cur_x < max_x:
-                                    stdscr.addnstr(f"PLAYING {shown[:40]}", max(0, max_x - cur_x - 1))
+                                if status_col < max_x:
+                                    stdscr.addnstr(y, status_col, f"{'PLAYING':<8}", max(0, max_x - status_col - 1))
                                 stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+                                # Print file name at col 18
+                                shown = _pretty_bwav_label(data.get("started_name"))
+                                if content_col < max_x:
+                                    stdscr.addnstr(y, content_col, f"{shown[:40]}", max(0, max_x - content_col - 1))
                             elif data.get("picked_name"):
+                                # Print label at col 4
+                                stdscr.addnstr(y, label_col, f"{kind}:", max(0, max_x - label_col - 1))
+                                # Print PICKED at col 10
                                 stdscr.attron(curses.color_pair(3))
-                                shown = _pretty_bwav_label(data.get("picked_name"))
-                                cur_x = stdscr.getyx()[1]
-                                if cur_x < max_x:
-                                    stdscr.addnstr(f"PICKED  {shown[:40]}", max(0, max_x - cur_x - 1))
+                                if status_col < max_x:
+                                    stdscr.addnstr(y, status_col, f"{'PICKED':<8}", max(0, max_x - status_col - 1))
                                 stdscr.attroff(curses.color_pair(3))
+                                # Print file name at col 18
+                                shown = _pretty_bwav_label(data.get("picked_name"))
+                                if content_col < max_x:
+                                    stdscr.addnstr(y, content_col, f"{shown[:40]}", max(0, max_x - content_col - 1))
                             else:
-                                is_jingle = kind == "SIGN"
+                                is_jingle = kind == "JING"
                                 last_name = last_jingle_name if is_jingle else last_comm_name
                                 last_state = last_jingle_state if is_jingle else last_comm_state
                                 if isinstance(last_name, str) and last_name:
-                                    stdscr.attron(curses.color_pair(4))
-                                    shown = _pretty_bwav_label(last_name)
                                     label_str = (last_state or "PREV")[:7]
-                                    cur_x = stdscr.getyx()[1]
-                                    if cur_x < max_x:
-                                        stdscr.addnstr(f"{label_str:<7} {shown[:40]}", max(0, max_x - cur_x - 1))
+                                    # Print label at col 4
+                                    stdscr.addnstr(y, label_col, f"{kind}:", max(0, max_x - label_col - 1))
+                                    # Print state at col 10
+                                    stdscr.attron(curses.color_pair(4))
+                                    if status_col < max_x:
+                                        stdscr.addnstr(y, status_col, f"{label_str:<8}", max(0, max_x - status_col - 1))
                                     stdscr.attroff(curses.color_pair(4))
+                                    # Print file name at col 18
+                                    shown = _pretty_bwav_label(last_name)
+                                    if content_col < max_x:
+                                        stdscr.addnstr(y, content_col, f"{shown[:40]}", max(0, max_x - content_col - 1))
                                 else:
-                                    cur_x = stdscr.getyx()[1]
-                                    if cur_x < max_x:
-                                        stdscr.addnstr("IDLE", max(0, max_x - cur_x - 1))
+                                    # Print label at col 4, IDLE at col 10
+                                    stdscr.addnstr(y, label_col, f"{kind}:", max(0, max_x - label_col - 1))
+                                    if status_col < max_x:
+                                        stdscr.addnstr(y, status_col, "IDLE", max(0, max_x - status_col - 1))
                             y += 1
                     else:
                         stdscr.attron(curses.color_pair(3))
@@ -1453,95 +1513,95 @@ while True:
                 if not sorted_anomalies and y < max_y:
                     stdscr.addnstr(y, 4, "No anomalies detected. System healthy.", max(0, max_x - 5))
                 else:
-                    def word_wrap(text: str, width: int) -> list:
-                        """Split text into lines of at most `width` chars, breaking at word boundaries."""
-                        if width <= 0:
-                            return [text] if text else []
-                        lines = []
-                        while text:
-                            if len(text) <= width:
-                                lines.append(text)
-                                break
-                            # Find last space within width
-                            break_at = text.rfind(' ', 0, width + 1)
-                            if break_at <= 0:
-                                # No space found, hard break
-                                break_at = width
-                            lines.append(text[:break_at])
-                            text = text[break_at:].lstrip()
-                        return lines
+                    # Get most recent anomaly for the header
+                    most_recent = sorted_anomalies[0] if sorted_anomalies else None
+                    most_recent_ts = most_recent.get("ts", 0) if most_recent else 0
+                    most_recent_title = most_recent.get("code", "") if most_recent else ""
+                    most_recent_sev = most_recent.get("severity", "info").lower() if most_recent else "info"
+                    
+                    # Determine header color based on most recent severity
+                    if most_recent_sev == "critical":
+                        header_color = curses.color_pair(13)  # Purple
+                    elif most_recent_sev == "error":
+                        header_color = curses.color_pair(2)   # Red
+                    elif most_recent_sev == "warn":
+                        header_color = curses.color_pair(3)
+                    else:
+                        header_color = curses.color_pair(4)
+                    
+                    # Header line: DATE + most recent anomaly title (colored by severity)
+                    try:
+                        date_str = time.strftime("%m/%d", time.localtime(most_recent_ts))
+                    except Exception:
+                        date_str = "??/??"
+                    
+                    if y < max_y:
+                        stdscr.addnstr(y, 4, f"{date_str}  ", max(0, max_x - 5))
+                        cur_x = stdscr.getyx()[1]
+                        if cur_x < max_x:
+                            stdscr.attron(header_color | curses.A_BOLD)
+                            stdscr.addnstr(most_recent_title, max(0, max_x - cur_x - 1))
+                            stdscr.attroff(header_color | curses.A_BOLD)
+                        y += 1
+                    
+                    # Track last date shown to only print new dates
+                    last_date = date_str
+                    
+                    # Each anomaly line: SEVERITY | HH:MM:SS | MESSAGE
+                    # Severity at col 11 to align with title (header is "MM/DD  TITLE" where title starts at col 11)
+                    # Timestamp at col 19, message at col 29
+                    sev_col = 11
+                    ts_col = 19
+                    msg_col = 29
                     
                     for r in sorted_anomalies:
                         if y >= max_y: break
                         sev = r.get("severity", "info").lower()
                         if sev == "critical":
-                            color = curses.color_pair(2)
+                            color = curses.color_pair(13)  # Purple
                         elif sev == "error":
-                            color = curses.color_pair(7)
+                            color = curses.color_pair(2)   # Red
                         elif sev == "warn":
                             color = curses.color_pair(3)
                         else:
                             color = curses.color_pair(4)
                         
-                        # Format timestamp as 24h date/time
                         ts = r.get("ts", 0)
                         try:
-                            ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
+                            this_date = time.strftime("%m/%d", time.localtime(ts))
+                            time_str = time.strftime("%H:%M:%S", time.localtime(ts))
                         except Exception:
-                            ts_str = "??:??:??"
+                            this_date = "??/??"
+                            time_str = "??:??:??"
                         
-                        code = r.get("code", "")
+                        # If date changed, print a new date header line with blank line above
+                        if this_date != last_date:
+                            if y < max_y:
+                                y += 1  # Blank line to separate from previous date's entries
+                                title_for_date = r.get("code", "")
+                                stdscr.addnstr(y, 4, f"{this_date}  {title_for_date}", max(0, max_x - 5))
+                                y += 1
+                                last_date = this_date
+                        
+                        if y >= max_y: break
+                        
                         msg = r.get("message", "")
                         
-                        # Format: "HH:MM:SS SEVERITY CODE: message..."
-                        # Aligned like EVENT/BWAV/SIGN/COMM section (starts at col 4)
-                        # Timestamp (8 chars) : SEVERITY (8 chars) CODE: message
-                        stdscr.addnstr(y, 4, f"{ts_str:<8} ", max(0, max_x - 5))
-                        cur_x = stdscr.getyx()[1]
-                        
+                        # SEVERITY (colored, bold, 6 chars to fit before ts_col 10)
                         stdscr.attron(color | curses.A_BOLD)
-                        if cur_x < max_x:
-                            stdscr.addnstr(f"{sev.upper():<8} ", max(0, max_x - cur_x - 1))
+                        stdscr.addnstr(y, sev_col, f"{sev.upper():<6}", max(0, max_x - sev_col - 1))
                         stdscr.attroff(color | curses.A_BOLD)
                         
-                        cur_x = stdscr.getyx()[1]
-                        # Code + message inline
-                        full_text = f"{code}: {msg}" if msg else code
-                        remaining_width = max(0, max_x - cur_x - 1)
-                        # Continuation lines: align with CODE start + 4 spaces indent
-                        cont_col = cur_x + 2
-                        cont_width = max(1, max_x - cont_col - 1)
+                        # TIMESTAMP (HH:MM:SS, 8 chars)
+                        if ts_col < max_x:
+                            stdscr.addnstr(y, ts_col, f"{time_str:<8}", max(0, max_x - ts_col - 1))
                         
-                        # First line uses remaining_width, continuation lines are indented
-                        if len(full_text) <= remaining_width:
-                            stdscr.addnstr(full_text, remaining_width)
-                            y += 1
-                        else:
-                            # Find word break for first line
-                            break_at = full_text.rfind(' ', 0, remaining_width + 1)
-                            if break_at <= 0:
-                                break_at = remaining_width
-                            stdscr.addnstr(full_text[:break_at], remaining_width)
-                            y += 1
-                            text_left = full_text[break_at:].lstrip()
-                            
-                            # Wrap remainder, indented from CODE start
-                            while text_left and y < max_y:
-                                line_to_print = ""
-                                if len(text_left) <= cont_width:
-                                    line_to_print = text_left
-                                    text_left = ""
-                                else:
-                                    brk = text_left.rfind(' ', 0, cont_width + 1)
-                                    if brk <= 0:
-                                        brk = cont_width
-                                    line_to_print = text_left[:brk]
-                                    text_left = text_left[brk:].lstrip()
-                                try:
-                                    stdscr.addstr(y, cont_col, line_to_print[:cont_width])
-                                except curses.error:
-                                    pass
-                                y += 1
+                        # MESSAGE (just the message, title is in header)
+                        if msg_col < max_x:
+                            remaining_width = max(0, max_x - msg_col - 1)
+                            stdscr.addnstr(y, msg_col, msg[:remaining_width], remaining_width)
+                        
+                        y += 1
 
                 stdscr.refresh()
                 time.sleep(max(0.1, float(refresh_s)))
