@@ -67,6 +67,11 @@ class Detector:
         # see occasional out-of-order delivery across restarts/rotations. Also, the
         # service may log "picked" during preload/cache warmup, well before start.
         self.reorder_grace_s: float = 2.0
+        
+        # Debounce DAC underruns: only emit anomaly after N underruns in a window.
+        self._underrun_timestamps: list[float] = []
+        self.underrun_debounce_count: int = 3  # require this many underruns
+        self.underrun_debounce_window_s: float = 10.0  # within this time window
 
     def snapshot(self) -> dict:
         def seg(st: SegmentState) -> dict:
@@ -143,7 +148,7 @@ class Detector:
                 anomalies.append(
                     Anomaly(
                         code=AnomalyCode.AIRCHECK_UNIT_STARTED_UNEXPECTED,
-                        severity=Severity.CRITICAL,
+                        severity=Severity.WARNING,
                         ts=ev.ts,
                         raw=ev.raw,
                         message="Monitored service restarted unexpectedly",
@@ -168,15 +173,24 @@ class Detector:
             )
             return anomalies
         if ev.etype == EventType.DAC_UNDERRUN:
-            anomalies.append(
-                Anomaly(
-                    code=AnomalyCode.DAC_RING_UNDERRUN,
-                    severity=Severity.WARN,
-                    ts=ev.ts,
-                    raw=ev.raw,
-                    message="DAC ring buffer underrun observed",
+            # Debounce: accumulate timestamps, prune old ones, emit only if threshold met
+            now = ev.ts
+            self._underrun_timestamps.append(now)
+            cutoff = now - self.underrun_debounce_window_s
+            self._underrun_timestamps = [t for t in self._underrun_timestamps if t >= cutoff]
+            
+            if len(self._underrun_timestamps) >= self.underrun_debounce_count:
+                anomalies.append(
+                    Anomaly(
+                        code=AnomalyCode.DAC_RING_UNDERRUN,
+                        severity=Severity.WARN,
+                        ts=ev.ts,
+                        raw=ev.raw,
+                        message="DAC ring buffer underrun observed",
+                    )
                 )
-            )
+                # Reset after emitting to avoid spamming
+                self._underrun_timestamps = []
             return anomalies
         if ev.etype == EventType.DAC_THROTTLE:
             anomalies.append(

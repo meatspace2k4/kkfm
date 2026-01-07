@@ -798,7 +798,7 @@ while True:
         stdscr.nodelay(True)
 
         last_tx_label: str = "WAIT"
-        last_tx_color = curses.color_pair(7)
+        last_tx_color = curses.color_pair(3)
         tx_silence_since_ts: Optional[float] = None
         tx_silence_grace_s: float = 5.0
 
@@ -906,7 +906,7 @@ while True:
                         elif tx_epoch != last_tx_epoch:
                             last_tx_epoch = tx_epoch
                             last_tx_label = "WAIT"
-                            last_tx_color = curses.color_pair(7)
+                            last_tx_color = curses.color_pair(3)
                             tx_silence_since_ts = None
 
                     inlevel = tx_snap.get("inlevel")
@@ -1041,7 +1041,7 @@ while True:
                             elif tx_epoch != last_tx_epoch:
                                 last_tx_epoch = tx_epoch
                                 last_tx_label = "WAIT"
-                                last_tx_color = curses.color_pair(7)
+                                last_tx_color = curses.color_pair(3)
                                 tx_silence_since_ts = None
                         inlevel = tx.get("inlevel")
                         audio_present = tx.get("audio_present")
