@@ -34,6 +34,7 @@ class AnomalyCode(str, Enum):
     DAC_RING_THROTTLE = "DAC_RING_THROTTLE"
     DAC_RING_UNDERRUN = "DAC_RING_UNDERRUN"
     RADIO_DEAD_AIR = "RADIO_DEAD_AIR"
+    RADIO_DEAD_AIR_RECOVERED = "RADIO_DEAD_AIR_RECOVERED"
 
     # Extended playback anomalies (for comprehensive testing)
     PLAYBACK_STALL = "PLAYBACK_STALL"  # Audio position not advancing
@@ -51,6 +52,7 @@ class AnomalyCode(str, Enum):
     TX_HEARTBEAT_MISSING = "TX_HEARTBEAT_MISSING"
     TX_HEARTBEAT_RECOVERED = "TX_HEARTBEAT_RECOVERED"  # Telemetry resumed after gap
     TX_SILENCE_DETECTED = "TX_SILENCE_DETECTED"  # Sustained silence over TX
+    TX_SILENCE_RECOVERED = "TX_SILENCE_RECOVERED"  # Audio resumed after sustained silence
     TX_SKETCH_RESTART = "TX_SKETCH_RESTART"
     TX_RECOVERY = "TX_RECOVERY"
     TX_SERIAL_ERROR = "TX_SERIAL_ERROR"

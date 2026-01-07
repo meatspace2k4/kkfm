@@ -57,4 +57,36 @@ class TestDetector(unittest.TestCase):
         out = d.feed(Event(EventType.UNIT_STARTED, ts=3.0, raw="Started KKFM Aircheck."))
         self.assertFalse(any(a.code == AnomalyCode.AIRCHECK_UNIT_STARTED_UNEXPECTED for a in out))
 
+    def test_unit_started_after_long_stop_gap_not_unexpected_restart(self):
+        d = Detector(expected_start_after_stop_gap_s=10.0)
+        d.feed(Event(EventType.UNIT_STARTED, ts=1.0, raw="Started KKFM Aircheck."))
+        d.feed(Event(EventType.UNIT_STOPPED, ts=2.0, raw="Stopped KKFM Aircheck."))
+        out = d.feed(Event(EventType.UNIT_STARTED, ts=20.0, raw="Started KKFM Aircheck."))
+        self.assertFalse(any(a.code == AnomalyCode.AIRCHECK_UNIT_STARTED_UNEXPECTED for a in out))
+
+    def test_underrun_suppressed_during_startup_grace(self):
+        d = Detector(underrun_startup_grace_s=10.0)
+        d.feed(Event(EventType.UNIT_STARTED, ts=0.0, raw="Started KKFM Aircheck."))
+        # Even if multiple underruns happen immediately after start, don't flag.
+        out1 = d.feed(Event(EventType.DAC_UNDERRUN, ts=1.0, raw="[DAC] underrun", name=None))
+        out2 = d.feed(Event(EventType.DAC_UNDERRUN, ts=2.0, raw="[DAC] underrun", name=None))
+        out3 = d.feed(Event(EventType.DAC_UNDERRUN, ts=3.0, raw="[DAC] underrun", name=None))
+        self.assertFalse(any(a.code == AnomalyCode.DAC_RING_UNDERRUN for a in (out1 + out2 + out3)))
+
+        # After grace period, normal debounce should apply.
+        a1 = d.feed(Event(EventType.DAC_UNDERRUN, ts=12.0, raw="[DAC] underrun", name=None))
+        a2 = d.feed(Event(EventType.DAC_UNDERRUN, ts=13.0, raw="[DAC] underrun", name=None))
+        a3 = d.feed(Event(EventType.DAC_UNDERRUN, ts=14.0, raw="[DAC] underrun", name=None))
+        self.assertTrue(any(a.code == AnomalyCode.DAC_RING_UNDERRUN for a in (a1 + a2 + a3)))
+
+    def test_dead_air_recovered_emits_info(self):
+        d = Detector(dead_air_timeout_s=5.0)
+        d.feed(Event(EventType.NOW_PLAYING, ts=0.0, raw="Now Playing: X", name="X"))
+        # Trigger dead-air state.
+        out1 = d.poll(10.0)
+        self.assertTrue(any(a.code == AnomalyCode.RADIO_DEAD_AIR for a in out1))
+        # Activity resumes after being dead.
+        out2 = d.feed(Event(EventType.NOW_PLAYING, ts=11.0, raw="Now Playing: Y", name="Y"))
+        self.assertTrue(any(a.code == AnomalyCode.RADIO_DEAD_AIR_RECOVERED for a in out2))
+
 

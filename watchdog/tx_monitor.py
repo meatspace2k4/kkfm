@@ -151,6 +151,7 @@ class TxState:
     # Silence tracking (separate from heartbeat missing)
     silence_started_mono: float = 0.0  # When sustained silence began
     last_silence_emit_mono: float = 0.0  # Cooldown for TX_SILENCE_DETECTED
+    last_silence_recovered_emit_mono: float = 0.0  # Cooldown for TX_SILENCE_RECOVERED
     # Heartbeat recovery tracking
     was_missing_heartbeat: bool = False  # Track if we were in missing-heartbeat state
     # Service-level recovery tracking
@@ -439,10 +440,10 @@ def monitor_tx(
                         if (now_mono - st.last_missing_mono) >= emit_cooldown_s:
                             st.last_missing_mono = now_mono
 
-                            # Escalate missing-telemetry severity; max severity is ERROR.
-                            # CRITICAL is reserved for TX_RECOVERY_FAILED (fault state).
                             missing_dur = now_mono - st.last_telem_mono
-                            if missing_dur >= 10.0:
+                            if missing_dur >= TX_DEAD_AIR_THRESHOLD_S:
+                                sev = Severity.CRITICAL
+                            elif missing_dur >= 10.0:
                                 sev = Severity.ERROR
                             else:
                                 sev = Severity.WARN
@@ -565,7 +566,27 @@ def monitor_tx(
                     # ---------------------------------------------------------------------------
                     # This catches the case where telemetry is flowing but no audio is present.
                     if audio_present:
-                        # Audio is present, reset silence tracking
+                        # Audio is present: if we were previously in sustained-silence state,
+                        # emit a one-shot recovery INFO.
+                        if st.silence_started_mono != 0.0:
+                            silence_duration = now_mono - st.silence_started_mono
+                            if (
+                                silence_duration >= TX_DEAD_AIR_THRESHOLD_S
+                                and (now_mono - st.last_silence_recovered_emit_mono) >= emit_cooldown_s
+                            ):
+                                st.last_silence_recovered_emit_mono = now_mono
+                                out_cb(
+                                    _mk(
+                                        AnomalyCode.TX_SILENCE_RECOVERED,
+                                        Severity.INFO,
+                                        now_ts,
+                                        message=(
+                                            f"TX back to normal: audio resumed on {port} after {silence_duration:.1f}s silence"
+                                        ),
+                                    )
+                                )
+
+                        # Reset silence tracking
                         st.silence_started_mono = 0.0
                     else:
                         # No audio - track how long
@@ -581,7 +602,7 @@ def monitor_tx(
                                 out_cb(
                                     _mk(
                                         AnomalyCode.TX_SILENCE_DETECTED,
-                                        Severity.ERROR,
+                                        Severity.CRITICAL,
                                         now_ts,
                                         message=(
                                             f"Sustained silence on TX for {silence_duration:.1f}s on {port} "

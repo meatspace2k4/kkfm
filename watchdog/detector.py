@@ -37,6 +37,8 @@ class Detector:
         end_timeout_s: float = 45.0,
         dead_air_timeout_s: float = 300.0,
         orphan_end_grace_s: float = 10.0,
+        underrun_startup_grace_s: float = 10.0,
+        expected_start_after_stop_gap_s: float = 10.0,
     ) -> None:
         self.start_timeout_s = float(start_timeout_s)
         self.end_timeout_s = float(end_timeout_s)
@@ -62,6 +64,18 @@ class Detector:
 
         # Used to suppress restart-induced noise for a short window after startup.
         self._startup_ts: Optional[float] = None
+
+        # Track dead-air state so we can emit a "back to normal" message on recovery.
+        self._in_dead_air: bool = False
+
+        # Track when systemd stopped the unit so we can avoid mislabeling
+        # long-down-time starts as "unexpected restarts".
+        self._last_unit_stopped_ts: Optional[float] = None
+        self.expected_start_after_stop_gap_s: float = max(0.0, float(expected_start_after_stop_gap_s))
+
+        # Suppress DAC underrun noise for a short window after unit startup/restart.
+        self.underrun_startup_grace_s: float = max(0.0, float(underrun_startup_grace_s))
+        self._underrun_suppress_until_ts: Optional[float] = None
 
         # `journalctl -o json -f` should preserve ordering, but in practice we still
         # see occasional out-of-order delivery across restarts/rotations. Also, the
@@ -123,8 +137,33 @@ class Detector:
         """Feed one event; returns any anomalies triggered by this event."""
         if self._startup_ts is None:
             self._startup_ts = ev.ts
+
+        prev_last_activity_ts = self.last_activity_ts
         self.last_activity_ts = ev.ts
+
+        # If we were in dead-air and activity resumes, emit a one-shot recovery INFO.
+        if prev_last_activity_ts is not None:
+            gap = ev.ts - prev_last_activity_ts
+            if gap > self.dead_air_timeout_s and self._in_dead_air:
+                self._in_dead_air = False
+                self.last_dead_air_emit_ts = 0.0
+                recovered_after = gap
+                # Keep message short and dashboard-friendly.
+                # This is intentionally INFO (operator-visible) not WARN/ERROR.
+                recovered = Anomaly(
+                    code=AnomalyCode.RADIO_DEAD_AIR_RECOVERED,
+                    severity=Severity.INFO,
+                    ts=ev.ts,
+                    message=f"RADIO back to normal: log activity resumed after {recovered_after:.1f}s",
+                )
+            else:
+                recovered = None
+        else:
+            recovered = None
+
         anomalies: list[Anomaly] = []
+        if recovered is not None:
+            anomalies.append(recovered)
         anomalies.extend(self._timeout_checks(ev.ts))
 
         if ev.etype == EventType.SAFE_SHUTDOWN:
@@ -142,13 +181,34 @@ class Detector:
             if not self._seen_unit_started:
                 self._seen_unit_started = True
                 self._saw_safe_shutdown_marker = False
+                self._startup_ts = ev.ts
+                self._underrun_suppress_until_ts = ev.ts + self.underrun_startup_grace_s
+                self._underrun_timestamps = []
+                self._last_unit_stopped_ts = None
                 return anomalies
 
-            if not self._saw_safe_shutdown_marker:
+            # Any UNIT_STARTED indicates a new run; set startup grace for underrun noise.
+            self._startup_ts = ev.ts
+            self._underrun_suppress_until_ts = ev.ts + self.underrun_startup_grace_s
+            self._underrun_timestamps = []
+
+            # Heuristic: if the unit was stopped and remained down for a while, treat
+            # the next start as an expected/manual/service-recovery start rather than
+            # an "unexpected restart".
+            start_after_stop_gap = None
+            if self._last_unit_stopped_ts is not None:
+                start_after_stop_gap = ev.ts - self._last_unit_stopped_ts
+
+            expected_due_to_gap = (
+                start_after_stop_gap is not None
+                and start_after_stop_gap >= self.expected_start_after_stop_gap_s
+            )
+
+            if (not self._saw_safe_shutdown_marker) and (not expected_due_to_gap):
                 anomalies.append(
                     Anomaly(
                         code=AnomalyCode.AIRCHECK_UNIT_STARTED_UNEXPECTED,
-                        severity=Severity.WARNING,
+                        severity=Severity.WARN,
                         ts=ev.ts,
                         raw=ev.raw,
                         message="Monitored service restarted unexpectedly",
@@ -157,8 +217,10 @@ class Detector:
 
             # Reset marker for the next run.
             self._saw_safe_shutdown_marker = False
+            self._last_unit_stopped_ts = None
             return anomalies
         if ev.etype == EventType.UNIT_STOPPED:
+            self._last_unit_stopped_ts = ev.ts
             return anomalies
 
         if ev.etype == EventType.DAC_OVERFLOW:
@@ -173,6 +235,10 @@ class Detector:
             )
             return anomalies
         if ev.etype == EventType.DAC_UNDERRUN:
+            if self._underrun_suppress_until_ts is not None and ev.ts <= self._underrun_suppress_until_ts:
+                # Ignore startup/restart underrun noise.
+                self._underrun_timestamps = []
+                return anomalies
             # Debounce: accumulate timestamps, prune old ones, emit only if threshold met
             now = ev.ts
             self._underrun_timestamps.append(now)
@@ -401,8 +467,9 @@ class Detector:
         if self.last_activity_ts is not None:
             silence_dur = now_ts - self.last_activity_ts
             if silence_dur > self.dead_air_timeout_s:
+                self._in_dead_air = True
                 # Emit dead air anomaly every 60s if it persists
-                if (now_ts - self.last_dead_air_emit_ts) > 60.0:
+                if self.last_dead_air_emit_ts == 0.0 or (now_ts - self.last_dead_air_emit_ts) > 60.0:
                     self.last_dead_air_emit_ts = now_ts
                     anomalies.append(
                         Anomaly(
