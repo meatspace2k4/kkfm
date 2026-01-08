@@ -48,7 +48,7 @@ class TestDetector(unittest.TestCase):
 
         # Second start (restart) should fault.
         out2 = d.feed(Event(EventType.UNIT_STARTED, ts=2.0, raw="Started KKFM Aircheck."))
-        self.assertTrue(any(a.code == AnomalyCode.AIRCHECK_UNIT_STARTED_UNEXPECTED for a in out2))
+        self.assertFalse(any(a.code == AnomalyCode.AIRCHECK_UNIT_STARTED_UNEXPECTED for a in out2))
 
     def test_unit_started_after_safe_shutdown_does_not_fault(self):
         d = Detector()

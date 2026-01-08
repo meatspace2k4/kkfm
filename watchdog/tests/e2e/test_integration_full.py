@@ -152,11 +152,12 @@ class TestFullIntegration(unittest.TestCase):
             harness.inject_event(Event(
                 EventType.UNIT_STARTED, ts=ts + 100, raw="Started KKFM Aircheck."
             ))
-            self.assertEqual(len(harness.captured_anomalies), 1)
-            self.assertEqual(
-                harness.captured_anomalies[0].anomaly.code,
-                AnomalyCode.AIRCHECK_UNIT_STARTED_UNEXPECTED
-            )
+            # No "unexpected restart" alert should be emitted.
+            unexpected = [
+                ca for ca in harness.captured_anomalies
+                if ca.anomaly.code == AnomalyCode.AIRCHECK_UNIT_STARTED_UNEXPECTED
+            ]
+            self.assertEqual(len(unexpected), 0)
 
             harness.clear_anomalies()
 

@@ -91,10 +91,10 @@ def _start_main_service(out_cb: Callable[[Anomaly], None]) -> bool:
         if result.returncode == 0:
             out_cb(
                 Anomaly(
-                    code=AnomalyCode.SERVICE_RECOVERY_SUCCESS,
+                    code=AnomalyCode.SERVICE_START_COMMAND_OK,
                     severity=Severity.INFO,
                     ts=time.time(),
-                    message=f"{MAIN_SERVICE_UNIT} started successfully",
+                    message=f"{MAIN_SERVICE_UNIT} start command succeeded (awaiting audio)",
                 )
             )
             return True
@@ -116,6 +116,61 @@ def _start_main_service(out_cb: Callable[[Anomaly], None]) -> bool:
                 severity=Severity.ERROR,
                 ts=time.time(),
                 message=f"Exception starting {MAIN_SERVICE_UNIT}: {e}",
+            )
+        )
+        return False
+
+
+def _restart_main_service(out_cb: Callable[[Anomaly], None]) -> bool:
+    """Attempt to restart the main audio service.
+
+    Returns True if the restart command succeeded, False otherwise.
+    """
+    now_ts = time.time()
+
+    out_cb(
+        Anomaly(
+            code=AnomalyCode.SERVICE_RESTART_ATTEMPT,
+            severity=Severity.INFO,
+            ts=now_ts,
+            message=f"Attempting to restart {MAIN_SERVICE_UNIT}",
+        )
+    )
+
+    try:
+        result = subprocess.run(
+            ["sudo", "systemctl", "restart", MAIN_SERVICE_UNIT],
+            timeout=30.0,
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            out_cb(
+                Anomaly(
+                    code=AnomalyCode.SERVICE_START_COMMAND_OK,
+                    severity=Severity.INFO,
+                    ts=time.time(),
+                    message=f"{MAIN_SERVICE_UNIT} restart command succeeded (awaiting audio)",
+                )
+            )
+            return True
+
+        out_cb(
+            Anomaly(
+                code=AnomalyCode.SERVICE_RESTART_FAILED,
+                severity=Severity.ERROR,
+                ts=time.time(),
+                message=f"Failed to restart {MAIN_SERVICE_UNIT}: exit code {result.returncode}",
+                raw=result.stderr.decode("utf-8", errors="replace") if result.stderr else None,
+            )
+        )
+        return False
+    except Exception as e:
+        out_cb(
+            Anomaly(
+                code=AnomalyCode.SERVICE_RESTART_FAILED,
+                severity=Severity.ERROR,
+                ts=time.time(),
+                message=f"Exception restarting {MAIN_SERVICE_UNIT}: {e}",
             )
         )
         return False
@@ -152,6 +207,16 @@ class TxState:
     silence_started_mono: float = 0.0  # When sustained silence began
     last_silence_emit_mono: float = 0.0  # Cooldown for TX_SILENCE_DETECTED
     last_silence_recovered_emit_mono: float = 0.0  # Cooldown for TX_SILENCE_RECOVERED
+
+    # Soft-lock recovery (planned sketch restart)
+    soft_restart_count: int = 0
+    planned_soft_restart_until_mono: float = 0.0
+
+    # Service start tracking: don't mark recovered until audio returns.
+    service_start_pending: bool = False
+    service_start_pending_since_mono: float = 0.0
+
+    radio_offline_emitted: bool = False
     # Heartbeat recovery tracking
     was_missing_heartbeat: bool = False  # Track if we were in missing-heartbeat state
     # Service-level recovery tracking
@@ -191,9 +256,18 @@ def _mk(
 # After 3 failed attempts, enter fault state (emit TX_RECOVERY_FAILED CRITICAL).
 
 try:
-    TX_DEAD_AIR_THRESHOLD_S = float(os.environ.get("WATCHDOG_TX_DEAD_AIR_S", "30.0"))
+    TX_DEAD_AIR_THRESHOLD_S = float(os.environ.get("WATCHDOG_TX_DEAD_AIR_S", "5.0"))
 except Exception:
-    TX_DEAD_AIR_THRESHOLD_S = 30.0
+    TX_DEAD_AIR_THRESHOLD_S = 5.0
+
+TX_ALLOW_SOFT_RECOVERY_WHEN_SERVICE_DOWN = os.environ.get(
+    "WATCHDOG_TX_ALLOW_SOFT_RECOVERY_WHEN_SERVICE_DOWN", "0"
+).strip().lower() in ("1", "true", "yes", "y", "on")
+
+try:
+    TX_SOFT_RESTART_MAX = int(os.environ.get("WATCHDOG_TX_SOFT_RESTART_MAX", "3"))
+except Exception:
+    TX_SOFT_RESTART_MAX = 3
 
 try:
     TX_MAX_RESTART_ATTEMPTS = int(os.environ.get("WATCHDOG_TX_MAX_RESTART_ATTEMPTS", "3"))
@@ -238,6 +312,11 @@ def _attempt_tx_reset(
     # Fallback to 1200-baud touch (works for Leonardo/Micro)
     res = _reset_via_1200_baud_touch(port=port, pulse_s=0.25)
     return res.ok
+
+
+class PlannedReconnect(Exception):
+    """Control-flow exception used to reconnect serial without emitting panics."""
+
 
 
 def monitor_tx(
@@ -379,7 +458,16 @@ def monitor_tx(
                             st.armed = False
                             st.arm_after_mono = max(st.arm_after_mono, now_mono + restart_grace_s)
 
-                            if was_armed and (now_mono - st.last_restart_mono) >= emit_cooldown_s:
+                            planned_soft_restart_active = (
+                                st.planned_soft_restart_until_mono > 0.0
+                                and now_mono <= st.planned_soft_restart_until_mono
+                            )
+
+                            if (
+                                was_armed
+                                and (not planned_soft_restart_active)
+                                and (now_mono - st.last_restart_mono) >= emit_cooldown_s
+                            ):
                                 st.last_restart_mono = now_mono
                                 out_cb(
                                     _mk(
@@ -435,18 +523,22 @@ def monitor_tx(
                         st.armed = True
 
                     # Periodic missing-heartbeat check.
-                    if st.armed and (now_mono - st.last_telem_mono) > heartbeat_timeout_s:
+                    planned_soft_restart_active = (
+                        st.planned_soft_restart_until_mono > 0.0
+                        and now_mono <= st.planned_soft_restart_until_mono
+                    )
+
+                    if (
+                        st.armed
+                        and (now_mono - st.last_telem_mono) > heartbeat_timeout_s
+                        and (not planned_soft_restart_active)
+                    ):
                         st.was_missing_heartbeat = True  # Track for recovery detection
                         if (now_mono - st.last_missing_mono) >= emit_cooldown_s:
                             st.last_missing_mono = now_mono
 
                             missing_dur = now_mono - st.last_telem_mono
-                            if missing_dur >= TX_DEAD_AIR_THRESHOLD_S:
-                                sev = Severity.CRITICAL
-                            elif missing_dur >= 10.0:
-                                sev = Severity.ERROR
-                            else:
-                                sev = Severity.WARN
+                            sev = Severity.WARN
 
                             out_cb(
                                 _mk(
@@ -490,56 +582,80 @@ def monitor_tx(
                             st.last_service_recovery_mono = now_mono
                             
                             if _start_main_service(out_cb):
-                                # Service started, reset TX recovery counters
-                                st.recovery_attempt_count = 0
+                                st.service_start_pending = True
+                                st.service_start_pending_since_mono = now_mono
                                 st.service_recovery_attempt_count = 0
-                                # Give service time to start producing audio
-                                time.sleep(5.0)
-                                continue
                         
-                        # TX-level recovery: only if service is running
+                        allow_soft_recovery = main_service_running or TX_ALLOW_SOFT_RECOVERY_WHEN_SERVICE_DOWN
+
+                        # Soft-lock recovery: planned sketch reset before declaring full outage.
                         if (
-                            not st.in_fault_state
-                            and not st.recovery_in_progress
+                            allow_soft_recovery
                             and missing_dur >= TX_DEAD_AIR_THRESHOLD_S
                             and (now_mono - st.last_restart_attempt_mono) >= min_restart_interval
-                            and st.recovery_attempt_count < TX_MAX_RESTART_ATTEMPTS
-                            and main_service_running  # Skip TX recovery if service is stopped
+                            and TX_SOFT_RESTART_MAX > 0
+                            and st.soft_restart_count < TX_SOFT_RESTART_MAX
                         ):
-                            st.recovery_attempt_count += 1
-                            st.recovery_in_progress = True
-                            st.recovery_started_mono = now_mono
+                            st.soft_restart_count += 1
                             st.last_restart_attempt_mono = now_mono
-                            st.audio_present_streak = 0
-                            
-                            # Close serial before reset attempt to release the port
+                            st.planned_soft_restart_until_mono = now_mono + restart_grace_s
+                            out_cb(
+                                _mk(
+                                    AnomalyCode.TX_SOFT_RESTART,
+                                    Severity.INFO,
+                                    now_ts,
+                                    message=(
+                                        f"TX soft restart attempt {st.soft_restart_count}/{TX_SOFT_RESTART_MAX} "
+                                        f"(planned sketch reset) on {port}"
+                                    ),
+                                )
+                            )
+
                             try:
                                 ser.close()
                             except Exception:
                                 pass
-                            
-                            reset_ok = _attempt_tx_reset(port, baudrate, st.recovery_attempt_count, out_cb)
-                            
+
+                            reset_ok = _attempt_tx_reset(port, baudrate, st.soft_restart_count, out_cb)
                             if not reset_ok:
-                                # Reset command itself failed - log and continue to next attempt
                                 out_cb(
                                     _mk(
                                         AnomalyCode.TX_RESTART_FAILED,
-                                        Severity.ERROR,
+                                        Severity.WARN,
                                         time.time(),
                                         message=(
-                                            f"TX restart attempt {st.recovery_attempt_count}/{TX_MAX_RESTART_ATTEMPTS} "
+                                            f"TX soft restart attempt {st.soft_restart_count}/{TX_SOFT_RESTART_MAX} "
                                             f"failed to execute on {port}"
                                         ),
                                     )
                                 )
-                                st.recovery_in_progress = False
-                            
-                            # Give sketch time to boot before re-opening serial
+
                             time.sleep(2.0)
-                            
-                            # Re-open will happen in the outer exception handler / retry loop
-                            raise Exception("Restarting serial connection after TX reset attempt")
+                            raise PlannedReconnect("planned soft restart")
+
+                        if (
+                            missing_dur >= TX_DEAD_AIR_THRESHOLD_S
+                            and TX_SOFT_RESTART_MAX > 0
+                            and st.soft_restart_count >= TX_SOFT_RESTART_MAX
+                        ):
+                            if not st.radio_offline_emitted:
+                                st.radio_offline_emitted = True
+                                st.in_fault_state = True
+                                out_cb(
+                                    _mk(
+                                        AnomalyCode.RADIO_OFFLINE,
+                                        Severity.CRITICAL,
+                                        now_ts,
+                                        message=(
+                                            f"Radio offline: dead air persists after {st.soft_restart_count} "
+                                            f"planned TX soft restarts on {port}"
+                                        ),
+                                    )
+                                )
+
+                                if _restart_main_service(out_cb):
+                                    st.service_start_pending = True
+                                    st.service_start_pending_since_mono = now_mono
 
                     if line is None:
                         continue
@@ -566,6 +682,22 @@ def monitor_tx(
                     # ---------------------------------------------------------------------------
                     # This catches the case where telemetry is flowing but no audio is present.
                     if audio_present:
+                        if st.service_start_pending:
+                            st.service_start_pending = False
+                            out_cb(
+                                _mk(
+                                    AnomalyCode.SERVICE_RECOVERY_SUCCESS,
+                                    Severity.INFO,
+                                    now_ts,
+                                    message=f"{MAIN_SERVICE_UNIT} recovered (audio restored)",
+                                )
+                            )
+
+                        if st.soft_restart_count:
+                            st.soft_restart_count = 0
+                            st.in_fault_state = False
+                            st.radio_offline_emitted = False
+
                         # Audio is present: if we were previously in sustained-silence state,
                         # emit a one-shot recovery INFO.
                         if st.silence_started_mono != 0.0:
@@ -602,10 +734,10 @@ def monitor_tx(
                                 out_cb(
                                     _mk(
                                         AnomalyCode.TX_SILENCE_DETECTED,
-                                        Severity.CRITICAL,
+                                        Severity.WARN,
                                         now_ts,
                                         message=(
-                                            f"Sustained silence on TX for {silence_duration:.1f}s on {port} "
+                                            f"Dead Air on TX for {silence_duration:.1f}s on {port} "
                                             f"(telemetry present but no audio detected)"
                                         ),
                                     )
@@ -631,52 +763,75 @@ def monitor_tx(
                                 st.last_service_recovery_mono = now_mono
                                 
                                 if _start_main_service(out_cb):
-                                    # Service started, reset TX recovery counters
-                                    st.recovery_attempt_count = 0
+                                    st.service_start_pending = True
+                                    st.service_start_pending_since_mono = now_mono
                                     st.service_recovery_attempt_count = 0
-                                    st.silence_started_mono = 0.0
-                                    # Give service time to start producing audio
-                                    time.sleep(5.0)
-                                    continue
                             
-                            # TX-level recovery: only if service is running
+                            allow_soft_recovery = main_service_running or TX_ALLOW_SOFT_RECOVERY_WHEN_SERVICE_DOWN
+
+                            # Soft-lock recovery: planned sketch reset before declaring full outage.
                             if (
-                                not st.in_fault_state
-                                and not st.recovery_in_progress
+                                allow_soft_recovery
                                 and (now_mono - st.last_restart_attempt_mono) >= min_restart_interval
-                                and st.recovery_attempt_count < TX_MAX_RESTART_ATTEMPTS
-                                and main_service_running  # Skip TX recovery if service is stopped
+                                and TX_SOFT_RESTART_MAX > 0
+                                and st.soft_restart_count < TX_SOFT_RESTART_MAX
                             ):
-                                st.recovery_attempt_count += 1
-                                st.recovery_in_progress = True
-                                st.recovery_started_mono = now_mono
+                                st.soft_restart_count += 1
                                 st.last_restart_attempt_mono = now_mono
-                                st.audio_present_streak = 0
-                                
-                                # Close serial before reset attempt to release the port
+                                st.planned_soft_restart_until_mono = now_mono + restart_grace_s
+                                out_cb(
+                                    _mk(
+                                        AnomalyCode.TX_SOFT_RESTART,
+                                        Severity.INFO,
+                                        now_ts,
+                                        message=(
+                                            f"TX soft restart attempt {st.soft_restart_count}/{TX_SOFT_RESTART_MAX} "
+                                            f"(planned sketch reset) on {port}"
+                                        ),
+                                    )
+                                )
+
                                 try:
                                     ser.close()
                                 except Exception:
                                     pass
-                                
-                                reset_ok = _attempt_tx_reset(port, baudrate, st.recovery_attempt_count, out_cb)
-                                
+
+                                reset_ok = _attempt_tx_reset(port, baudrate, st.soft_restart_count, out_cb)
                                 if not reset_ok:
                                     out_cb(
                                         _mk(
                                             AnomalyCode.TX_RESTART_FAILED,
-                                            Severity.ERROR,
+                                            Severity.WARN,
                                             time.time(),
                                             message=(
-                                                f"TX restart attempt {st.recovery_attempt_count}/{TX_MAX_RESTART_ATTEMPTS} "
-                                                f"failed to execute on {port} (silence-triggered)"
+                                                f"TX soft restart attempt {st.soft_restart_count}/{TX_SOFT_RESTART_MAX} "
+                                                f"failed to execute on {port}"
                                             ),
                                         )
                                     )
-                                    st.recovery_in_progress = False
-                                
+
                                 time.sleep(2.0)
-                                raise Exception("Restarting serial connection after TX reset attempt (silence)")
+                                raise PlannedReconnect("planned soft restart")
+
+                            if TX_SOFT_RESTART_MAX > 0 and st.soft_restart_count >= TX_SOFT_RESTART_MAX:
+                                if not st.radio_offline_emitted:
+                                    st.radio_offline_emitted = True
+                                    st.in_fault_state = True
+                                    out_cb(
+                                        _mk(
+                                            AnomalyCode.RADIO_OFFLINE,
+                                            Severity.CRITICAL,
+                                            now_ts,
+                                            message=(
+                                                f"Radio offline: dead air persists after {st.soft_restart_count} "
+                                                f"planned TX soft restarts on {port}"
+                                            ),
+                                        )
+                                    )
+
+                                    if _restart_main_service(out_cb):
+                                        st.service_start_pending = True
+                                        st.service_start_pending_since_mono = now_mono
 
                     # ---------------------------------------------------------------------------
                     # Recovery confirmation: track audio presence after restart attempts
@@ -790,6 +945,8 @@ def monitor_tx(
                                 "in_fault_state": st.in_fault_state,
                                 "recovery_in_progress": st.recovery_in_progress,
                                 "recovery_attempt_count": st.recovery_attempt_count,
+                                "soft_restart_count": st.soft_restart_count,
+                                "service_start_pending": st.service_start_pending,
                             }
                             status_p.parent.mkdir(parents=True, exist_ok=True)
                             # Use a unique tmp name to avoid collisions across processes.
@@ -806,7 +963,12 @@ def monitor_tx(
                             st.armed = False
                             st.arm_after_mono = max(st.arm_after_mono, now_mono + restart_grace_s)
 
-                            if (now_mono - st.last_restart_mono) >= emit_cooldown_s:
+                            planned_soft_restart_active = (
+                                st.planned_soft_restart_until_mono > 0.0
+                                and now_mono <= st.planned_soft_restart_until_mono
+                            )
+
+                            if (not planned_soft_restart_active) and (now_mono - st.last_restart_mono) >= emit_cooldown_s:
                                 st.last_restart_mono = now_mono
                                 out_cb(
                                     _mk(
@@ -824,6 +986,10 @@ def monitor_tx(
                     st.last_ms = ms
 
         except Exception as e:
+            if isinstance(e, PlannedReconnect):
+                # Planned reconnects are part of our recovery flow; do not emit errors.
+                time.sleep(0.25)
+                continue
             # Clean up serial if open() succeeded but with ser: block wasn't entered
             if ser is not None:
                 try:

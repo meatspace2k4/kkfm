@@ -204,16 +204,9 @@ class Detector:
                 and start_after_stop_gap >= self.expected_start_after_stop_gap_s
             )
 
-            if (not self._saw_safe_shutdown_marker) and (not expected_due_to_gap):
-                anomalies.append(
-                    Anomaly(
-                        code=AnomalyCode.AIRCHECK_UNIT_STARTED_UNEXPECTED,
-                        severity=Severity.WARN,
-                        ts=ev.ts,
-                        raw=ev.raw,
-                        message="Monitored service restarted unexpectedly",
-                    )
-                )
+            # Do not emit "unexpected restart" anomalies.
+            # In practice, planned operator actions and watchdog-driven recoveries
+            # can look like restarts, and this alert is too noisy/conflicting.
 
             # Reset marker for the next run.
             self._saw_safe_shutdown_marker = False

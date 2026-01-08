@@ -362,7 +362,7 @@ class TestTxRecoveryConstants:
     def test_dead_air_threshold_exists(self):
         """TX_DEAD_AIR_THRESHOLD_S is defined."""
         from watchdog.tx_monitor import TX_DEAD_AIR_THRESHOLD_S
-        assert TX_DEAD_AIR_THRESHOLD_S == 30.0
+        assert TX_DEAD_AIR_THRESHOLD_S == 5.0
     
     def test_max_restart_attempts_exists(self):
         """TX_MAX_RESTART_ATTEMPTS is defined."""

@@ -36,6 +36,9 @@ class AnomalyCode(str, Enum):
     RADIO_DEAD_AIR = "RADIO_DEAD_AIR"
     RADIO_DEAD_AIR_RECOVERED = "RADIO_DEAD_AIR_RECOVERED"
 
+    # System-wide state escalation
+    RADIO_OFFLINE = "RADIO_OFFLINE"  # Escalation after repeated soft recoveries
+
     # Extended playback anomalies (for comprehensive testing)
     PLAYBACK_STALL = "PLAYBACK_STALL"  # Audio position not advancing
     VOLUME_SILENT = "VOLUME_SILENT"  # Output samples all zero
@@ -53,6 +56,7 @@ class AnomalyCode(str, Enum):
     TX_HEARTBEAT_RECOVERED = "TX_HEARTBEAT_RECOVERED"  # Telemetry resumed after gap
     TX_SILENCE_DETECTED = "TX_SILENCE_DETECTED"  # Sustained silence over TX
     TX_SILENCE_RECOVERED = "TX_SILENCE_RECOVERED"  # Audio resumed after sustained silence
+    TX_SOFT_RESTART = "TX_SOFT_RESTART"  # Planned sketch restart attempt (soft-lock recovery)
     TX_SKETCH_RESTART = "TX_SKETCH_RESTART"
     TX_RECOVERY = "TX_RECOVERY"
     TX_SERIAL_ERROR = "TX_SERIAL_ERROR"
@@ -79,7 +83,8 @@ class AnomalyCode(str, Enum):
     
     # Service-level recovery (TX watchdog starting main service)
     SERVICE_RESTART_ATTEMPT = "SERVICE_RESTART_ATTEMPT"  # Attempting to start main service
-    SERVICE_RECOVERY_SUCCESS = "SERVICE_RECOVERY_SUCCESS"  # Main service started successfully
+    SERVICE_START_COMMAND_OK = "SERVICE_START_COMMAND_OK"  # systemctl start/restart command succeeded
+    SERVICE_RECOVERY_SUCCESS = "SERVICE_RECOVERY_SUCCESS"  # Main service considered recovered (e.g., audio back)
     SERVICE_RESTART_FAILED = "SERVICE_RESTART_FAILED"  # Failed to start main service
 
     # Test-injected anomalies (for E2E testing)
