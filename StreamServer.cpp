@@ -188,6 +188,8 @@ void StreamServer::configure_client_socket(int fd) {
     int set = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set));
 #endif
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     timeval tv{};
     tv.tv_sec = 10;
     tv.tv_usec = 0;

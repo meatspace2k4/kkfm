@@ -260,6 +260,10 @@ struct UIState {
 
 UIState g_ui_state;
 
+static void restore_terminal() {
+    std::cout << "\033[?25h\033[?1049l" << std::flush;
+}
+
 class TUI {
     bool is_tty;
     struct winsize w;
@@ -267,11 +271,8 @@ public:
     TUI() {
         is_tty = isatty(STDOUT_FILENO);
         if (is_tty) {
-            // Enter alternate screen buffer and hide cursor
             std::cout << "\033[?1049h\033[?25l" << std::flush;
-            
-            // Note: atexit is hard to capture "this" context or restore correctly if object destroyed first
-            // We rely on destructor.
+            std::atexit(restore_terminal);
         }
     }
     
@@ -643,7 +644,9 @@ public:
         int total = 0;
         for (const auto& entry : pool) total += entry.second;
         if (total <= 0) return nullptr;
-        int r = rand() % total;
+        static thread_local std::mt19937 tl_rng(std::random_device{}());
+        std::uniform_int_distribution<int> dist(0, total - 1);
+        int r = dist(tl_rng);
         for (const auto& entry : pool) {
             if (r < entry.second) return entry.first;
             r -= entry.second;
@@ -2154,9 +2157,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::signal(SIGINT, handle_shutdown_signal);
+    struct sigaction sa{};
+    sa.sa_handler = handle_shutdown_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &sa, nullptr);
 #ifdef SIGTERM
-    std::signal(SIGTERM, handle_shutdown_signal);
+    sigaction(SIGTERM, &sa, nullptr);
 #endif
 
     log_info(std::string(C_GREEN) + "[AIRCHECK] " + C_RESET + "Streaming radio on port " + C_BOLD + std::to_string(port) + C_RESET + " (visit /stream)");
