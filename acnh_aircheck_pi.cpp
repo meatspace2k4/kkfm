@@ -382,7 +382,7 @@ const int   HARDWARE_GAIN_Q15 = (int)(HARDWARE_GAIN * 32768.0f);
 
 const float DEFAULT_NO_OVERLAY_DELAY = 11.0f;
 
-const float FADE_PLAY_DURATION = 10.0f; 
+const float FADE_PLAY_DURATION = 11.0f; 
 const float FADE_TIME_DURATION = 7.0f;
 
 // ---------------------------------------------------------------------------
