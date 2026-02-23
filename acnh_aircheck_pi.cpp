@@ -1789,7 +1789,7 @@ public:  // Allow test access to private members in unit test mode
         if (it != ctx_cache.end()) {
             // BWAVParser::parse() (and its [BWAV] log) only runs on first load.
             // Emit a stable log line when we reuse a cached context.
-            log_info_f(C_GRAY "[CACHE] " C_RESET C_CYAN "%s" C_RESET " (id=%d, size=%u)",
+            log_info_f(C_GRAY "[CACHED] " C_RESET C_CYAN "%s" C_RESET " (id=%d, size=%u)",
                        (meta->name ? meta->name : "(null)"), meta->id, (unsigned)meta->size);
             return it->second;
         }
@@ -1844,19 +1844,21 @@ public:  // Allow test access to private members in unit test mode
 
        if (song_first_allowed) {
            decision.plan = OverlayPlan::SongFirst;
-           decision.intro_delay = compute_song_first_intro_delay(decision.loop_start_sec,
-                                                                 decision.lead_in_sec,
-                                                                 decision.intro_sec,
-                                                                 beat_len,
-                                                                 bar_len);
+           decision.intro_delay = compute_song_first_intro_delay(
+                decision.loop_start_sec,
+                decision.lead_in_sec,
+                decision.intro_sec,
+                beat_len,
+                bar_len);
            decision.song_delay = 0.0f;
        } else if (intro_first_allowed) {
            decision.plan = OverlayPlan::IntroFirst;
            decision.intro_delay = 0.0f;
-           decision.song_delay = compute_intro_first_song_delay(decision.intro_sec,
-                                                                decision.lead_in_sec,
-                                                                beat_len,
-                                                                bar_len);
+           decision.song_delay = compute_intro_first_song_delay(
+                decision.intro_sec,
+                decision.lead_in_sec,
+                beat_len,
+                bar_len);
        } else {
            decision.plan = OverlayPlan::NoOverlay;
            decision.intro_delay = 0.0f;
