@@ -176,6 +176,22 @@ def _restart_main_service(out_cb: Callable[[Anomaly], None]) -> bool:
         return False
 
 
+def _hard_reboot(out_cb: Callable[[Anomaly], None]) -> None:
+    """Last-resort: reboot the Pi to power-cycle the Si4713."""
+    out_cb(
+        Anomaly(
+            code=AnomalyCode.TX_HARD_REBOOT,
+            severity=Severity.CRITICAL,
+            ts=time.time(),
+            message="All TX recovery exhausted — rebooting Pi to power-cycle Si4713",
+        )
+    )
+    try:
+        subprocess.run(["sudo", "reboot"], timeout=10.0, capture_output=True)
+    except Exception:
+        pass
+
+
 TELEMETRY_RE = re.compile(
     r"^(?P<ms>\d+)\s+"
     r"(?P<freq>\d+(?:\.\d+)?)\s+"
@@ -217,6 +233,7 @@ class TxState:
     service_start_pending_since_mono: float = 0.0
 
     radio_offline_emitted: bool = False
+    hard_reboot_scheduled: bool = False  # True when hard reboot is pending
     # Heartbeat recovery tracking
     was_missing_heartbeat: bool = False  # Track if we were in missing-heartbeat state
     # Service-level recovery tracking
@@ -235,6 +252,17 @@ try:
     SERVICE_RESTART_INTERVAL_S = float(os.environ.get("WATCHDOG_SERVICE_RESTART_INTERVAL_S", "60.0"))
 except Exception:
     SERVICE_RESTART_INTERVAL_S = 60.0
+
+# Hard reboot: power-cycle the Pi (and Si4713) as last resort.
+# Only triggers if WATCHDOG_TX_HARD_REBOOT=1 and all softer recovery is exhausted.
+TX_HARD_REBOOT_ENABLED = os.environ.get(
+    "WATCHDOG_TX_HARD_REBOOT", "0"
+).strip().lower() in ("1", "true", "yes", "y", "on")
+
+try:
+    TX_HARD_REBOOT_GRACE_S = float(os.environ.get("WATCHDOG_TX_HARD_REBOOT_GRACE_S", "120.0"))
+except Exception:
+    TX_HARD_REBOOT_GRACE_S = 120.0
 
 
 def _mk(
@@ -657,6 +685,18 @@ def monitor_tx(
                                     st.service_start_pending = True
                                     st.service_start_pending_since_mono = now_mono
 
+                            # Hard reboot escalation: if fault state persists
+                            # past the grace window, power-cycle the Pi.
+                            if (
+                                st.in_fault_state
+                                and not st.hard_reboot_scheduled
+                                and TX_HARD_REBOOT_ENABLED
+                                and st.radio_offline_emitted
+                                and (now_mono - st.service_start_pending_since_mono) >= TX_HARD_REBOOT_GRACE_S
+                            ):
+                                st.hard_reboot_scheduled = True
+                                _hard_reboot(out_cb)
+
                     if line is None:
                         continue
 
@@ -697,6 +737,7 @@ def monitor_tx(
                             st.soft_restart_count = 0
                             st.in_fault_state = False
                             st.radio_offline_emitted = False
+                            st.hard_reboot_scheduled = False
 
                         # Audio is present: if we were previously in sustained-silence state,
                         # emit a one-shot recovery INFO.

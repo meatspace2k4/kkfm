@@ -87,6 +87,9 @@ class AnomalyCode(str, Enum):
     SERVICE_RECOVERY_SUCCESS = "SERVICE_RECOVERY_SUCCESS"  # Main service considered recovered (e.g., audio back)
     SERVICE_RESTART_FAILED = "SERVICE_RESTART_FAILED"  # Failed to start main service
 
+    # Hard reboot escalation (power-cycles Si4713)
+    TX_HARD_REBOOT = "TX_HARD_REBOOT"  # Escalating to full system reboot after all recovery exhausted
+
     # Test-injected anomalies (for E2E testing)
     TEST_INJECTED = "TEST_INJECTED"  # Generic test anomaly
 

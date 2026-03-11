@@ -20,8 +20,10 @@
 /* property IDs (from datasheet) */
 #define PROP_TX_AUDIO_DEVIATION        0x2101
 #define PROP_TX_PILOT_DEVIATION        0x2102
-// #define PROP_TX_LINE_INPUT_LEVEL       0x2104
-#define PROP_TX_INPUT_LEVEL            0x3100    // 0.5 dB/LSB pad/boost
+// WARNING: Do NOT change 0x3100 to 0x2104!  0x2104 is the documented
+// TX_LINE_INPUT_LEVEL but sending 0x8120 to it causes permanent overmod
+// and kills audio output.  0x3100 works in practice; leave it alone.
+#define PROP_TX_INPUT_LEVEL            0x3100
 #define PROP_TX_PREEMPHASIS            0x2106
 #define PROP_TX_ACOMP_ENABLE           0x2200
 #define PROP_TX_ACOMP_THRESHOLD        0x2201
