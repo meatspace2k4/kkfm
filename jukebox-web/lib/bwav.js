@@ -142,6 +142,29 @@ export function validateSource(arrayBuffer) {
     throw new BwavIntegrityError(
       `CRC mismatch: computed 0x${got.toString(16)} != stored 0x${ctx.storedCrc.toString(16)}`);
   }
+  // IMPORTANT: the CRC above covers only the audio body — it does NOT cover
+  // loop_start/loop_end (or any other channel-info field). A corrupted loop
+  // point would sail straight through the CRC check, then send the decoder's
+  // loop jump to a garbage byte offset. In JS, reading past a Uint8Array's end
+  // silently yields `undefined`, which bitwise ops coerce to 0 rather than
+  // throwing — so without this check, corrupted loop metadata would decode to
+  // quietly-wrong (not obviously corrupt) audio instead of failing loudly.
+  // Validate the loop fields against the same CRC-verified body length.
+  const loopable = ctx.loopEnd > 0 && ctx.loopStart !== 0xffffffff && ctx.loopEnd > ctx.loopStart;
+  if (ctx.loopEnd > 0 && ctx.loopStart !== 0xffffffff) {
+    if (ctx.loopStart >= ctx.loopEnd) {
+      throw new BwavIntegrityError(`invalid loop range: loop_start ${ctx.loopStart} >= loop_end ${ctx.loopEnd}`);
+    }
+    if (ctx.loopEnd > ctx.samplesThis) {
+      throw new BwavIntegrityError(`invalid loop range: loop_end ${ctx.loopEnd} exceeds sample count ${ctx.samplesThis}`);
+    }
+    const loopJumpByteOffset = Math.floor(ctx.loopStart / BLK_SAMP) * BLK_BYTES;
+    if (loopJumpByteOffset >= bodyLen) {
+      throw new BwavIntegrityError(
+        `invalid loop_start ${ctx.loopStart}: jump target byte ${loopJumpByteOffset} is past the ${bodyLen}-byte audio body`);
+    }
+  }
+  ctx.loopable = loopable;
   return ctx;
 }
 
@@ -199,7 +222,18 @@ export class BwavDecoder {
       this.samplePos = this.ctx.loopStart;
     }
 
-    if (this.ofs >= this.ctx.rawLen && !this.loopable) return 0;
+    if (this.ofs >= this.ctx.rawLen) {
+      if (!this.loopable) return 0;
+      // Reactive backstop: this should be unreachable given validateSource's
+      // proactive loop-metadata check (loop_start's jump target is verified
+      // to land inside the audio body before decode ever starts). If it's
+      // reached anyway, loop metadata is corrupt in a way that check missed —
+      // fail loudly rather than silently read past the buffer (which in JS
+      // returns `undefined`, coerced to 0 by the bitwise ops below, producing
+      // plausible-looking but wrong audio instead of an obvious failure).
+      throw new BwavIntegrityError(
+        `corrupt loop metadata: loop jump landed past end of audio data (ofs=${this.ofs}, rawLen=${this.ctx.rawLen})`);
+    }
 
     const hdr = rw[this.ofs++];
     const scale = 1 << (hdr & 0x0f);

@@ -43,5 +43,17 @@ allGood &= expectPass('clean Hifi file', abOf(clean));
 // 8. single bit flip mid-file
 { const c = Buffer.from(clean); c[Math.floor(c.length/2)] ^= 0x08; allGood &= expectReject('mid-file bit flip', abOf(c)); }
 
+// 9. corrupted loop_start (channel-info field at ci+64 = 0x50) — NOT covered
+// by the body CRC, so this must be caught by validateSource's own loop-range
+// check, not the CRC gate. This is the "quiet garbage" scenario: without the
+// dedicated check, the decoder's loop jump would land on a huge byte offset,
+// which in JS reads as `undefined` -> coerced to 0 by bitwise ops -> silently
+// wrong audio that still passes the finite/in-range post-decode check.
+{ const c = Buffer.from(clean); c.writeUInt32LE(0x7fffffff, 0x50); allGood &= expectReject('corrupted loop_start (out of body range)', abOf(c)); }
+
+// 10. loop_start >= loop_end (nonsensical but each field individually "valid").
+// loop_end is channel-info offset 0x3C == absolute 16+0x3C == 0x4C.
+{ const c = Buffer.from(clean); const loopEnd = c.readUInt32LE(0x4c); c.writeUInt32LE(loopEnd + 1000, 0x50); allGood &= expectReject('loop_start >= loop_end', abOf(c)); }
+
 console.log('\n' + (allGood ? 'ALL SAFETY GATES OK ✓' : 'SAFETY GATE FAILURE ✗'));
 process.exit(allGood ? 0 : 1);
