@@ -19,6 +19,8 @@ import styles from '@/styles/Home.module.scss';
 import { useIsTouchDevice, useKeydown, useLocalStorage } from '@/lib/hooks';
 import { makeIdFromSongName, shuffleInPlace } from '@/lib/utils';
 import { getBwavPlayer } from '@/lib/bwavPlayer';
+import { getDiscordInstanceId } from '@/lib/discordShell';
+import { fetchBroadcastPosition } from '@/lib/broadcastSync';
 
 /**
  * The main app component
@@ -88,6 +90,66 @@ export default function Home({ songs }: { songs: Song[] }) {
     return songs[idx];
   }
 
+  /**
+   * Multicast broadcast sync: everyone in the same Discord Activity session
+   * (same voice channel -> same instanceId, see lib/discordShell) hears the
+   * same song at the same position, like tuning into a station. The server
+   * (jukebox_pi's /now-playing) is the single authority on "what song, since
+   * when" per instance; this client just asks it and starts mid-buffer at the
+   * reported offset -- AudioBufferSourceNode.start(when, offset) seeks into
+   * the already-fully-decoded buffer natively, no extra plumbing needed.
+   *
+   * `synced` tracks whether the CURRENT playback is following the broadcast
+   * (true, the default -- this is what makes it multicast "out of the box")
+   * or is a solo listen the user chose explicitly (a tile click or Random,
+   * which sets it false). A solo pick's natural end returns to the broadcast
+   * automatically, so "everyone hears the same thing" is the steady state.
+   */
+  const syncedRef = useRef(true);
+  const instanceIdRef = useRef<string | null>(null);
+  const resyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const joinBroadcast = async () => {
+    if (resyncTimerRef.current) { clearTimeout(resyncTimerRef.current); resyncTimerRef.current = null; }
+    try {
+      const pos = await fetchBroadcastPosition(instanceIdRef.current);
+      const song = songs.find((s) => s.id === pos.songId);
+      if (!song) return; // server knows a song this client's build doesn't ship; skip silently
+
+      syncedRef.current = true;
+      setCurrentSong(song);
+      const el = document.getElementById(makeIdFromSongName(song.name['name-USen']));
+      el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+      await getBwavPlayer().play(song.music_uri, { offsetSec: pos.offsetSec });
+
+      // Belt-and-suspenders resync timer for whatever's left of this song, in
+      // case the 'bwav-ended' event is ever missed (tab throttling, etc.) --
+      // the ended-handler below normally fires first and clears this.
+      const remainingMs = Math.max(1000, (pos.durationSec - pos.offsetSec) * 1000 + 500);
+      resyncTimerRef.current = setTimeout(() => {
+        if (syncedRef.current) joinBroadcast();
+      }, remainingMs);
+    } catch (err) {
+      console.error('[broadcast] join failed:', err);
+      // Retry shortly rather than leaving the room permanently out of sync.
+      resyncTimerRef.current = setTimeout(() => joinBroadcast(), 5000);
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      instanceIdRef.current = await getDiscordInstanceId();
+      if (!cancelled) joinBroadcast();
+    })();
+    return () => {
+      cancelled = true;
+      if (resyncTimerRef.current) clearTimeout(resyncTimerRef.current);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   //
   // Component Functions
   //
@@ -105,6 +167,13 @@ export default function Home({ songs }: { songs: Song[] }) {
   const handlePlay = () => {
     const uri = pendingUriRef.current;
     if (!uri) return;
+    // Any explicit single-song play (tile click, or Random via playRandomSong
+    // below) is a deliberate solo listen, not the shared broadcast -- stop
+    // following it, and cancel any pending resync so it can't cut this off
+    // mid-play. The 'bwav-ended' handler returns to the broadcast once this
+    // song naturally finishes.
+    syncedRef.current = false;
+    if (resyncTimerRef.current) { clearTimeout(resyncTimerRef.current); resyncTimerRef.current = null; }
     getBwavPlayer().play(uri).catch((err: unknown) => console.error('[bwav] play failed:', err));
   }
 
@@ -170,13 +239,17 @@ export default function Home({ songs }: { songs: Song[] }) {
   playRandomRef.current = playRandomSong; // Manually set ref after fn creation
 
   /**
-   * When a song finishes naturally (loop played twice, then faded to
-   * silence — see lib/bwavPlayer), auto-advance to another song drawn from
-   * the same shuffle-bag pool. Guarded by the player's own token check, so
-   * this never fires for a song the user paused/skipped away from.
+   * When a song finishes naturally (loop played twice, plays on, then fades
+   * to silence — see lib/bwavPlayer), rejoin the shared broadcast. This is
+   * true whether the song that just ended was itself the broadcast (the
+   * common case) or a solo pick (Random / a tile click): either way, once
+   * it's over, playback returns to "everyone hears the same thing" rather
+   * than continuing to wander off on its own pool. Guarded by the player's
+   * own token check, so this never fires for a song the user paused/skipped
+   * away from mid-play.
    */
   useEffect(() => {
-    const onEnded = () => playRandomSong();
+    const onEnded = () => { joinBroadcast(); };
     window.addEventListener('bwav-ended', onEnded);
     return () => window.removeEventListener('bwav-ended', onEnded);
   // eslint-disable-next-line react-hooks/exhaustive-deps

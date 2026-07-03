@@ -157,7 +157,12 @@ export class BwavPlayer {
     return buf;
   }
 
-  async play(url) {
+  // opts.offsetSec: start mid-buffer (broadcast sync -- "tune in" at the
+  // server's authoritative position instead of always restarting at 0).
+  // Clamped to the buffer's own decoded length regardless of what the caller
+  // asked for, so a stale/optimistic server estimate can never seek past the
+  // end of what was actually decoded.
+  async play(url, opts = {}) {
     if (this.locked) {
       throw new BwavIntegrityError(`player hard-locked: ${this.lockReason}`);
     }
@@ -196,6 +201,10 @@ export class BwavPlayer {
     if (myToken !== this.token || this.locked) return;
 
     const { rate, samples } = decoded;
+    const bufferDurationSec = samples.length / rate;
+    const requestedOffset = Number.isFinite(opts.offsetSec) ? opts.offsetSec : 0;
+    const offsetSec = Math.min(Math.max(requestedOffset, 0), Math.max(0, bufferDurationSec - 0.05));
+
     const songSrc = ctx.createBufferSource();
     songSrc.buffer = this._stereoBuffer(samples, rate);
     songSrc.connect(this.gain);
@@ -212,7 +221,11 @@ export class BwavPlayer {
         window.dispatchEvent(new CustomEvent('bwav-ended', { detail: { url } }));
       }
     };
-    songSrc.start(ctx.currentTime + 0.03); // small lead so scheduling isn't right on the edge
+    // Small lead so scheduling isn't right on the edge; offsetSec seeks into
+    // the already-fully-decoded buffer (this is the "infra to jump to an
+    // arbitrary point" the sync feature relies on -- no extra plumbing needed,
+    // AudioBufferSourceNode.start(when, offset) does it natively).
+    songSrc.start(ctx.currentTime + 0.03, offsetSec);
     this.songSrc = songSrc;
 
     this._startWatchdog();

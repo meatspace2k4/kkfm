@@ -6,6 +6,38 @@
 #include <csignal>
 #include <sys/wait.h>
 
+namespace {
+
+// Pulls `key=value` out of a raw query string (already split off the path).
+// Sanitizes to a conservative charset and length -- the result becomes a
+// std::unordered_map key and appears in logs, so it must never carry
+// attacker-controlled bytes through untouched.
+std::string extract_query_param(const std::string& query, const std::string& key) {
+    std::string needle = key + "=";
+    size_t pos = 0;
+    while (pos < query.size()) {
+        size_t amp = query.find('&', pos);
+        std::string pair = query.substr(pos, amp == std::string::npos ? std::string::npos : amp - pos);
+        if (pair.compare(0, needle.size(), needle) == 0) {
+            std::string val = pair.substr(needle.size());
+            std::string safe;
+            for (char c : val) {
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                    c == '-' || c == '_') {
+                    safe.push_back(c);
+                }
+                if (safe.size() >= 64) break;
+            }
+            return safe;
+        }
+        if (amp == std::string::npos) break;
+        pos = amp + 1;
+    }
+    return "";
+}
+
+} // namespace
+
 bool JukeboxServer::send_all_fd(int fd, const void* data, size_t len) {
     if (fd < 0 || !data || len == 0) return true;
     const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -173,12 +205,27 @@ void JukeboxServer::handle_client(int client_fd) {
         return;
     }
 
-    // Strip any query string before routing (Next.js adds cache-busters).
+    // Strip any query string before routing (Next.js adds cache-busters), but
+    // keep it around for routes that need it (e.g. /now-playing's ?instance=).
+    std::string query;
     size_t q = path.find('?');
-    if (q != std::string::npos) path.resize(q);
+    if (q != std::string::npos) {
+        query = path.substr(q + 1);
+        path.resize(q);
+    }
 
     if (path == "/discord-config") {
         send_discord_config(client_fd);
+        return;
+    }
+
+    if (path == "/now-playing") {
+        std::string instance_id = extract_query_param(query, "instance");
+        if (now_playing_handler) {
+            now_playing_handler(client_fd, instance_id);
+        } else {
+            send_not_found(client_fd);
+        }
         return;
     }
 

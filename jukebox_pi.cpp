@@ -46,6 +46,7 @@
 #include <iterator>
 #include <unordered_map>
 #include <cstdarg>
+#include <filesystem>
 
 // ---------------------------------------------------------------------------
 // Runtime Sample Rate (derived from BWAV headers)
@@ -363,7 +364,12 @@ const int   HARDWARE_GAIN_Q15 = (int)(HARDWARE_GAIN * 32768.0f);
 
 const float DEFAULT_NO_OVERLAY_DELAY = 11.0f;
 
-const float FADE_PLAY_DURATION = 10.0f; 
+// Kept in sync with lib/bwav.js's FADE_PLAY_SECONDS/FADE_SECONDS (jukebox's
+// client-side decode) -- this jukebox_pi.cpp fork's copy of the constant was
+// forked before origin/dev commit 6150710 bumped it 10.0f -> 11.0f; matching
+// it here keeps the server's broadcast-schedule duration estimate in step
+// with what the client actually decodes and plays.
+const float FADE_PLAY_DURATION = 11.0f;
 const float FADE_TIME_DURATION = 7.0f;
 
 // ---------------------------------------------------------------------------
@@ -2136,8 +2142,7 @@ void send_song_error(int fd, const char* status_line) {
     JukeboxServer::send_string_fd(fd, hdr.str());
 }
 
-// Renders one song as a fixed-length WAV over the socket. Runs on the
-// Directory of raw Phono .bwav files, named <binId>.bwav. Set from
+// Directory of raw bwav files, named <binId>.bwav. Set from
 // ACNH_JUKEBOX_BWAV_ROOT (default alongside the web root).
 std::string g_bwav_root = "bwav";
 
@@ -2182,6 +2187,220 @@ void serve_raw_bwav(int fd, int song_id, bool head_only) {
     }
 }
 
+// ============================================================================
+// Broadcast sync: all listeners in the same Discord Activity session (voice
+// channel) hear the same song at the same position, "tune in" radio-style.
+//
+// Discord's Embedded App SDK exposes `instanceId`, shared by everyone
+// connected to the same Activity instance (docs.discord.com/developers/
+// activities/development-guides/multiplayer-experience: "Any users joining
+// the same application will receive the same instanceId... should be used as
+// a key to save and load the shared data relevant to an application"). Discord
+// provides no relay itself, just that key -- so this server is the shared
+// backend the docs say to bring: one authoritative {songId, startedAtMs} per
+// instanceId, computed lazily (no background thread needed) by advancing
+// through a shuffle-bag pool every time elapsed real time crosses a song's
+// duration, however many requests come in.
+//
+// Duration per song is computed once at startup by reading each bwav's
+// header (rate/loop points) with the SAME loop-once-more(twice
+// total)+FADE_PLAY_DURATION+FADE_TIME_DURATION formula the client's
+// lib/bwav.js decodeFullPlayback uses, so the server's schedule and the
+// client's actual decoded buffer length agree to within float rounding
+// (a client further clamps its own seek offset to its own decoded length,
+// so sub-second server/client duration drift is harmless -- this doesn't
+// need to be sample-accurate, just close).
+// ============================================================================
+
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// Reads just the bwav header (channel-info block) to compute total playback
+// duration without touching the (possibly multi-MB) audio body.
+double compute_bwav_duration_seconds(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return 0.0;
+    unsigned char hdr[96] = {0};
+    f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+    if (f.gcount() < (std::streamsize)sizeof(hdr)) return 0.0;
+    if (std::memcmp(hdr, "BWAV", 4) != 0) return 0.0;
+
+    auto ru16 = [&](int off) -> uint16_t {
+        return (uint16_t)(hdr[off] | (hdr[off + 1] << 8));
+    };
+    auto ru32 = [&](int off) -> uint32_t {
+        return (uint32_t)hdr[off] | ((uint32_t)hdr[off + 1] << 8) |
+               ((uint32_t)hdr[off + 2] << 16) | ((uint32_t)hdr[off + 3] << 24);
+    };
+
+    if (ru16(4) != 0xFEFF || ru16(14) != 1) return 0.0; // bom / mono channel count
+
+    const int ci = 16;
+    uint32_t rate = ru32(ci + 4);
+    uint32_t samples_this = ru32(ci + 12);
+    uint32_t loop_end = ru32(ci + 60);
+    uint32_t loop_start = ru32(ci + 64);
+    if (rate == 0) return 0.0;
+
+    bool loopable = loop_end > 0 && loop_start != 0xFFFFFFFFu && loop_end > loop_start;
+    double total_frames;
+    if (loopable) {
+        double body_len = (double)(loop_end - loop_start);
+        double extra_play_samples = std::trunc((double)FADE_PLAY_DURATION * (double)rate);
+        double fade_samples = std::trunc((double)FADE_TIME_DURATION * (double)rate);
+        total_frames = (double)loop_end + body_len + extra_play_samples + fade_samples;
+    } else {
+        total_frames = (double)samples_this;
+    }
+    return total_frames / (double)rate;
+}
+
+struct SongInfo {
+    int id;
+    double duration_sec;
+};
+
+std::vector<SongInfo> g_playable_songs; // built at startup from g_bwav_root
+
+void load_playable_songs() {
+    g_playable_songs.clear();
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(g_bwav_root, ec)) {
+        if (ec || !entry.is_regular_file()) continue;
+        std::string name = entry.path().filename().string();
+        if (name.size() < 6 || name.substr(name.size() - 5) != ".bwav") continue;
+        std::string stem = name.substr(0, name.size() - 5);
+        if (stem.empty() || !std::all_of(stem.begin(), stem.end(), ::isdigit)) continue;
+
+        int id = std::atoi(stem.c_str());
+        double dur = compute_bwav_duration_seconds(entry.path().string());
+        if (dur <= 0.0) {
+            log_error("[JUKEBOX] skipping unparseable bwav for broadcast schedule: " + name);
+            continue;
+        }
+        g_playable_songs.push_back({id, dur});
+    }
+    std::sort(g_playable_songs.begin(), g_playable_songs.end(),
+              [](const SongInfo& a, const SongInfo& b) { return a.id < b.id; });
+    log_info("[JUKEBOX] broadcast schedule loaded: " + std::to_string(g_playable_songs.size()) + " songs");
+}
+
+const SongInfo* find_song_info(int id) {
+    for (const auto& s : g_playable_songs) if (s.id == id) return &s;
+    return nullptr;
+}
+
+struct BroadcastSession {
+    int current_song_id = -1;
+    int64_t started_at_ms = 0;
+    std::vector<int> pool;    // remaining shuffle-bag draw pool
+    int64_t last_access_ms = 0;
+};
+
+std::mutex g_sessions_mutex;
+std::unordered_map<std::string, BroadcastSession> g_sessions;
+std::mt19937 g_broadcast_rng{std::random_device{}()};
+
+void rehydrate_pool(std::vector<int>& pool) {
+    pool.clear();
+    for (const auto& s : g_playable_songs) pool.push_back(s.id);
+}
+
+int draw_from_pool(std::vector<int>& pool) {
+    if (pool.empty()) rehydrate_pool(pool);
+    std::shuffle(pool.begin(), pool.end(), g_broadcast_rng);
+    int id = pool.back();
+    pool.pop_back();
+    if (pool.empty()) rehydrate_pool(pool);
+    return id;
+}
+
+// Returns a snapshot {songId, startedAtMs} for the given instance, advancing
+// through the shuffle-bag pool as many times as real time has actually
+// elapsed since the last request (so a session nobody polled for an hour
+// catches up correctly instead of getting stuck replaying one long song).
+struct BroadcastState { int song_id; int64_t started_at_ms; double duration_sec; };
+
+BroadcastState get_broadcast_state(const std::string& instance_id) {
+    std::lock_guard<std::mutex> lock(g_sessions_mutex);
+    BroadcastSession& sess = g_sessions[instance_id]; // creates on first use
+    int64_t now = now_ms();
+    sess.last_access_ms = now;
+
+    if (sess.current_song_id < 0) {
+        sess.current_song_id = draw_from_pool(sess.pool);
+        sess.started_at_ms = now;
+    }
+
+    // Advance through however many songs have fully elapsed since we were
+    // last asked. Bounded loop: g_playable_songs is never empty here (main()
+    // refuses to start the server if it is), so each iteration always makes
+    // forward progress.
+    for (int guard = 0; guard < 100000; ++guard) {
+        const SongInfo* info = find_song_info(sess.current_song_id);
+        double dur = info ? info->duration_sec : 30.0; // defensive fallback
+        int64_t ends_at = sess.started_at_ms + (int64_t)(dur * 1000.0);
+        if (now < ends_at) break;
+        sess.current_song_id = draw_from_pool(sess.pool);
+        sess.started_at_ms = ends_at;
+    }
+
+    const SongInfo* info = find_song_info(sess.current_song_id);
+    return { sess.current_song_id, sess.started_at_ms, info ? info->duration_sec : 30.0 };
+}
+
+// Idle sessions (nobody's asked about that instance in a while -- the voice
+// channel Activity ended) are pruned so g_sessions doesn't grow unbounded
+// across a long-running server. Called opportunistically from the
+// /now-playing handler, not a dedicated thread.
+void sweep_idle_sessions() {
+    constexpr int64_t IDLE_LIMIT_MS = 30LL * 60 * 1000; // 30 minutes
+    int64_t now = now_ms();
+    std::lock_guard<std::mutex> lock(g_sessions_mutex);
+    for (auto it = g_sessions.begin(); it != g_sessions.end(); ) {
+        if (now - it->second.last_access_ms > IDLE_LIMIT_MS) it = g_sessions.erase(it);
+        else ++it;
+    }
+}
+
+// Handles GET /now-playing?instance=<id>. instance_id comes from the request
+// path's query string, already extracted by JukeboxServer before this is
+// called; an empty id is valid (a single shared "no instance" broadcast,
+// used for plain-browser testing outside Discord where there's no shared
+// instanceId to key off of).
+void handle_now_playing(int fd, const std::string& instance_id) {
+    if (g_playable_songs.empty()) {
+        send_song_error(fd, "503 Service Unavailable");
+        return;
+    }
+    static std::atomic<int> sweep_counter{0};
+    if ((sweep_counter.fetch_add(1) % 64) == 0) sweep_idle_sessions();
+
+    BroadcastState state = get_broadcast_state(instance_id);
+    int64_t server_now = now_ms();
+
+    std::ostringstream json;
+    json << "{"
+         << "\"songId\":" << state.song_id << ","
+         << "\"startedAtMs\":" << state.started_at_ms << ","
+         << "\"serverNowMs\":" << server_now << ","
+         << "\"durationMs\":" << (int64_t)(state.duration_sec * 1000.0)
+         << "}";
+
+    std::string body = json.str();
+    std::ostringstream hdr;
+    hdr << "HTTP/1.1 200 OK\r\n"
+        << "Content-Type: application/json; charset=utf-8\r\n"
+        << "Content-Length: " << body.size() << "\r\n"
+        << "Access-Control-Allow-Origin: *\r\n"
+        << "Cache-Control: no-store\r\n"
+        << "Connection: close\r\n\r\n";
+    if (!JukeboxServer::send_string_fd(fd, hdr.str())) return;
+    JukeboxServer::send_string_fd(fd, body);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2218,8 +2437,14 @@ int main(int argc, char** argv) {
         g_bwav_root = env_bwav;
     }
 
+    load_playable_songs();
+    if (g_playable_songs.empty()) {
+        log_error("[JUKEBOX] no playable songs found under " + g_bwav_root + " -- broadcast sync disabled");
+    }
+
     JukeboxServer server(web_root);
     server.set_song_streamer(serve_raw_bwav);
+    server.set_now_playing_handler(handle_now_playing);
     if (!server.start(port, localhost_only)) {
         log_error("[WEB] Failed to start jukebox server on port " + std::to_string(port));
         return 1;

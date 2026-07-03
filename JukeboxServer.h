@@ -44,6 +44,9 @@ public:
     // fd is the accepted client socket; the hook owns writing the entire HTTP
     // response (status line, headers, WAV body) and must not close fd.
     using SongStreamer = std::function<void(int fd, int song_id, bool head_only)>;
+    // Handles GET /now-playing?instance=<id>; instance_id may be empty (no
+    // query param / not inside Discord). Hook owns writing the whole response.
+    using NowPlayingHandler = std::function<void(int fd, const std::string& instance_id)>;
 
     explicit JukeboxServer(std::string web_root)
         : web_root(std::move(web_root)), running(false), listen_fd(-1), port(0) {}
@@ -51,6 +54,7 @@ public:
     ~JukeboxServer() { stop(); }
 
     void set_song_streamer(SongStreamer s) { song_streamer = std::move(s); }
+    void set_now_playing_handler(NowPlayingHandler h) { now_playing_handler = std::move(h); }
 
     bool start(uint16_t listen_port, bool localhost_only = false);
     void stop();
@@ -62,6 +66,7 @@ public:
 private:
     std::string web_root;
     SongStreamer song_streamer;
+    NowPlayingHandler now_playing_handler;
     std::atomic<bool> running;
     std::thread accept_thread;
     int listen_fd;
