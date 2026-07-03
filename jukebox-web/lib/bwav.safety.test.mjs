@@ -1,15 +1,15 @@
-import { validateSource, decodeToBuffers, BwavIntegrityError } from '/Users/johusha/kkfm-jukebox/jukebox-web/lib/bwav.js';
+import { validateSource, decodeFullPlayback, BwavIntegrityError } from '/Users/johusha/kkfm-jukebox/jukebox-web/lib/bwav.js';
 import { readFileSync } from 'node:fs';
 
 const clean = readFileSync('/Users/johusha/kkfm-jukebox/bwav/1.bwav');
 const abOf = (buf) => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
 
 function expectPass(name, ab) {
-  try { validateSource(ab); decodeToBuffers(ab); console.log('PASS-OK  ', name); return true; }
+  try { validateSource(ab); decodeFullPlayback(ab); console.log('PASS-OK  ', name); return true; }
   catch (e) { console.log('FAIL     ', name, '->', e.message); return false; }
 }
 function expectReject(name, ab) {
-  try { decodeToBuffers(ab); console.log('LEAK!!   ', name, '-> accepted corrupt input'); return false; }
+  try { decodeFullPlayback(ab); console.log('LEAK!!   ', name, '-> accepted corrupt input'); return false; }
   catch (e) {
     const ok = e instanceof BwavIntegrityError;
     console.log(ok ? 'REJECT-OK' : 'WRONGERR ', name, '->', e.name + ': ' + e.message.slice(0,60));

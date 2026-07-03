@@ -2,7 +2,15 @@
 // Replaces the acnh-jukebox <audio> element: the browser can't decode BWAV, so
 // we fetch the compressed bytes and decode them here with lib/bwav.js (the
 // bit-exact port of the radio engine's GC-ADPCM decoder), then play mono ->
-// stereo through Web Audio with sample-accurate intro + gapless native loop.
+// stereo through Web Audio.
+//
+// Playback is procedural, matching Track::pull() in the C++ engine: the whole
+// song (intro, loop body played twice, then a fade to silence) is decoded up
+// front by decodeFullPlayback() into one PCM buffer — the loop/fade shape is
+// state the decoder tracks internally and bakes directly into the samples,
+// not something we schedule afterward. So playback here is just "play this
+// buffer once and tell me when it ends" (native 'onended'); there's no
+// separate stop-time or gain-automation scheduling to get out of sync.
 //
 // SAFETY — HARD LOCK. Corrupt or distorted audio must never reach the speaker.
 // Defenses, in order:
@@ -17,7 +25,7 @@
 // the AudioContext is closed, and the player latches — it will not play again
 // until reset() (a deliberate user action), so a bad state can't "recover" into
 // noise. The latch is the whole point: fail closed, silent, and stay there.
-import { decodeToBuffers, BwavIntegrityError } from './bwav';
+import { decodeFullPlayback, BwavIntegrityError } from './bwav';
 
 // Watchdog trips if this many consecutive output samples sit at/near full
 // scale (square-wave / DC rail — the signature of decode corruption). Real
@@ -28,18 +36,18 @@ const RAIL_RUN_LIMIT = 4096;
 export class BwavPlayer {
   constructor() {
     this.ctx = null;
-    this.introSrc = null;
-    this.loopSrc = null;
-    this.gain = null;
+    this.songSrc = null;      // single AudioBufferSourceNode for the whole decoded song
+    this.gain = null;         // master volume (user-controlled)
     this.analyser = null;
     this.watchTimer = null;
     this.token = 0; // bumps on every play/stop so stale async loads are ignored
     this.volume = 1;
     this.locked = false;      // latched hard-lock; refuses playback while true
     this.lockReason = null;
-    this._cache = new Map();  // url -> decoded buffers (only ever CRC-validated ones)
+    this._cache = new Map();  // url -> decoded {rate, samples} (only ever CRC-validated)
     this._railRun = 0;
     this._scratch = null;
+    this.onEnded = null;      // optional callback(url), fired on natural completion
   }
 
   _ensureContext() {
@@ -65,11 +73,10 @@ export class BwavPlayer {
   }
 
   _stopSources() {
-    for (const s of [this.introSrc, this.loopSrc]) {
-      if (s) { try { s.onended = null; s.stop(); } catch (_) {} }
+    if (this.songSrc) {
+      try { this.songSrc.onended = null; this.songSrc.stop(); } catch (_) {}
     }
-    this.introSrc = null;
-    this.loopSrc = null;
+    this.songSrc = null;
   }
 
   _stopWatchdog() {
@@ -105,8 +112,7 @@ export class BwavPlayer {
     this.ctx = null;
     this.gain = null;
     this.analyser = null;
-    this.introSrc = null;
-    this.loopSrc = null;
+    this.songSrc = null;
     this._railRun = 0;
   }
 
@@ -176,9 +182,9 @@ export class BwavPlayer {
           throw new BwavIntegrityError(
             `incomplete download: got ${ab.byteLength}, expected ${declared}`);
         }
-        // decodeToBuffers runs the CRC + structural + PCM sanity gates and
+        // decodeFullPlayback runs the CRC + structural + PCM sanity gates and
         // throws BwavIntegrityError on any problem.
-        decoded = decodeToBuffers(ab);
+        decoded = decodeFullPlayback(ab);
       } catch (err) {
         // Corruption/truncation/decoder fault -> fail closed. Never play.
         this.hardLock(err && err.message ? err.message : String(err));
@@ -189,28 +195,25 @@ export class BwavPlayer {
     // A newer play()/pause() happened while we were fetching/decoding — abort.
     if (myToken !== this.token || this.locked) return;
 
-    const { rate, intro, loop } = decoded;
-    const startAt = ctx.currentTime + 0.03; // small lead so both sources arm together
-
-    if (intro.length > 0) {
-      const introSrc = ctx.createBufferSource();
-      introSrc.buffer = this._stereoBuffer(intro, rate);
-      introSrc.connect(this.gain);
-      introSrc.start(startAt);
-      this.introSrc = introSrc;
-    }
-
-    if (loop) {
-      const loopBuf = this._stereoBuffer(loop, rate);
-      const loopSrc = ctx.createBufferSource();
-      loopSrc.buffer = loopBuf;
-      loopSrc.loop = true;
-      loopSrc.loopStart = 0;
-      loopSrc.loopEnd = loop.length / rate;
-      loopSrc.connect(this.gain);
-      loopSrc.start(startAt + intro.length / rate);
-      this.loopSrc = loopSrc;
-    }
+    const { rate, samples } = decoded;
+    const songSrc = ctx.createBufferSource();
+    songSrc.buffer = this._stereoBuffer(samples, rate);
+    songSrc.connect(this.gain);
+    songSrc.onended = () => {
+      // Only a natural end-of-buffer for THIS play() call should fire "ended" —
+      // if pause()/play() has since bumped the token, this is a stop we
+      // ourselves triggered (e.g. skip/pause), not a real completion.
+      if (myToken !== this.token) return;
+      this.token++;
+      this._stopWatchdog();
+      this.songSrc = null;
+      if (this.onEnded) this.onEnded(url);
+      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+        window.dispatchEvent(new CustomEvent('bwav-ended', { detail: { url } }));
+      }
+    };
+    songSrc.start(ctx.currentTime + 0.03); // small lead so scheduling isn't right on the edge
+    this.songSrc = songSrc;
 
     this._startWatchdog();
   }

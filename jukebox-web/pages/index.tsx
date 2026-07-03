@@ -17,7 +17,7 @@ import TouchPrompt from '@/components/TouchPrompt';
 // Other
 import styles from '@/styles/Home.module.scss';
 import { useIsTouchDevice, useKeydown, useLocalStorage } from '@/lib/hooks';
-import { makeIdFromSongName } from '@/lib/utils';
+import { makeIdFromSongName, shuffleInPlace } from '@/lib/utils';
 import { getBwavPlayer } from '@/lib/bwavPlayer';
 
 /**
@@ -67,9 +67,26 @@ export default function Home({ songs }: { songs: Song[] }) {
     }
   }, [isTouchDevice, requiresTouchPrompt, storage])
 
-  // Looping is gapless in the BWAV player (native Web Audio loop over the
-  // engine's reset-history loop body), so the original client-side loop-back
-  // timer (which polled an <audio> element's currentTime) is gone.
+  // Looping/fade-out is baked into the decoded PCM by the BWAV player (it
+  // mirrors the engine's own decoder: loop body plays twice, then fades),
+  // so the original client-side loop-back timer (which polled an <audio>
+  // element's currentTime) is gone.
+
+  /**
+   * Shuffle-bag pool for the Random button and auto-advance: pressing Random
+   * shuffles the remaining pool and draws the top song, removing it so it
+   * can't repeat until every other song has been played. Once the pool is
+   * empty, it's rehydrated with the full song list for the next draw.
+   */
+  const poolRef = useRef<number[]>(songs.map((_, i) => i));
+
+  const drawNextSong = (): Song => {
+    if (poolRef.current.length === 0) poolRef.current = songs.map((_, i) => i);
+    shuffleInPlace(poolRef.current);
+    const idx = poolRef.current.pop() as number;
+    if (poolRef.current.length === 0) poolRef.current = songs.map((_, i) => i);
+    return songs[idx];
+  }
 
   //
   // Component Functions
@@ -131,25 +148,39 @@ export default function Home({ songs }: { songs: Song[] }) {
 
   /**
    * Used by RANDOM button and gets mapped to 'r' key
-   * using a Ref object in useKeydown()
+   * using a Ref object in useKeydown(). Also reused by the auto-advance
+   * effect below, so "ended" behaves like a continuous radio: it draws the
+   * next song from the same shuffle-bag pool.
    */
   const playRandomSong = () => {
     // Cancel search if clicked while in search mode.
     cancelSearchMode();
 
-    const randIdx = Math.floor(Math.random() * songs.length);
-    const song = songs[randIdx];
+    const song = drawNextSong();
 
     setCurrentSong(song);
     setAudioUri(song.music_uri);
     handlePlay();
-    
+
     const id = makeIdFromSongName(song.name['name-USen']);
     const el = document.getElementById(id);
     el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
   // @ts-ignore - Cannot assign to 'current' because it is a read-only property
   playRandomRef.current = playRandomSong; // Manually set ref after fn creation
+
+  /**
+   * When a song finishes naturally (loop played twice, then faded to
+   * silence — see lib/bwavPlayer), auto-advance to another song drawn from
+   * the same shuffle-bag pool. Guarded by the player's own token check, so
+   * this never fires for a song the user paused/skipped away from.
+   */
+  useEffect(() => {
+    const onEnded = () => playRandomSong();
+    window.addEventListener('bwav-ended', onEnded);
+    return () => window.removeEventListener('bwav-ended', onEnded);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   /**
    * Used to filter songs when searching

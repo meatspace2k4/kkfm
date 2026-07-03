@@ -251,72 +251,67 @@ export class BwavDecoder {
   }
 }
 
-// Decode a BWAV into ready-to-play mono Float32 buffers, split at the loop so
-// the player can schedule intro-then-loop with gapless native looping.
-//   intro: samples [0, loopStart)      (continuous history)
-//   loop:  one loop body [loopStart, loopEnd) decoded with the engine's loop
-//          reset (Nintendo's stored loop history), i.e. exactly what plays on
-//          every wrap — reset history is what makes the seam click-free.
-// Non-looping songs return {intro: whole song, loop: null}.
+// Matches the radio engine's FADE_TIME_DURATION (acnh_aircheck_pi.cpp).
+export const FADE_SECONDS = 7.0;
+
+// Decode a whole BWAV to one mono Float32 buffer, procedurally, exactly the
+// way the engine's Track::pull() does: keep pulling decodeBlock() until the
+// decoder reports itself exhausted. No wall-clock scheduling of anything —
+// the loop-twice-then-fade shape (first pass, one more loop-body repeat, then
+// a linear fade to silence) is state the decoder tracks internally (looped,
+// postLoopPos, playLim/fadeLim) and bakes directly into the int16 samples it
+// emits, same as the C++ Decoder does. Playback is then just "play this
+// buffer once, tell me when it ends" — no separate fade automation needed.
+//
+// Non-looping songs decode once through with no fade (fadePlaySamples=0).
 //
 // Runs the source integrity gate (CRC etc.) first, then a post-decode PCM
-// sanity check, and throws BwavIntegrityError on any failure — so a caller that
-// awaits this either gets known-good buffers or an exception, never bad audio.
-export function decodeToBuffers(arrayBuffer) {
+// sanity check, and throws BwavIntegrityError on any failure — so a caller
+// that awaits this either gets a known-good buffer or an exception, never
+// bad audio.
+export function decodeFullPlayback(arrayBuffer) {
   const ctx = validateSource(arrayBuffer); // CRC / structure gate (throws)
   const loopable = ctx.loopEnd > 0 && ctx.loopStart !== 0xffffffff && ctx.loopEnd > ctx.loopStart;
-  const toF32 = (i16arr) => {
-    const f = new Float32Array(i16arr.length);
-    for (let i = 0; i < f.length; i++) f[i] = i16arr[i] / 32768;
-    return f;
-  };
 
-  const block = new Float32Array(14);
-  const dec = new BwavDecoder(ctx, {}); // loop enabled, no fade
-
-  let out;
-  if (!loopable) {
-    const acc = new Int16Array(ctx.totalSamples);
-    let idx = 0, n;
-    while (idx < ctx.totalSamples && (n = dec.decodeBlock(block)) > 0) {
-      for (let i = 0; i < n && idx < ctx.totalSamples; i++) acc[idx++] = block[i];
-    }
-    if (idx !== ctx.totalSamples) {
-      throw new BwavIntegrityError(`short decode: got ${idx}/${ctx.totalSamples} samples`);
-    }
-    out = { rate: ctx.rate, intro: toF32(acc.subarray(0, idx)), loop: null,
-            loopStart: 0, loopEnd: idx };
-  } else {
+  let fadePlaySamples = 0, fadeSamples = 0, totalFrames;
+  if (loopable) {
+    // Mirror the engine's own float32 arithmetic (acnh_aircheck_pi.cpp computes
+    // these as `float`) so the fade window lands on the identical sample the
+    // C++ decoder would land on.
+    const fr = Math.fround;
     const bodyLen = ctx.loopEnd - ctx.loopStart;
-    const need = ctx.loopEnd + bodyLen; // first pass + one reset-history loop body
-    const acc = new Int16Array(need);
-    let idx = 0, n;
-    while (idx < need && (n = dec.decodeBlock(block)) > 0) {
-      for (let i = 0; i < n && idx < need; i++) acc[idx++] = block[i];
-    }
-    if (idx !== need) {
-      throw new BwavIntegrityError(`short decode: got ${idx}/${need} samples`);
-    }
-    out = {
-      rate: ctx.rate,
-      intro: toF32(acc.subarray(0, ctx.loopStart)),
-      loop: toF32(acc.subarray(ctx.loopEnd, ctx.loopEnd + bodyLen)),
-      loopStart: ctx.loopStart,
-      loopEnd: ctx.loopEnd,
-    };
+    const fadePlaySec = fr(fr(bodyLen) / fr(ctx.rate));
+    fadePlaySamples = Math.trunc(fr(fadePlaySec * fr(ctx.rate)));
+    fadeSamples = Math.trunc(fr(fr(FADE_SECONDS) * fr(ctx.rate)));
+    totalFrames = ctx.loopEnd + fadePlaySamples + fadeSamples;
+  } else {
+    totalFrames = ctx.totalSamples;
   }
+
+  const dec = new BwavDecoder(ctx, { fadePlaySamples, fadeSamples });
+  const acc = new Int16Array(totalFrames);
+  const block = new Float32Array(14);
+  let idx = 0;
+  while (idx < totalFrames && !dec.isExhausted()) {
+    const n = dec.decodeBlock(block);
+    if (n === 0) break;
+    for (let i = 0; i < n && idx < totalFrames; i++) acc[idx++] = block[i];
+  }
+  if (idx !== totalFrames) {
+    throw new BwavIntegrityError(`decode length mismatch: got ${idx}, expected ${totalFrames}`);
+  }
+
+  const samples = new Float32Array(idx);
+  for (let i = 0; i < idx; i++) samples[i] = acc[i] / 32768;
 
   // Secondary sanity: every produced sample must be finite and within the
   // valid PCM range. Integer decode + clamp16 guarantees this, so a violation
   // means memory/logic corruption — treat as fatal, never play it.
-  for (const buf of [out.intro, out.loop]) {
-    if (!buf) continue;
-    for (let i = 0; i < buf.length; i++) {
-      const v = buf[i];
-      if (!Number.isFinite(v) || v < -1.0000001 || v > 1.0000001) {
-        throw new BwavIntegrityError(`decoded sample out of range at ${i}: ${v}`);
-      }
+  for (let i = 0; i < samples.length; i++) {
+    const v = samples[i];
+    if (!Number.isFinite(v) || v < -1.0000001 || v > 1.0000001) {
+      throw new BwavIntegrityError(`decoded sample out of range at ${i}: ${v}`);
     }
   }
-  return out;
+  return { rate: ctx.rate, samples };
 }
