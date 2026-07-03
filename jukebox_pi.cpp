@@ -2367,10 +2367,21 @@ void sweep_idle_sessions() {
 
 // Handles GET /now-playing?instance=<id>. instance_id comes from the request
 // path's query string, already extracted by JukeboxServer before this is
-// called; an empty id is valid (a single shared "no instance" broadcast,
-// used for plain-browser testing outside Discord where there's no shared
-// instanceId to key off of).
+// called. There is deliberately NO anonymous/no-instance fallback session:
+// an empty instance_id fails loudly (400) instead of silently falling into a
+// single shared session keyed by "". That fallback used to exist for local
+// testing convenience and caused a real bug -- a plain (non-Discord) browser
+// tab has no shared instanceId, so it should never be able to sync into
+// *anything*, and a silent shared "" session meant it tuned into whatever an
+// unrelated curl test (or another stray non-Discord tab) happened to be
+// playing, mid-song. Callers without a real Discord instanceId must not call
+// this endpoint at all -- see pages/index.tsx's joinBroadcast(), which now
+// no-ops without one.
 void handle_now_playing(int fd, const std::string& instance_id) {
+    if (instance_id.empty()) {
+        send_song_error(fd, "400 Bad Request");
+        return;
+    }
     if (g_playable_songs.empty()) {
         send_song_error(fd, "503 Service Unavailable");
         return;

@@ -24,10 +24,18 @@ export interface BroadcastPosition {
 // Fetches /now-playing and returns the current song + how far into it we are,
 // correcting for network latency and any client/server clock offset by timing
 // the request round-trip and assuming roughly symmetric latency.
+//
+// Requires a real Discord instanceId. There's no anonymous/no-instance
+// fallback session on the server (removed after one caused a real bug: a
+// plain browser tab tuned into an unrelated curl-test session mid-song), so
+// this throws immediately rather than sending a request that would just
+// come back 400 -- fail at the call site, not after a round trip.
 export async function fetchBroadcastPosition(instanceId: string | null): Promise<BroadcastPosition> {
+  if (!instanceId) {
+    throw new Error('fetchBroadcastPosition called without a Discord instanceId -- no shared session to sync to');
+  }
   const t0 = Date.now();
-  const qs = instanceId ? `?instance=${encodeURIComponent(instanceId)}` : '';
-  const resp = await fetch(`/now-playing${qs}`, { cache: 'no-store' });
+  const resp = await fetch(`/now-playing?instance=${encodeURIComponent(instanceId)}`, { cache: 'no-store' });
   const t1 = Date.now();
   if (!resp.ok) throw new Error(`/now-playing -> ${resp.status}`);
   const data: NowPlaying = await resp.json();
