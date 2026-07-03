@@ -115,3 +115,11 @@ watchdog/out_scan_check/
 *.pem
 *.key
 secrets/
+
+# Jukebox build artifacts / large binaries
+bwav/
+jukebox-web/node_modules/
+jukebox-web/out/
+jukebox-web/.next/
+jukebox-web/_excluded_assets/
+tools_local_serve.py

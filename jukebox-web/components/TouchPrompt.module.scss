@@ -1,0 +1,14 @@
+@use "../styles/mixins";
+
+.outerContainer {
+  position: fixed;
+  bottom: 0;
+  width: 100%;
+  @include mixins.layer_3;
+  padding: 5vh 0;
+
+  display: flex;
+  justify-content: center;
+  text-align: center;
+  color: white;
+}

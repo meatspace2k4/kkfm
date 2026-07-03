@@ -1,0 +1,27 @@
+@use './media' as *;
+
+.app {
+  padding: 4rem 1rem;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  max-width: 1440px;
+
+  @include tablet {
+    padding: 5rem 3rem;
+  }
+
+  @include desktop {
+    padding: 6rem 3rem;
+  }
+}
+
+.main {
+  width: 100%;
+}
+
+.songList {
+  display: flex;
+  flex-wrap: wrap;
+}
