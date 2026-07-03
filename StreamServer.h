@@ -94,7 +94,8 @@ private:
     bool read_request(int fd, std::string& method, std::string& path,
                       std::string& headers_out, std::string& body_prefix);
     void send_index(int fd, bool head_only);
-    void send_static(int fd, const char* disk_path, const char* content_type, bool head_only);
+    void send_static(int fd, const char* disk_path, const char* content_type, bool head_only,
+                     const char* cache_control = "no-store");
     void send_not_found(int fd);
     void send_json(int fd, int status, const char* status_text, const std::string& json);
     void stream_audio(int fd, bool head_only);

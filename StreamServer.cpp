@@ -197,6 +197,39 @@ void StreamServer::handle_client(int client_fd) {
                     "text/javascript; charset=utf-8", head_only);
     } else if (path == "/discord-config") {
         send_discord_config(client_fd);
+    } else if (path == "/jukebox.html") {
+        send_static(client_fd, "browser/jukebox.html",
+                    "text/html; charset=utf-8", head_only);
+    } else if (path == "/songs.json") {
+        send_static(client_fd, "browser/songs.json",
+                    "application/json; charset=utf-8", head_only);
+    } else if (path == "/nowplaying.json") {
+        send_static(client_fd, "browser/nowplaying.json",
+                    "application/json; charset=utf-8", head_only);
+    } else if (path.rfind("/jackets/", 0) == 0) {
+        // /jackets/<name>.png where <name> is strictly [A-Za-z0-9_] — anything
+        // else (dots, slashes, etc.) 404s, so no traversal out of browser/jackets.
+        std::string name = path.substr(9);
+        const std::string suffix = ".png";
+        bool ok = name.size() > suffix.size() &&
+                  name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+        if (ok) {
+            for (size_t i = 0; i + suffix.size() < name.size(); ++i) {
+                char c = name[i];
+                if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                      (c >= '0' && c <= '9') || c == '_')) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if (ok) {
+            std::string disk_path = "browser/jackets/" + name;
+            send_static(client_fd, disk_path.c_str(), "image/png", head_only,
+                        "public, max-age=86400, immutable");
+        } else {
+            send_not_found(client_fd);
+        }
     } else if (is_stream_path(path)) {
         if (!range_value.empty() && handle_range_probe(client_fd, range_req)) {
             return;
@@ -290,7 +323,8 @@ void StreamServer::send_index(int fd, bool head_only) {
     }
 }
 
-void StreamServer::send_static(int fd, const char* disk_path, const char* content_type, bool head_only) {
+void StreamServer::send_static(int fd, const char* disk_path, const char* content_type, bool head_only,
+                               const char* cache_control) {
     std::ifstream f(disk_path, std::ios::binary);
     if (!f) {
         send_not_found(fd);
@@ -305,7 +339,7 @@ void StreamServer::send_static(int fd, const char* disk_path, const char* conten
         << "Content-Type: " << content_type << "\r\n"
         << "Content-Length: " << payload.size() << "\r\n"
         << "Connection: close\r\n"
-        << "Cache-Control: no-store\r\n\r\n";
+        << "Cache-Control: " << cache_control << "\r\n\r\n";
     if (!send_string(fd, hdr.str())) return;
     if (!head_only) {
         send_string(fd, payload);

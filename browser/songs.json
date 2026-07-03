@@ -1,0 +1,479 @@
+{
+ "songs": [
+  {
+   "file": "mjk_Keiji",
+   "title": "Agent K.K.",
+   "id": 1
+  },
+  {
+   "file": "mjk_Aloha",
+   "title": "Aloha K.K.",
+   "id": 2
+  },
+  {
+   "file": "mjk_DoubutuNoMachi",
+   "title": "Animal City",
+   "id": 3
+  },
+  {
+   "file": "mjk_Idol",
+   "title": "Bubblegum K.K.",
+   "id": 4
+  },
+  {
+   "file": "mjk_Paris",
+   "title": "Caf\u00e9 K.K.",
+   "id": 5
+  },
+  {
+   "file": "mjk_ShowaKayo",
+   "title": "Comrade K.K.",
+   "id": 6
+  },
+  {
+   "file": "mjk_EuroBeat",
+   "title": "DJ K.K.",
+   "id": 7
+  },
+  {
+   "file": "mjk_Drive",
+   "title": "Drivin'",
+   "id": 8
+  },
+  {
+   "file": "mjk_Sayonara",
+   "title": "Farewell",
+   "id": 9
+  },
+  {
+   "file": "mjk_MoriNoSeikatsu",
+   "title": "Forest Life",
+   "id": 10
+  },
+  {
+   "file": "mjk_KekeRider",
+   "title": "Go K.K. Rider",
+   "id": 11
+  },
+  {
+   "file": "mjk_UtataneNoYume",
+   "title": "Hypno K.K.",
+   "id": 12
+  },
+  {
+   "file": "mjk_Daisuki",
+   "title": "I Love You",
+   "id": 13
+  },
+  {
+   "file": "mjk_China",
+   "title": "Imperial K.K.",
+   "id": 14
+  },
+  {
+   "file": "mjk_Hollywood",
+   "title": "K.K. Adventure",
+   "id": 15
+  },
+  {
+   "file": "mjk_Maria",
+   "title": "K.K. Aria",
+   "id": 16
+  },
+  {
+   "file": "mjk_Ballad",
+   "title": "K.K. Ballad",
+   "id": 17
+  },
+  {
+   "file": "mjk_Roma",
+   "title": "K.K. Bazaar",
+   "id": 18
+  },
+  {
+   "file": "mjk_BirthdaySong",
+   "title": "K.K. Birthday",
+   "id": 19
+  },
+  {
+   "file": "mjk_Blues",
+   "title": "K.K. Blues",
+   "id": 20
+  },
+  {
+   "file": "mjk_Bossa",
+   "title": "K.K. Bossa",
+   "id": 21
+  },
+  {
+   "file": "mjk_Caripso",
+   "title": "K.K. Calypso",
+   "id": 22
+  },
+  {
+   "file": "mjk_Turkey",
+   "title": "K.K. Casbah",
+   "id": 23
+  },
+  {
+   "file": "mjk_Sanbika",
+   "title": "K.K. Chorale",
+   "id": 24
+  },
+  {
+   "file": "mjk_Peru",
+   "title": "K.K. Condor",
+   "id": 25
+  },
+  {
+   "file": "mjk_Country",
+   "title": "K.K. Country",
+   "id": 26
+  },
+  {
+   "file": "mjk_Urban",
+   "title": "K.K. Cruisin'",
+   "id": 27
+  },
+  {
+   "file": "mjk_Drumnbass",
+   "title": "K.K. D&B",
+   "id": 28
+  },
+  {
+   "file": "mjk_KowaiUta",
+   "title": "K.K. Dirge",
+   "id": 29
+  },
+  {
+   "file": "mjk_Disco",
+   "title": "K.K. Disco",
+   "id": 30
+  },
+  {
+   "file": "mjk_Dixie",
+   "title": "K.K. Dixie",
+   "id": 31
+  },
+  {
+   "file": "mjk_Haisai",
+   "title": "K.K. Faire",
+   "id": 33
+  },
+  {
+   "file": "mjk_Flamenco",
+   "title": "K.K. Flamenco",
+   "id": 34
+  },
+  {
+   "file": "mjk_Minyo",
+   "title": "K.K. Folk",
+   "id": 35
+  },
+  {
+   "file": "mjk_Fusion",
+   "title": "K.K. Fusion",
+   "id": 36
+  },
+  {
+   "file": "mjk_Raregroove",
+   "title": "K.K. Groove",
+   "id": 37
+  },
+  {
+   "file": "mjk_NewOrleans",
+   "title": "K.K. Gumbo",
+   "id": 38
+  },
+  {
+   "file": "mjk_House",
+   "title": "K.K. House",
+   "id": 39
+  },
+  {
+   "file": "mjk_DoubutsuNoShima",
+   "title": "K.K. Island",
+   "id": 40
+  },
+  {
+   "file": "mjk_Jazz",
+   "title": "K.K. Jazz",
+   "id": 41
+  },
+  {
+   "file": "mjk_Jongara",
+   "title": "K.K. Jongara",
+   "id": 42
+  },
+  {
+   "file": "mjk_Enka",
+   "title": "K.K. Lament",
+   "id": 43
+  },
+  {
+   "file": "mjk_LoveSong",
+   "title": "K.K. Love Song",
+   "id": 44
+  },
+  {
+   "file": "mjk_Lullaby",
+   "title": "K.K. Lullaby",
+   "id": 45
+  },
+  {
+   "file": "mjk_Mambo",
+   "title": "K.K. Mambo",
+   "id": 46
+  },
+  {
+   "file": "mjk_Gamelan",
+   "title": "K.K. Marathon",
+   "id": 47
+  },
+  {
+   "file": "mjk_March",
+   "title": "K.K. March",
+   "id": 48
+  },
+  {
+   "file": "mjk_Senor",
+   "title": "K.K. Mariachi",
+   "id": 49
+  },
+  {
+   "file": "mjk_Metal",
+   "title": "K.K. Metal",
+   "id": 50
+  },
+  {
+   "file": "mjk_Milonga",
+   "title": "K.K. Milonga",
+   "id": 51
+  },
+  {
+   "file": "mjk_Bolero",
+   "title": "K.K. Moody",
+   "id": 52
+  },
+  {
+   "file": "mjk_Maharaja",
+   "title": "K.K. Oasis",
+   "id": 53
+  },
+  {
+   "file": "mjk_Parade",
+   "title": "K.K. Parade",
+   "id": 54
+  },
+  {
+   "file": "mjk_RagTime",
+   "title": "K.K. Ragtime",
+   "id": 55
+  },
+  {
+   "file": "mjk_Ondo",
+   "title": "K.K. Rally",
+   "id": 56
+  },
+  {
+   "file": "mjk_Reggae",
+   "title": "K.K. Reggae",
+   "id": 57
+  },
+  {
+   "file": "mjk_Rock",
+   "title": "K.K. Rock",
+   "id": 58
+  },
+  {
+   "file": "mjk_KekeBilly",
+   "title": "K.K. Rockabilly",
+   "id": 59
+  },
+  {
+   "file": "mjk_Afro",
+   "title": "K.K. Safari",
+   "id": 60
+  },
+  {
+   "file": "mjk_Salsa",
+   "title": "K.K. Salsa",
+   "id": 61
+  },
+  {
+   "file": "mjk_Samba",
+   "title": "K.K. Samba",
+   "id": 62
+  },
+  {
+   "file": "mjk_Ska",
+   "title": "K.K. Ska",
+   "id": 63
+  },
+  {
+   "file": "mjk_Sonata",
+   "title": "K.K. Sonata",
+   "id": 64
+  },
+  {
+   "file": "mjk_KekeSong",
+   "title": "K.K. Song",
+   "id": 65
+  },
+  {
+   "file": "mjk_Soul",
+   "title": "K.K. Soul",
+   "id": 66
+  },
+  {
+   "file": "mjk_Cossack",
+   "title": "K.K. Steppe",
+   "id": 67
+  },
+  {
+   "file": "mjk_Osanpo",
+   "title": "K.K. Stroll",
+   "id": 68
+  },
+  {
+   "file": "mjk_Swing",
+   "title": "K.K. Swing",
+   "id": 69
+  },
+  {
+   "file": "mjk_Electronica",
+   "title": "K.K. Synth",
+   "id": 70
+  },
+  {
+   "file": "mjk_Tango",
+   "title": "K.K. Tango",
+   "id": 71
+  },
+  {
+   "file": "mjk_TechnoBeat",
+   "title": "K.K. Technopop",
+   "id": 72
+  },
+  {
+   "file": "mjk_Waltz",
+   "title": "K.K. Waltz",
+   "id": 73
+  },
+  {
+   "file": "mjk_Western",
+   "title": "K.K. Western",
+   "id": 74
+  },
+  {
+   "file": "mjk_Etude",
+   "title": "K.K. \u00c9tude",
+   "id": 32
+  },
+  {
+   "file": "mjk_Daimyo",
+   "title": "King K.K.",
+   "id": 75
+  },
+  {
+   "file": "mjk_Irish",
+   "title": "Lucky K.K.",
+   "id": 76
+  },
+  {
+   "file": "mjk_HunaUta2001",
+   "title": "Marine Song 2001",
+   "id": 77
+  },
+  {
+   "file": "mjk_Alpine",
+   "title": "Mountain Song",
+   "id": 78
+  },
+  {
+   "file": "mjk_Sensei",
+   "title": "Mr. K.K.",
+   "id": 79
+  },
+  {
+   "file": "mjk_BokuNoBasho",
+   "title": "My Place",
+   "id": 80
+  },
+  {
+   "file": "mjk_Napolitan",
+   "title": "Neapolitan",
+   "id": 81
+  },
+  {
+   "file": "mjk_OnlyMe",
+   "title": "Only Me",
+   "id": 82
+  },
+  {
+   "file": "mjk_KangaeChu",
+   "title": "Pondering",
+   "id": 83
+  },
+  {
+   "file": "mjk_RocknRoll",
+   "title": "Rockin' K.K.",
+   "id": 84
+  },
+  {
+   "file": "mjk_Gospel",
+   "title": "Soulful K.K.",
+   "id": 85
+  },
+  {
+   "file": "mjk_Minimal",
+   "title": "Space K.K.",
+   "id": 86
+  },
+  {
+   "file": "mjk_HaruNoKomorebi",
+   "title": "Spring Blossoms",
+   "id": 87
+  },
+  {
+   "file": "mjk_BlueOnigiri",
+   "title": "Stale Cupcakes",
+   "id": 88
+  },
+  {
+   "file": "mjk_NiDanZaka",
+   "title": "Steep Hill",
+   "id": 89
+  },
+  {
+   "file": "mjk_Eleki",
+   "title": "Surfin' K.K.",
+   "id": 90
+  },
+  {
+   "file": "mjk_Funk",
+   "title": "The K. Funk",
+   "id": 91
+  },
+  {
+   "file": "mjk_NamiNami",
+   "title": "To the Edge",
+   "id": 92
+  },
+  {
+   "file": "mjk_Ototoi",
+   "title": "Two Days Ago",
+   "id": 93
+  },
+  {
+   "file": "mjk_Horo",
+   "title": "Wandering",
+   "id": 94
+  },
+  {
+   "file": "mjk_MainTheme",
+   "title": "Welcome Horizons",
+   "id": 95
+  }
+ ]
+}
