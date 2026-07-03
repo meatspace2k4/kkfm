@@ -288,9 +288,10 @@ export class BwavDecoder {
 // Matches the radio engine's FADE_PLAY_DURATION / FADE_TIME_DURATION
 // (acnh_aircheck_pi.cpp) — these are the defaults Mixer::add() uses for every
 // actual song track (the calls at lines ~1901/1917-18/1933-34 pass no
-// override), so this is a FIXED 10s of post-loop playback before a 7s fade,
+// override), so this is a FIXED 11s of post-loop playback before a 7s fade,
 // independent of how long the loop body itself is. Not "loop twice."
-export const FADE_PLAY_SECONDS = 10.0;
+// (origin/dev commit 6150710 bumped this from 10.0f to 11.0f.)
+export const FADE_PLAY_SECONDS = 11.0;
 export const FADE_SECONDS = 7.0;
 
 // Decode a whole BWAV to one mono Float32 buffer, procedurally, exactly the
