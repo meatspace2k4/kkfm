@@ -17,26 +17,64 @@
 export const BLK_SAMP = 14;
 export const BLK_BYTES = 8;
 
+// Raised by every integrity gate. The player treats any of these as fatal:
+// it hard-locks (kills audio, refuses to play) rather than risk distortion.
+export class BwavIntegrityError extends Error {
+  constructor(reason) {
+    super(reason);
+    this.name = 'BwavIntegrityError';
+  }
+}
+
 function clamp16(v) {
   if (v < -32768) return -32768;
   if (v > 32767) return 32767;
   return v;
 }
 
+// Standard IEEE (zlib/PNG) CRC-32 — matches the value ACNH stores at BWAV
+// offset 0x08 over the raw sample data. Table built once on first use.
+let CRC_TABLE = null;
+function crc32(u8, start, end) {
+  if (!CRC_TABLE) {
+    CRC_TABLE = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      CRC_TABLE[n] = c >>> 0;
+    }
+  }
+  let c = 0xffffffff;
+  for (let i = start; i < end; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+// Bytes of DSP-ADPCM for `n` samples (14 samples per 8-byte frame; the last
+// partial frame is 1 header byte + ceil(remaining/2) nibble bytes).
+function adpcmByteLen(n) {
+  const full = Math.floor(n / 14);
+  const rem = n % 14;
+  const last = rem === 0 ? 0 : 1 + ((rem + 1) >> 1);
+  return full * 8 + last;
+}
+
 export function parseBwav(buffer) {
   const d = new DataView(buffer);
   const u8 = new Uint8Array(buffer);
   if (u8[0] !== 0x42 || u8[1] !== 0x57 || u8[2] !== 0x41 || u8[3] !== 0x56) {
-    throw new Error('not a BWAV');
+    throw new BwavIntegrityError('not a BWAV (bad magic)');
   }
   const bom = d.getUint16(4, true);
   const channels = d.getUint16(14, true);
   if (bom !== 0xfeff || channels !== 1) {
-    throw new Error(`unsupported BWAV (bom=${bom.toString(16)} channels=${channels})`);
+    throw new BwavIntegrityError(`unsupported BWAV (bom=${bom.toString(16)} channels=${channels})`);
   }
+  const storedCrc = d.getUint32(8, true);
   const ci = 16;
+  const codecId = d.getUint16(ci + 0, true);
   const rate = d.getUint32(ci + 4, true);
   const totalSamples = d.getUint32(ci + 8, true);
+  const samplesThis = d.getUint32(ci + 12, true);
 
   const coeffs = [];
   for (let i = 0; i < 8; i++) {
@@ -53,7 +91,9 @@ export function parseBwav(buffer) {
 
   return {
     rate,
+    codecId,
     totalSamples,
+    samplesThis,
     coeffs,
     start,
     loops,
@@ -61,9 +101,48 @@ export function parseBwav(buffer) {
     loopStart,
     hist1,
     hist2,
+    storedCrc,
+    bytes: u8,                 // whole file, for CRC over the body
     raw: u8.subarray(start),   // audio data only
     rawLen: buffer.byteLength - start,
   };
+}
+
+// HARD integrity gate. Parses + verifies a downloaded BWAV against its own
+// self-declared CRC-32 (over the audio body) and structural invariants. Throws
+// BwavIntegrityError on ANY discrepancy — corruption, truncation, wrong codec.
+// A pass means the bytes are exactly the game's, so the deterministic, clamped
+// decoder can only produce the exact game audio (never distortion).
+export function validateSource(arrayBuffer) {
+  if (arrayBuffer.byteLength < 0x80) {
+    throw new BwavIntegrityError(`file too small (${arrayBuffer.byteLength} bytes)`);
+  }
+  const ctx = parseBwav(arrayBuffer); // throws on bad magic/bom/channels
+  if (ctx.codecId !== 1) {
+    throw new BwavIntegrityError(`unsupported codec_id ${ctx.codecId} (expected DSP-ADPCM=1)`);
+  }
+  if (ctx.rate !== 48000 && ctx.rate !== 24000 && ctx.rate !== 4000) {
+    throw new BwavIntegrityError(`implausible sample_rate ${ctx.rate}`);
+  }
+  if (ctx.samplesThis === 0 || ctx.samplesThis > 0x7fffffff) {
+    throw new BwavIntegrityError(`implausible sample count ${ctx.samplesThis}`);
+  }
+  // The file must actually contain the ADPCM bytes it claims — a short read
+  // (dropped chunk, cut connection) fails here before any decode.
+  const bodyLen = adpcmByteLen(ctx.samplesThis);
+  const bodyEnd = ctx.start + bodyLen;
+  if (bodyEnd > arrayBuffer.byteLength) {
+    throw new BwavIntegrityError(
+      `truncated: need ${bodyEnd} bytes, have ${arrayBuffer.byteLength}`);
+  }
+  // The linchpin: recomputed CRC-32 over the audio body must equal the value
+  // the file declares. One flipped byte anywhere in transit breaks this.
+  const got = crc32(ctx.bytes, ctx.start, bodyEnd);
+  if (got !== ctx.storedCrc) {
+    throw new BwavIntegrityError(
+      `CRC mismatch: computed 0x${got.toString(16)} != stored 0x${ctx.storedCrc.toString(16)}`);
+  }
+  return ctx;
 }
 
 // Streaming decoder that mirrors Decoder::decode_block. Pull one 14-sample block
@@ -179,8 +258,12 @@ export class BwavDecoder {
 //          reset (Nintendo's stored loop history), i.e. exactly what plays on
 //          every wrap — reset history is what makes the seam click-free.
 // Non-looping songs return {intro: whole song, loop: null}.
+//
+// Runs the source integrity gate (CRC etc.) first, then a post-decode PCM
+// sanity check, and throws BwavIntegrityError on any failure — so a caller that
+// awaits this either gets known-good buffers or an exception, never bad audio.
 export function decodeToBuffers(arrayBuffer) {
-  const ctx = parseBwav(arrayBuffer);
+  const ctx = validateSource(arrayBuffer); // CRC / structure gate (throws)
   const loopable = ctx.loopEnd > 0 && ctx.loopStart !== 0xffffffff && ctx.loopEnd > ctx.loopStart;
   const toF32 = (i16arr) => {
     const f = new Float32Array(i16arr.length);
@@ -191,28 +274,49 @@ export function decodeToBuffers(arrayBuffer) {
   const block = new Float32Array(14);
   const dec = new BwavDecoder(ctx, {}); // loop enabled, no fade
 
+  let out;
   if (!loopable) {
     const acc = new Int16Array(ctx.totalSamples);
     let idx = 0, n;
     while (idx < ctx.totalSamples && (n = dec.decodeBlock(block)) > 0) {
       for (let i = 0; i < n && idx < ctx.totalSamples; i++) acc[idx++] = block[i];
     }
-    return { rate: ctx.rate, intro: toF32(acc.subarray(0, idx)), loop: null,
-             loopStart: 0, loopEnd: idx };
+    if (idx !== ctx.totalSamples) {
+      throw new BwavIntegrityError(`short decode: got ${idx}/${ctx.totalSamples} samples`);
+    }
+    out = { rate: ctx.rate, intro: toF32(acc.subarray(0, idx)), loop: null,
+            loopStart: 0, loopEnd: idx };
+  } else {
+    const bodyLen = ctx.loopEnd - ctx.loopStart;
+    const need = ctx.loopEnd + bodyLen; // first pass + one reset-history loop body
+    const acc = new Int16Array(need);
+    let idx = 0, n;
+    while (idx < need && (n = dec.decodeBlock(block)) > 0) {
+      for (let i = 0; i < n && idx < need; i++) acc[idx++] = block[i];
+    }
+    if (idx !== need) {
+      throw new BwavIntegrityError(`short decode: got ${idx}/${need} samples`);
+    }
+    out = {
+      rate: ctx.rate,
+      intro: toF32(acc.subarray(0, ctx.loopStart)),
+      loop: toF32(acc.subarray(ctx.loopEnd, ctx.loopEnd + bodyLen)),
+      loopStart: ctx.loopStart,
+      loopEnd: ctx.loopEnd,
+    };
   }
 
-  const bodyLen = ctx.loopEnd - ctx.loopStart;
-  const need = ctx.loopEnd + bodyLen; // first pass + one reset-history loop body
-  const acc = new Int16Array(need);
-  let idx = 0, n;
-  while (idx < need && (n = dec.decodeBlock(block)) > 0) {
-    for (let i = 0; i < n && idx < need; i++) acc[idx++] = block[i];
+  // Secondary sanity: every produced sample must be finite and within the
+  // valid PCM range. Integer decode + clamp16 guarantees this, so a violation
+  // means memory/logic corruption — treat as fatal, never play it.
+  for (const buf of [out.intro, out.loop]) {
+    if (!buf) continue;
+    for (let i = 0; i < buf.length; i++) {
+      const v = buf[i];
+      if (!Number.isFinite(v) || v < -1.0000001 || v > 1.0000001) {
+        throw new BwavIntegrityError(`decoded sample out of range at ${i}: ${v}`);
+      }
+    }
   }
-  return {
-    rate: ctx.rate,
-    intro: toF32(acc.subarray(0, ctx.loopStart)),
-    loop: toF32(acc.subarray(ctx.loopEnd, ctx.loopEnd + bodyLen)),
-    loopStart: ctx.loopStart,
-    loopEnd: ctx.loopEnd,
-  };
+  return out;
 }
