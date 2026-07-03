@@ -285,20 +285,24 @@ export class BwavDecoder {
   }
 }
 
-// Matches the radio engine's FADE_PLAY_DURATION / FADE_TIME_DURATION
-// (acnh_aircheck_pi.cpp) — these are the defaults Mixer::add() uses for every
-// actual song track (the calls at lines ~1901/1917-18/1933-34 pass no
-// override), so this is a FIXED 11s of post-loop playback before a 7s fade,
-// independent of how long the loop body itself is. Not "loop twice."
-// (origin/dev commit 6150710 bumped this from 10.0f to 11.0f.)
+// FADE_SECONDS matches the radio engine's FADE_TIME_DURATION
+// (acnh_aircheck_pi.cpp), the length of the linear fade-to-silence.
+//
+// FADE_PLAY_SECONDS is the jukebox's own extra listening window (11s, per
+// origin/dev commit 6150710's FADE_PLAY_DURATION value) added ON TOP OF one
+// full loop-body repeat — this is a deliberate jukebox-specific shape, not
+// the plain radio engine behavior (the radio's Mixer::add() defaults use
+// FADE_PLAY_DURATION alone as the whole post-loop window, no extra repeat).
+// The jukebox's shape is: first pass through loop_end, then the loop body
+// again in full (so it's heard twice total), then FADE_PLAY_SECONDS more of
+// playback, THEN the fade — not "loop once, wait 11s, fade".
 export const FADE_PLAY_SECONDS = 11.0;
 export const FADE_SECONDS = 7.0;
 
 // Decode a whole BWAV to one mono Float32 buffer, procedurally, exactly the
 // way the engine's Track::pull() does: keep pulling decodeBlock() until the
 // decoder reports itself exhausted. No wall-clock scheduling of anything —
-// the loop-then-fade shape (first pass, FADE_PLAY_SECONDS more of the loop
-// content, then a linear fade to silence) is state the decoder tracks
+// the loop-twice-then-play-then-fade shape is state the decoder tracks
 // internally (looped, postLoopPos, playLim/fadeLim) and bakes directly into
 // the int16 samples it emits, same as the C++ Decoder does. Playback is then
 // just "play this buffer once, tell me when it ends" — no separate fade
@@ -317,10 +321,12 @@ export function decodeFullPlayback(arrayBuffer) {
   let fadePlaySamples = 0, fadeSamples = 0, totalFrames;
   if (loopable) {
     // Mirror the engine's own float32 arithmetic (acnh_aircheck_pi.cpp computes
-    // these as `(size_t)(fade_play_s * ctx->rate)` in `float`) so the fade
-    // window lands on the identical sample the C++ decoder would land on.
+    // durations as `(size_t)(seconds * ctx->rate)` in `float`) so the extra
+    // window and fade land on the identical sample the C++ math would.
     const fr = Math.fround;
-    fadePlaySamples = Math.trunc(fr(fr(FADE_PLAY_SECONDS) * fr(ctx.rate)));
+    const bodyLen = ctx.loopEnd - ctx.loopStart; // one full loop-body repeat
+    const extraPlaySamples = Math.trunc(fr(fr(FADE_PLAY_SECONDS) * fr(ctx.rate)));
+    fadePlaySamples = bodyLen + extraPlaySamples; // repeat once (loop twice total) + 11s more
     fadeSamples = Math.trunc(fr(fr(FADE_SECONDS) * fr(ctx.rate)));
     totalFrames = ctx.loopEnd + fadePlaySamples + fadeSamples;
   } else {
