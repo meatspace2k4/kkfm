@@ -11,12 +11,27 @@ button:hover{background:#2563eb;}
 button:disabled{background:#4b5563;cursor:not-allowed;}
 .status{margin-top:1rem;color:#9ca3af;font-size:.9rem;}
 </style>
+<!-- Resolves the Embedded App SDK for browser/discord-shell.js. Points at a
+     same-origin vendored copy so nothing loads from an external CDN inside the
+     Discord iframe. Download it once on the Pi (see browser/README-discord.md):
+       mkdir -p browser/vendor
+       curl -L "https://cdn.jsdelivr.net/npm/@discord/embedded-app-sdk@2/+esm" \
+         -o browser/vendor/embedded-app-sdk.js -->
+<script type="importmap">
+{
+  "imports": {
+    "@discord/embedded-app-sdk": "/vendor/embedded-app-sdk.js"
+  }
+}
+</script>
 </head>
 <body>
 <h1>Aircheck</h1>
 <button id="playBtn">▶ Start Radio</button>
 <div id="status" class="status">Ready</div>
-<script>
+<script type="module">
+import { initDiscordShell, isInsideDiscord } from './discord-shell.js';
+
 const workletCode = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -53,7 +68,7 @@ registerProcessor('pcm-processor', PCMProcessor);
 const btn = document.getElementById('playBtn');
 const status = document.getElementById('status');
 
-btn.onclick = async () => {
+async function startAudio() {
   if (btn.disabled) return;
   btn.disabled = true;
   btn.innerText = 'Connecting...';
@@ -109,6 +124,10 @@ btn.onclick = async () => {
     btn.innerText = 'Live';
 
     let headerBytesRemaining = 44;
+    // Carry-over for bytes that don't complete a 4-byte stereo frame. Network
+    // reads land on arbitrary byte boundaries; dropping the remainder (as the
+    // old code did) byte-shifts every later sample and plays as loud static.
+    let leftover = new Uint8Array(0);
 
     while (true) {
       const { done, value } = await reader.read();
@@ -125,13 +144,23 @@ btn.onclick = async () => {
         headerBytesRemaining = 0;
       }
 
-      const sampleCount = (chunk.byteLength >> 1);
-      const evenSamples = sampleCount & ~1;
-      if (evenSamples <= 0) continue;
-      const int16 = new Int16Array(chunk.buffer, chunk.byteOffset, evenSamples);
-      const floatChunk = new Float32Array(evenSamples);
-      for (let i = 0; i < evenSamples; i++) {
-        floatChunk[i] = int16[i] / 32768.0;
+      let buf = chunk;
+      if (leftover.length > 0) {
+        buf = new Uint8Array(leftover.length + chunk.byteLength);
+        buf.set(leftover, 0);
+        buf.set(chunk, leftover.length);
+      }
+
+      const usableBytes = buf.byteLength & ~3;
+      leftover = buf.slice(usableBytes);
+      if (usableBytes === 0) continue;
+
+      // DataView: safe at any byteOffset, explicit little-endian (WAV PCM).
+      const view = new DataView(buf.buffer, buf.byteOffset, usableBytes);
+      const sampleCount = usableBytes >> 1;
+      const floatChunk = new Float32Array(sampleCount);
+      for (let i = 0; i < sampleCount; i++) {
+        floatChunk[i] = view.getInt16(i * 2, true) / 32768.0;
       }
       pcmNode.port.postMessage(floatChunk, [floatChunk.buffer]);
     }
@@ -141,7 +170,22 @@ btn.onclick = async () => {
     btn.disabled = false;
     btn.innerText = '▶ Retry';
   }
-};
+}
+
+// The click doubles as the user gesture that lets AudioContext start.
+btn.addEventListener('click', startAudio);
+
+// When launched as a Discord Activity, complete the SDK/OAuth handshake up
+// front. Outside Discord this is skipped and the page behaves as before.
+if (isInsideDiscord()) {
+  status.innerText = 'Connecting to Discord…';
+  initDiscordShell()
+    .then(() => { status.innerText = 'In voice channel — press play'; })
+    .catch((err) => {
+      console.error(err);
+      status.innerText = 'Discord error: ' + err.message;
+    });
+}
 </script>
 </body>
 </html>

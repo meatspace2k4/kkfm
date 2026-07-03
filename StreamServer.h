@@ -91,10 +91,18 @@ private:
     bool handle_range_probe(int fd, const ByteRangeRequest& range);
     void handle_client(int client_fd);
     void configure_client_socket(int fd);
-    bool read_request(int fd, std::string& method, std::string& path, std::string& headers_out);
+    bool read_request(int fd, std::string& method, std::string& path,
+                      std::string& headers_out, std::string& body_prefix);
     void send_index(int fd, bool head_only);
+    void send_static(int fd, const char* disk_path, const char* content_type, bool head_only);
     void send_not_found(int fd);
+    void send_json(int fd, int status, const char* status_text, const std::string& json);
     void stream_audio(int fd, bool head_only);
+
+    // Discord Activity shell support (see browser/README-discord.md).
+    void send_discord_config(int fd);
+    void handle_token_exchange(int fd, const std::string& headers, const std::string& body_prefix);
+    bool discord_token_exchange(const std::string& code, std::string& response_out);
 
     bool send_all(int fd, const void* data, size_t len) {
         if (fd < 0 || !data || len == 0) return true;

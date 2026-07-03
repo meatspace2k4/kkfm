@@ -3,17 +3,11 @@
  * can listen in real-time without needing a local audio device.
  */
 
-#ifndef KKFM_TEST_MODE
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstringop-overflow"
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 #pragma GCC diagnostic pop
-#else
-// Test mode: provide minimal stubs for miniaudio types
-#include "test_mocks.h"
-#endif
-
 #include "assets.h"
 #include "StreamServer.h"
 
@@ -24,8 +18,6 @@
 #include <condition_variable>
 #include <cctype>
 #include <csignal>
-#include <exception>
-#include <pthread.h>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -54,16 +46,6 @@
 #include <iterator>
 #include <unordered_map>
 #include <cstdarg>
-
-// Helper to set real-time priority for audio threads
-static void set_realtime_priority() {
-    struct sched_param param;
-    param.sched_priority = 50; // Moderate RT priority (1-99)
-    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
-        // Silently ignore failure; requires CAP_SYS_NICE or root.
-        // If it fails, we just run with normal scheduling.
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Runtime Sample Rate (derived from BWAV headers)
@@ -260,10 +242,6 @@ struct UIState {
 
 UIState g_ui_state;
 
-static void restore_terminal() {
-    std::cout << "\033[?25h\033[?1049l" << std::flush;
-}
-
 class TUI {
     bool is_tty;
     struct winsize w;
@@ -271,8 +249,11 @@ public:
     TUI() {
         is_tty = isatty(STDOUT_FILENO);
         if (is_tty) {
+            // Enter alternate screen buffer and hide cursor
             std::cout << "\033[?1049h\033[?25l" << std::flush;
-            std::atexit(restore_terminal);
+            
+            // Note: atexit is hard to capture "this" context or restore correctly if object destroyed first
+            // We rely on destructor.
         }
     }
     
@@ -351,13 +332,13 @@ TUI g_tui;
 const float VOL_DEFAULT = 1.0f;
 const float VOL_DUCK = 0.25f;
 const float VOL_MAX = 1.5f;
-const float DELAY_AFTER_CM_S = 0.90f;
+const float DELAY_AFTER_CM_S = 0.75f;  // was 0.90f; game uses 0.75f convention (matches OUTRO, in BgmStatic Fanfare→Outdoor dst_off=0.75)
 const float DELAY_AFTER_OUTRO = 0.75f;
 const float OVERLAY_MIN_DELAY = 1.0f;
 const float OVERLAY_MAX_DELAY = 13.0f;
 const float OVERLAY_LATEST_IF_GRID = 2.5f;
 const bool  OVERLAY_ALLOW_WRAP = true;
-const float OVERLAY_RANGE_MIN = -3.0f;
+const float OVERLAY_RANGE_MIN = -5.0f;  // was -3.0f; symmetric with RANGE_MAX = 5.0f, and -5.0f IS in game radio code (2 occurrences)
 const float OVERLAY_RANGE_MAX = 5.0f;
 
 const float INTRO_ALIGN_PAD_SEC = 0.0f;
@@ -382,7 +363,7 @@ const int   HARDWARE_GAIN_Q15 = (int)(HARDWARE_GAIN * 32768.0f);
 
 const float DEFAULT_NO_OVERLAY_DELAY = 11.0f;
 
-const float FADE_PLAY_DURATION = 11.0f; 
+const float FADE_PLAY_DURATION = 10.0f; 
 const float FADE_TIME_DURATION = 7.0f;
 
 // ---------------------------------------------------------------------------
@@ -644,9 +625,7 @@ public:
         int total = 0;
         for (const auto& entry : pool) total += entry.second;
         if (total <= 0) return nullptr;
-        static thread_local std::mt19937 tl_rng(std::random_device{}());
-        std::uniform_int_distribution<int> dist(0, total - 1);
-        int r = dist(tl_rng);
+        int r = rand() % total;
         for (const auto& entry : pool) {
             if (r < entry.second) return entry.first;
             r -= entry.second;
@@ -748,7 +727,7 @@ public:
         info.beat_len_sec = entry->beat_len;
         info.bar_len_sec = entry->beat_len * 4.0f;
         float song_start = compute_song_start(loop_start, entry->tempo_class, entry->unique_id);
-        if (song_start > 0.0f) info.lead_in_sec = std::max(0.0f, loop_start - song_start);
+        info.lead_in_sec = std::max(0.0f, loop_start - song_start);
         info.valid = true;
         return info;
     }
@@ -1684,7 +1663,6 @@ public:
 
 private:
     void run() {
-        set_realtime_priority();
         using clock = std::chrono::steady_clock;
         const bool have_dac = (dac && dac->is_ready());
         const uint32_t sr = have_dac ? std::max<uint32_t>(1u, dac->sample_rate()) : engine_sample_rate();
@@ -1693,49 +1671,41 @@ private:
         std::vector<int16_t> stereo_block(MIX_BLOCK_FRAMES * 2, 0);
         auto next = clock::now();
         while (running.load()) {
-            try {
-                mixer.mix_block(stereo_block.data(), MIX_BLOCK_FRAMES);
-                buffer.write(stereo_block.data(), MIX_BLOCK_FRAMES);
-                if (dac && dac->is_ready()) {
-                    dac->write(stereo_block.data(), MIX_BLOCK_FRAMES);
-                }
+            mixer.mix_block(stereo_block.data(), MIX_BLOCK_FRAMES);
+            buffer.write(stereo_block.data(), MIX_BLOCK_FRAMES);
+            if (dac && dac->is_ready()) {
+                dac->write(stereo_block.data(), MIX_BLOCK_FRAMES);
+            }
 
-                if (have_dac) {
-                    // Maintain a small, stable cushion in the ring buffer. If we fall behind, run a bit faster
-                    // (skip the sleep) until we recover; if we get too far ahead, sleep a little extra.
-                    const uint32_t cap = std::max<uint32_t>(1u, dac->capacity_frames());
-                    const uint32_t fill = dac->buffered_frames();
-                    // Use a larger cushion to tolerate OS scheduling jitter and reduce audible underruns.
-                    const uint32_t target = std::min<uint32_t>(cap - 1u, (uint32_t)MIX_BLOCK_FRAMES * 32u);  // ~300ms @48k
-                    const uint32_t low = std::min<uint32_t>(target, (uint32_t)MIX_BLOCK_FRAMES * 16u);
-                    const uint32_t high = std::min<uint32_t>(cap - 1u, (uint32_t)MIX_BLOCK_FRAMES * 48u);
+            if (have_dac) {
+                // Maintain a small, stable cushion in the ring buffer. If we fall behind, run a bit faster
+                // (skip the sleep) until we recover; if we get too far ahead, sleep a little extra.
+                const uint32_t cap = std::max<uint32_t>(1u, dac->capacity_frames());
+                const uint32_t fill = dac->buffered_frames();
+                // Use a larger cushion to tolerate OS scheduling jitter and reduce audible underruns.
+                const uint32_t target = std::min<uint32_t>(cap - 1u, (uint32_t)MIX_BLOCK_FRAMES * 32u);  // ~300ms @48k
+                const uint32_t low = std::min<uint32_t>(target, (uint32_t)MIX_BLOCK_FRAMES * 16u);
+                const uint32_t high = std::min<uint32_t>(cap - 1u, (uint32_t)MIX_BLOCK_FRAMES * 48u);
 
-                    if (fill < low) {
-                        // Catch up quickly; small sleep avoids busy-spin.
-                        std::this_thread::sleep_for(std::chrono::microseconds(200));
-                    } else if (fill > high) {
-                        const uint32_t extra_frames = (fill > target) ? (fill - target) : 0u;
-                        const int64_t extra_us = (int64_t)extra_frames * 1000000LL / (int64_t)sr;
-                        std::this_thread::sleep_for(std::chrono::microseconds(std::clamp<int64_t>(extra_us, 0, 10000)));
-                    } else {
-                        std::this_thread::sleep_for(block_duration);
-                    }
+                if (fill < low) {
+                    // Catch up quickly; small sleep avoids busy-spin.
+                    std::this_thread::sleep_for(std::chrono::microseconds(200));
+                } else if (fill > high) {
+                    const uint32_t extra_frames = (fill > target) ? (fill - target) : 0u;
+                    const int64_t extra_us = (int64_t)extra_frames * 1000000LL / (int64_t)sr;
+                    std::this_thread::sleep_for(std::chrono::microseconds(std::clamp<int64_t>(extra_us, 0, 10000)));
                 } else {
-                    next += block_duration;
-                    // If we ever fall behind (decode hiccup / OS scheduling), do NOT "catch up" by
-                    // mixing multiple blocks back-to-back — that can overfill downstream buffers.
-                    const auto now = clock::now();
-                    if (next < now) {
-                        next = now + block_duration;
-                    }
-                    std::this_thread::sleep_until(next);
+                    std::this_thread::sleep_for(block_duration);
                 }
-            } catch (const std::exception& e) {
-                log_error(std::string("[PUMP] Exception in audio loop: ") + e.what());
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            } catch (...) {
-                log_error("[PUMP] Unknown exception in audio loop.");
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            } else {
+                next += block_duration;
+                // If we ever fall behind (decode hiccup / OS scheduling), do NOT "catch up" by
+                // mixing multiple blocks back-to-back — that can overfill downstream buffers.
+                const auto now = clock::now();
+                if (next < now) {
+                    next = now + block_duration;
+                }
+                std::this_thread::sleep_until(next);
             }
         }
     }
@@ -1767,9 +1737,6 @@ const char* overlay_plan_name(OverlayPlan plan) {
 }
 
 class Radio {
-#ifdef UNIT_TEST
-public:  // Allow test access to private members in unit test mode
-#endif
     Mixer& mixer;
     CalendarManager calendar;
     TempoMap tempo;
@@ -1783,13 +1750,14 @@ public:  // Allow test access to private members in unit test mode
         std::uniform_int_distribution<size_t> dist(0, count - 1);
         return &bin[dist(rng)];
     }
+
     std::shared_ptr<AudioCtx> get_ctx(const AssetMeta* meta) {
         if (!meta) return nullptr;
         auto it = ctx_cache.find(meta);
         if (it != ctx_cache.end()) {
             // BWAVParser::parse() (and its [BWAV] log) only runs on first load.
             // Emit a stable log line when we reuse a cached context.
-            log_info_f(C_GRAY "[CACHED] " C_RESET C_CYAN "%s" C_RESET " (id=%d, size=%u)",
+            log_info_f(C_GRAY "[CACHE] " C_RESET C_CYAN "%s" C_RESET " (id=%d, size=%u)",
                        (meta->name ? meta->name : "(null)"), meta->id, (unsigned)meta->size);
             return it->second;
         }
@@ -1803,21 +1771,34 @@ public:  // Allow test access to private members in unit test mode
        OverlayDecision decision;
        if (!song) return decision;
 
+       // Use song's sample rate as the reference timebase for sample-domain math.
+       // This is what the game does in radio_pool_slot_overlay_init: all timing
+       // diffs are computed as (sample_pos - playhead) / sample_rate before
+       // any plan-selection bounds are applied.
+       const int64_t song_rate = (song->rate > 0) ? (int64_t)song->rate : 1;
+
+       int64_t intro_samples = 0;  // intro length expressed at song's sample rate
        if (intro) {
-           uint32_t intro_rate = std::max<uint32_t>(1u, intro->rate);
-           decision.intro_sec = static_cast<float>(intro->total_samples) / intro_rate;
+           const int64_t intro_rate = std::max<int64_t>(1, (int64_t)intro->rate);
+           // Resample to song timebase: intro->total_samples * song_rate / intro_rate
+           // No int64 overflow risk: 11 sec * 48 kHz * 48000 / 32000 ≈ 8e5, well within int64.
+           intro_samples = (int64_t)intro->total_samples * song_rate / intro_rate;
+           decision.intro_sec = (float)intro_samples / (float)song_rate;
        } else {
            decision.intro_sec = 0.0f;
        }
-       decision.loop_start_sec = (song->rate > 0) ? (float)song->loop_start / song->rate : 0.0f;
 
-       if (!intro || decision.loop_start_sec < 1.0f) {
+       const int64_t loop_start_samples = (int64_t)song->loop_start;
+       decision.loop_start_sec = (float)loop_start_samples / (float)song_rate;
+
+       // Early NoOverlay: no intro, or song's loop_start is less than 1 sec in.
+       const int64_t one_sec_samples = song_rate;
+       if (!intro || loop_start_samples < one_sec_samples) {
            decision.plan = OverlayPlan::NoOverlay;
            decision.intro_delay = 0.0f;
            decision.song_delay = DEFAULT_NO_OVERLAY_DELAY;
            return decision;
        }
-
 
        // Use the ID from AudioCtx to use the cache
        auto align = tempo.get_alignment(song->id, decision.loop_start_sec);
@@ -1825,13 +1806,32 @@ public:  // Allow test access to private members in unit test mode
        float beat_len = align.beat_len_sec;
        float bar_len = align.bar_len_sec;
 
-       decision.delta = (int)(std::ceil(decision.lead_in_sec) - std::ceil(decision.intro_sec + INTRO_ALIGN_PAD_SEC));
-       
-       // Basic Range Check: Ensure tracks aren't wildly incompatible
-       // But skip this if we have valid alignment data, because lead-in might be much shorter than loop_start
+       // === Sample-domain plan selection (bit-perfect match to game) ===
+       //
+       // The game's radio_pool_slot_overlay_init at 0x4565c4630 computes
+       // (target_sample_pos - playhead_sample_pos) entirely in sample-position
+       // integers, then divides by sample_rate only when storing the final
+       // overlay_start_sec into the slot.  Plan-selection bounds are
+       // therefore implicitly in the sample domain.
+       //
+       // The earlier ceil()-based delta math introduced up to ±1-second rounding
+       // jitter at integer-second boundaries: e.g. lead_in=10.001 vs 9.999 would
+       // produce different plans even though the audio difference is 2 ms.
+       const int64_t pad_samples = (int64_t)std::llround((double)INTRO_ALIGN_PAD_SEC * (double)song_rate);
+       const int64_t lead_in_samples = (int64_t)std::llround((double)decision.lead_in_sec * (double)song_rate);
+       const int64_t intro_padded_samples = intro_samples + pad_samples;
+       const int64_t delta_samples = lead_in_samples - intro_padded_samples;
+
+       // Expose decision.delta as truncated integer seconds for debug + telemetry.
+       decision.delta = (int)(delta_samples / song_rate);
+
+       // Range-check (only when no alignment data): unchanged in semantics,
+       // also lifted to sample domain for the same precision reason.
        if (!align.valid) {
-            float diff_sec = decision.loop_start_sec - decision.intro_sec;
-            if (diff_sec < OVERLAY_RANGE_MIN || diff_sec > OVERLAY_RANGE_MAX) {
+            const int64_t diff_samples = loop_start_samples - intro_samples;
+            const int64_t range_min_samples = (int64_t)std::llround((double)OVERLAY_RANGE_MIN * (double)song_rate);
+            const int64_t range_max_samples = (int64_t)std::llround((double)OVERLAY_RANGE_MAX * (double)song_rate);
+            if (diff_samples < range_min_samples || diff_samples > range_max_samples) {
                decision.plan = OverlayPlan::NoOverlay;
                decision.intro_delay = 0.0f;
                decision.song_delay = DEFAULT_NO_OVERLAY_DELAY;
@@ -1839,41 +1839,38 @@ public:  // Allow test access to private members in unit test mode
             }
        }
 
-       bool song_first_allowed = decision.delta >= OVERLAY_DELTA_SONG_FIRST_MIN && decision.delta <= OVERLAY_DELTA_SONG_FIRST_MAX;
-       bool intro_first_allowed = decision.delta >= OVERLAY_DELTA_INTRO_FIRST_MIN && decision.delta <= OVERLAY_DELTA_INTRO_FIRST_MAX;
+       // Plan-selection bounds, lifted to sample domain.
+       const int64_t sf_min_samples = (int64_t)OVERLAY_DELTA_SONG_FIRST_MIN  * song_rate;
+       const int64_t sf_max_samples = (int64_t)OVERLAY_DELTA_SONG_FIRST_MAX  * song_rate;
+       const int64_t if_min_samples = (int64_t)OVERLAY_DELTA_INTRO_FIRST_MIN * song_rate;
+       const int64_t if_max_samples = (int64_t)OVERLAY_DELTA_INTRO_FIRST_MAX * song_rate;
+
+       const bool song_first_allowed  = delta_samples >= sf_min_samples && delta_samples <= sf_max_samples;
+       const bool intro_first_allowed = delta_samples >= if_min_samples && delta_samples <= if_max_samples;
 
        if (song_first_allowed) {
            decision.plan = OverlayPlan::SongFirst;
-           decision.intro_delay = compute_song_first_intro_delay(
-                decision.loop_start_sec,
-                decision.lead_in_sec,
-                decision.intro_sec,
-                beat_len,
-                bar_len);
+           decision.intro_delay = compute_song_first_intro_delay(decision.loop_start_sec,
+                                                                 decision.lead_in_sec,
+                                                                 decision.intro_sec,
+                                                                 beat_len,
+                                                                 bar_len);
            decision.song_delay = 0.0f;
        } else if (intro_first_allowed) {
            decision.plan = OverlayPlan::IntroFirst;
            decision.intro_delay = 0.0f;
-           decision.song_delay = compute_intro_first_song_delay(
-                decision.intro_sec,
-                decision.lead_in_sec,
-                beat_len,
-                bar_len);
+           decision.song_delay = compute_intro_first_song_delay(decision.intro_sec,
+                                                                decision.lead_in_sec,
+                                                                beat_len,
+                                                                bar_len);
        } else {
            decision.plan = OverlayPlan::NoOverlay;
            decision.intro_delay = 0.0f;
            decision.song_delay = DEFAULT_NO_OVERLAY_DELAY;
        }
 
-#ifndef UNIT_TEST
-       if (decision.plan == OverlayPlan::IntroFirst) {
-           std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-           if (dist(rng) < 0.5f) {
-               decision.plan = OverlayPlan::NoOverlay;
-               decision.song_delay = DEFAULT_NO_OVERLAY_DELAY;
-           }
-       }
-#endif
+       // (50% IntroFirst→NoOverlay coin flip removed: no game-side evidence
+       //  for this random downgrade.)
 
        decision.intro_delay = std::max(0.0f, decision.intro_delay);
        decision.song_delay = std::max(0.0f, decision.song_delay);
@@ -2064,11 +2061,15 @@ public:
            }
        }
 
-       // Special First Block: No Intro
-       play_block(0, false);
+       // // Special First Block: No Intro — DISABLED 2026-05-13 so intro plays
+       // //                                  before Welcome Horizons on first run.
+       // //                                  Welcome Horizons is still pinned to
+       // //                                  song_indices[0] by the swap above.
+       // play_block(0, false);
 
-       // Start main rotation from second block (if any)
-       size_t offset = 4;
+       // // Start main rotation from second block (if any)
+       // size_t offset = 4;
+       size_t offset = 0;  // rotation now covers block 0 (with intro) too
 
        while (!stop_sig) {
            const size_t pool_limit = std::min((size_t)12, song_indices.size());
@@ -2112,12 +2113,6 @@ int main(int argc, char** argv) {
     // Derive runtime engine sample rate from BWAV headers (do not guess).
     init_engine_sample_rate_from_assets();
 
-    // Try to set main thread (which runs the radio logic) to RT priority too,
-    // though it's less critical than the audio pump.
-    // Actually, miniaudio creates its own threads for ALSA, and it tries to set priority.
-    // But the main thread handles the TUI and high-level logic.
-    // The AudioPump thread is the critical one we handled above.
-    
     if (bin_songs_count == 0) {
         log_error("No songs.");
         return 1;
@@ -2159,13 +2154,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    struct sigaction sa{};
-    sa.sa_handler = handle_shutdown_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
-    sigaction(SIGINT, &sa, nullptr);
+    std::signal(SIGINT, handle_shutdown_signal);
 #ifdef SIGTERM
-    sigaction(SIGTERM, &sa, nullptr);
+    std::signal(SIGTERM, handle_shutdown_signal);
 #endif
 
     log_info(std::string(C_GREEN) + "[AIRCHECK] " + C_RESET + "Streaming radio on port " + C_BOLD + std::to_string(port) + C_RESET + " (visit /stream)");
