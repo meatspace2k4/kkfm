@@ -285,17 +285,23 @@ export class BwavDecoder {
   }
 }
 
-// Matches the radio engine's FADE_TIME_DURATION (acnh_aircheck_pi.cpp).
+// Matches the radio engine's FADE_PLAY_DURATION / FADE_TIME_DURATION
+// (acnh_aircheck_pi.cpp) — these are the defaults Mixer::add() uses for every
+// actual song track (the calls at lines ~1901/1917-18/1933-34 pass no
+// override), so this is a FIXED 10s of post-loop playback before a 7s fade,
+// independent of how long the loop body itself is. Not "loop twice."
+export const FADE_PLAY_SECONDS = 10.0;
 export const FADE_SECONDS = 7.0;
 
 // Decode a whole BWAV to one mono Float32 buffer, procedurally, exactly the
 // way the engine's Track::pull() does: keep pulling decodeBlock() until the
 // decoder reports itself exhausted. No wall-clock scheduling of anything —
-// the loop-twice-then-fade shape (first pass, one more loop-body repeat, then
-// a linear fade to silence) is state the decoder tracks internally (looped,
-// postLoopPos, playLim/fadeLim) and bakes directly into the int16 samples it
-// emits, same as the C++ Decoder does. Playback is then just "play this
-// buffer once, tell me when it ends" — no separate fade automation needed.
+// the loop-then-fade shape (first pass, FADE_PLAY_SECONDS more of the loop
+// content, then a linear fade to silence) is state the decoder tracks
+// internally (looped, postLoopPos, playLim/fadeLim) and bakes directly into
+// the int16 samples it emits, same as the C++ Decoder does. Playback is then
+// just "play this buffer once, tell me when it ends" — no separate fade
+// automation needed.
 //
 // Non-looping songs decode once through with no fade (fadePlaySamples=0).
 //
@@ -310,12 +316,10 @@ export function decodeFullPlayback(arrayBuffer) {
   let fadePlaySamples = 0, fadeSamples = 0, totalFrames;
   if (loopable) {
     // Mirror the engine's own float32 arithmetic (acnh_aircheck_pi.cpp computes
-    // these as `float`) so the fade window lands on the identical sample the
-    // C++ decoder would land on.
+    // these as `(size_t)(fade_play_s * ctx->rate)` in `float`) so the fade
+    // window lands on the identical sample the C++ decoder would land on.
     const fr = Math.fround;
-    const bodyLen = ctx.loopEnd - ctx.loopStart;
-    const fadePlaySec = fr(fr(bodyLen) / fr(ctx.rate));
-    fadePlaySamples = Math.trunc(fr(fadePlaySec * fr(ctx.rate)));
+    fadePlaySamples = Math.trunc(fr(fr(FADE_PLAY_SECONDS) * fr(ctx.rate)));
     fadeSamples = Math.trunc(fr(fr(FADE_SECONDS) * fr(ctx.rate)));
     totalFrames = ctx.loopEnd + fadePlaySamples + fadeSamples;
   } else {
