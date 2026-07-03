@@ -91,75 +91,76 @@ export default function Home({ songs }: { songs: Song[] }) {
   }
 
   /**
-   * Multicast broadcast sync: everyone in the same Discord Activity session
-   * (same voice channel -> same instanceId, see lib/discordShell) hears the
-   * same song at the same position, like tuning into a station. The server
-   * (jukebox_pi's /now-playing) is the single authority on "what song, since
-   * when" per instance; this client just asks it and starts mid-buffer at the
-   * reported offset -- AudioBufferSourceNode.start(when, offset) seeks into
-   * the already-fully-decoded buffer natively, no extra plumbing needed.
+   * Multicast sync is a CONTROL LAYER on top of the base jukebox, not a
+   * replacement for it. The base -- pick the next song from the local shuffle
+   * pool, play it with the engine's loop/fade -- always runs. When the client
+   * is in a Discord Activity room (a shared instanceId, see lib/discordShell),
+   * the server (jukebox_pi's /now-playing) is authoritative about what that
+   * room is playing, and it OVERRIDES the base pick at each decision point:
+   * the client plays the server's song at the server's offset instead of its
+   * own local pick.
    *
-   * Outside Discord there is no shared instanceId -- no "room" to sync with --
-   * so sync must never engage there. instanceIdRef stays null in that case,
-   * and every call site below checks it first; a plain browser tab keeps the
-   * original solo/local-pool behavior (nothing plays until the user picks
-   * something) instead of tuning into whatever the server's anonymous
-   * fallback session happens to be playing mid-song.
-   *
-   * `synced` tracks whether the CURRENT playback is following the broadcast
-   * (only possible with a real instanceId) or is a solo listen (a tile click
-   * or Random, which sets it false, or simply not being inside Discord at
-   * all). A solo pick's natural end returns to the broadcast if one's
-   * available, so inside Discord "everyone hears the same thing" is the
-   * steady state; outside it, playback just keeps behaving like a normal
-   * jukebox.
+   * The override is a short circuit, not a fallback. The base is the default
+   * that always executes; the room, when present and answering, preempts it.
+   * When there is no room (a plain browser tab: instanceId null), or when
+   * we're in a room but the server doesn't answer (logged loudly), nothing
+   * preempts and the base simply proceeds -- keeping the music going. The
+   * next decision point re-attempts the override, so a room that comes back
+   * (rejoining after sleep, or a hypothetical future room change) transparently
+   * takes back over at the next song boundary without any special resume path.
    */
-  const syncedRef = useRef(false);
   const instanceIdRef = useRef<string | null>(null);
-  const resyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const joinBroadcast = async () => {
-    if (!instanceIdRef.current) return; // no shared room to sync with -- stay solo
-    if (resyncTimerRef.current) { clearTimeout(resyncTimerRef.current); resyncTimerRef.current = null; }
+  const scrollToSong = (song: Song) => {
+    const el = document.getElementById(makeIdFromSongName(song.name['name-USen']));
+    el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  // The override. Returns true only if it actually took over playback with the
+  // room's current song. Never call without being in a room -- "in a room" is
+  // a real precondition, checked by the caller, not an error to swallow here.
+  const applyRoomOverride = async (): Promise<boolean> => {
     try {
       const pos = await fetchBroadcastPosition(instanceIdRef.current);
       const song = songs.find((s) => s.id === pos.songId);
-      if (!song) return; // server knows a song this client's build doesn't ship; skip silently
-
-      syncedRef.current = true;
+      if (!song) {
+        // In a room, but the server named a song this build doesn't ship.
+        // Surface it; the base pick keeps playing.
+        console.error(`[broadcast] server song id ${pos.songId} not in this client's set`);
+        return false;
+      }
       setCurrentSong(song);
-      const el = document.getElementById(makeIdFromSongName(song.name['name-USen']));
-      el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
+      scrollToSong(song);
       await getBwavPlayer().play(song.music_uri, { offsetSec: pos.offsetSec });
-
-      // Belt-and-suspenders resync timer for whatever's left of this song, in
-      // case the 'bwav-ended' event is ever missed (tab throttling, etc.) --
-      // the ended-handler below normally fires first and clears this.
-      const remainingMs = Math.max(1000, (pos.durationSec - pos.offsetSec) * 1000 + 500);
-      resyncTimerRef.current = setTimeout(() => {
-        if (syncedRef.current) joinBroadcast();
-      }, remainingMs);
+      return true;
     } catch (err) {
-      console.error('[broadcast] join failed:', err);
-      // Retry shortly rather than leaving the room permanently out of sync.
-      resyncTimerRef.current = setTimeout(() => joinBroadcast(), 5000);
+      // In a room, but the server didn't answer. Do not invent a quiet
+      // substitute -- log it and let the base keep the music going; the next
+      // boundary re-asserts the room.
+      console.error('[broadcast] room query failed, staying on local pool for now:', err);
+      return false;
     }
+  }
+
+  // The decision made at every song boundary (and reused on load). Base:
+  // next song from the local pool. The room, if we're in one, short-circuits it.
+  const advanceToNext = async () => {
+    if (instanceIdRef.current && (await applyRoomOverride())) return;
+    playRandomSong();
   }
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       instanceIdRef.current = await getDiscordInstanceId();
-      // Only auto-join when there's an actual shared room; otherwise leave the
-      // page idle (matches the original site: nothing plays until the user
-      // clicks Random or a tile).
-      if (!cancelled && instanceIdRef.current) joinBroadcast();
+      // On load, only the room can start playback on its own: joining an
+      // Activity room means tuning into whatever it's already playing, at the
+      // right offset. With no room there's nothing to auto-start (and browsers
+      // block autoplay without a gesture anyway), so the page stays idle until
+      // the user hits Random or a tile -- exactly the original site's behavior.
+      if (!cancelled && instanceIdRef.current) applyRoomOverride();
     })();
-    return () => {
-      cancelled = true;
-      if (resyncTimerRef.current) clearTimeout(resyncTimerRef.current);
-    };
+    return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -180,13 +181,11 @@ export default function Home({ songs }: { songs: Song[] }) {
   const handlePlay = () => {
     const uri = pendingUriRef.current;
     if (!uri) return;
-    // Any explicit single-song play (tile click, or Random via playRandomSong
-    // below) is a deliberate solo listen, not the shared broadcast -- stop
-    // following it, and cancel any pending resync so it can't cut this off
-    // mid-play. The 'bwav-ended' handler returns to the broadcast once this
-    // song naturally finishes.
-    syncedRef.current = false;
-    if (resyncTimerRef.current) { clearTimeout(resyncTimerRef.current); resyncTimerRef.current = null; }
+    // An explicit user pick (tile click, or Random) plays immediately from the
+    // start -- a momentary override of whatever the room is doing, for this
+    // client only. No sync bookkeeping needed: when this song ends, the normal
+    // boundary decision (advanceToNext) runs and the room, if any, takes back
+    // over. So a manual pick simply lasts one song.
     getBwavPlayer().play(uri).catch((err: unknown) => console.error('[bwav] play failed:', err));
   }
 
@@ -252,21 +251,15 @@ export default function Home({ songs }: { songs: Song[] }) {
   playRandomRef.current = playRandomSong; // Manually set ref after fn creation
 
   /**
-   * When a song finishes naturally (loop played twice, plays on, then fades
-   * to silence — see lib/bwavPlayer), advance. Inside Discord (a real
-   * instanceId) this rejoins the shared broadcast -- true whether the song
-   * that just ended was itself the broadcast or a solo pick (Random / a tile
-   * click), so "everyone hears the same thing" is the steady state. Outside
-   * Discord there's no room to rejoin, so it draws another song from the
-   * local shuffle-bag pool instead, same as the original site. Guarded by the
+   * When a song finishes naturally (loop played twice, plays on, then fades to
+   * silence — see lib/bwavPlayer), make the boundary decision: advanceToNext()
+   * plays the next song from the local pool, unless we're in a room and the
+   * server overrides that with what the room is playing. Guarded by the
    * player's own token check, so this never fires for a song the user
    * paused/skipped away from mid-play.
    */
   useEffect(() => {
-    const onEnded = () => {
-      if (instanceIdRef.current) joinBroadcast();
-      else playRandomSong();
-    };
+    const onEnded = () => { advanceToNext(); };
     window.addEventListener('bwav-ended', onEnded);
     return () => window.removeEventListener('bwav-ended', onEnded);
   // eslint-disable-next-line react-hooks/exhaustive-deps
