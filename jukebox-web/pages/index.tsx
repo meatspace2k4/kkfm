@@ -99,17 +99,27 @@ export default function Home({ songs }: { songs: Song[] }) {
    * reported offset -- AudioBufferSourceNode.start(when, offset) seeks into
    * the already-fully-decoded buffer natively, no extra plumbing needed.
    *
+   * Outside Discord there is no shared instanceId -- no "room" to sync with --
+   * so sync must never engage there. instanceIdRef stays null in that case,
+   * and every call site below checks it first; a plain browser tab keeps the
+   * original solo/local-pool behavior (nothing plays until the user picks
+   * something) instead of tuning into whatever the server's anonymous
+   * fallback session happens to be playing mid-song.
+   *
    * `synced` tracks whether the CURRENT playback is following the broadcast
-   * (true, the default -- this is what makes it multicast "out of the box")
-   * or is a solo listen the user chose explicitly (a tile click or Random,
-   * which sets it false). A solo pick's natural end returns to the broadcast
-   * automatically, so "everyone hears the same thing" is the steady state.
+   * (only possible with a real instanceId) or is a solo listen (a tile click
+   * or Random, which sets it false, or simply not being inside Discord at
+   * all). A solo pick's natural end returns to the broadcast if one's
+   * available, so inside Discord "everyone hears the same thing" is the
+   * steady state; outside it, playback just keeps behaving like a normal
+   * jukebox.
    */
-  const syncedRef = useRef(true);
+  const syncedRef = useRef(false);
   const instanceIdRef = useRef<string | null>(null);
   const resyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const joinBroadcast = async () => {
+    if (!instanceIdRef.current) return; // no shared room to sync with -- stay solo
     if (resyncTimerRef.current) { clearTimeout(resyncTimerRef.current); resyncTimerRef.current = null; }
     try {
       const pos = await fetchBroadcastPosition(instanceIdRef.current);
@@ -141,7 +151,10 @@ export default function Home({ songs }: { songs: Song[] }) {
     let cancelled = false;
     (async () => {
       instanceIdRef.current = await getDiscordInstanceId();
-      if (!cancelled) joinBroadcast();
+      // Only auto-join when there's an actual shared room; otherwise leave the
+      // page idle (matches the original site: nothing plays until the user
+      // clicks Random or a tile).
+      if (!cancelled && instanceIdRef.current) joinBroadcast();
     })();
     return () => {
       cancelled = true;
@@ -240,16 +253,20 @@ export default function Home({ songs }: { songs: Song[] }) {
 
   /**
    * When a song finishes naturally (loop played twice, plays on, then fades
-   * to silence — see lib/bwavPlayer), rejoin the shared broadcast. This is
-   * true whether the song that just ended was itself the broadcast (the
-   * common case) or a solo pick (Random / a tile click): either way, once
-   * it's over, playback returns to "everyone hears the same thing" rather
-   * than continuing to wander off on its own pool. Guarded by the player's
-   * own token check, so this never fires for a song the user paused/skipped
-   * away from mid-play.
+   * to silence — see lib/bwavPlayer), advance. Inside Discord (a real
+   * instanceId) this rejoins the shared broadcast -- true whether the song
+   * that just ended was itself the broadcast or a solo pick (Random / a tile
+   * click), so "everyone hears the same thing" is the steady state. Outside
+   * Discord there's no room to rejoin, so it draws another song from the
+   * local shuffle-bag pool instead, same as the original site. Guarded by the
+   * player's own token check, so this never fires for a song the user
+   * paused/skipped away from mid-play.
    */
   useEffect(() => {
-    const onEnded = () => { joinBroadcast(); };
+    const onEnded = () => {
+      if (instanceIdRef.current) joinBroadcast();
+      else playRandomSong();
+    };
     window.addEventListener('bwav-ended', onEnded);
     return () => window.removeEventListener('bwav-ended', onEnded);
   // eslint-disable-next-line react-hooks/exhaustive-deps
