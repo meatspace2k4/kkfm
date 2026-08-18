@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aircheck</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0b0b0f;color:#f5f5f5;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;min-height:100vh;margin:0;text-align:center;padding:0;}
+button{padding:15px 30px;font-size:1.2rem;border-radius:8px;border:0;cursor:pointer;background:#3b82f6;color:white;transition:background .2s;}
+button:hover{background:#2563eb;}
+button:disabled{background:#4b5563;cursor:not-allowed;}
+.status{margin-top:1rem;color:#9ca3af;font-size:.9rem;}
+</style>
+<!-- Resolves the Embedded App SDK for browser/discord-shell.js. Points at a
+     same-origin vendored copy so nothing loads from an external CDN inside the
+     Discord iframe. Download it once on the Pi (see browser/README-discord.md):
+       mkdir -p browser/vendor
+       curl -L "https://cdn.jsdelivr.net/npm/@discord/embedded-app-sdk@2/+esm" \
+         -o browser/vendor/embedded-app-sdk.js -->
+<script type="importmap">
+{
+  "imports": {
+    "@discord/embedded-app-sdk": "/vendor/embedded-app-sdk.js"
+  }
+}
+</script>
+</head>
+<body>
+<style>
+  /* Windows 95 chrome: flat #c0c0c0, hard 3D bevels, no gradients, no
+     glow, no radius. The ticker is a sunken black readout; the button is
+     a stock dialog button. The TUI below stays the TUI. */
+  #radiobar { display:none;   /* legacy GUI: show with ?gui */
+    position:sticky; top:0; z-index:10; width:100%;
+    padding:4px 0; box-sizing:border-box; background:#c0c0c0;
+    border-top:1px solid #dfdfdf; border-bottom:2px solid #404040;
+    font-family:"MS Sans Serif",Tahoma,sans-serif; font-size:11px; }
+  #rbinner { width:min(92vw, 980px); margin:0 auto;
+    display:flex; align-items:center; gap:6px; }
+  #brand { font-weight:bold; color:#000; white-space:nowrap;
+    padding:0 4px; }
+  #brand b { color:#000080; }   /* title-bar navy */
+  #playBtn { padding:2px 12px; font-size:11px; font-weight:bold;
+    color:#000; background:#c0c0c0; border:2px solid; border-radius:0;
+    border-color:#ffffff #404040 #404040 #ffffff; cursor:pointer;
+    font-family:"MS Sans Serif",Tahoma,sans-serif; white-space:nowrap;
+    margin:0; }
+  #playBtn:active { border-color:#404040 #ffffff #ffffff #404040;
+    padding:3px 11px 1px 13px; }
+  #playBtn:disabled { color:#2aa889;   /* the TUI's Gotham green */
+    text-shadow:1px 1px 0 #ffffff; cursor:default; }
+  /* the readout is an early-iTunes LCD: pale green, dark text, FIXED
+     (no marquee), centered, ellipsis when long */
+  #tickerwrap { flex:1; min-width:0; overflow:hidden; height:20px;
+    background:#cdd8c6; border:2px solid; border-radius:0;
+    border-color:#404040 #ffffff #ffffff #404040;
+    display:flex; align-items:center; }
+  #ticker { display:inline-block; white-space:nowrap;
+    padding:0 6px; text-align:left;
+    font-family:Tahoma,Verdana,sans-serif; font-size:11px;
+    color:#2c352b; --shift:0px; }
+  @keyframes tick { 0%,25% { transform:translateX(0); }
+                    75%,100% { transform:translateX(var(--shift)); } }
+  #status { font-size:11px; color:#000; white-space:nowrap; margin:0;
+    background:#c0c0c0; padding:2px 8px; border:2px solid;
+    border-color:#808080 #ffffff #ffffff #808080; }
+  #dashwrap { width:min(92vw, 980px); aspect-ratio:900/532; overflow:hidden;
+              margin:14px auto 1rem; }
+  #cv { width:128.9%; height:auto; display:block; background:#0c1014; }
+  #flat, #diag { display:none; }  /* debug surfaces; /dash/ still shows them */
+</style>
+<div id="radiobar"><div id="rbinner">
+  <span id="brand">KKFM <b>88.0</b></span>
+  <button id="playBtn">&#9654; PLAY</button>
+  <div id="tickerwrap"><span id="ticker">NOW PLAYING: tuning&#8230;</span></div>
+  <div id="status" class="status">Ready</div>
+</div></div>
+<script>
+  /* --gui equivalent: ?gui shows the Win95 bar; default is the TUI-native
+     player chip rendered inside the terminal */
+  if (new URLSearchParams(location.search).has("gui"))
+    document.getElementById("radiobar").style.display = "block";
+</script>
+<div id="dashwrap"><canvas id="cv"></canvas></div>
+<button id="flat">2D mode (rotation -> 0; same render path)</button>
+<div id="diag"></div>
+<script src="/dash/terminal.js"></script>
+<script src="/dash/dashboard.js"></script>
+<script>
+(function(){
+  var el = document.getElementById("ticker");
+  var wrap = document.getElementById("tickerwrap");
+  var lastNP = null, shown = null;
+  function apply(text){
+    el.style.animation = "none";
+    el.textContent = text;
+    var over = el.scrollWidth - wrap.clientWidth;
+    if (over > 0) {
+      el.style.setProperty("--shift", (-(over + 6)) + "px");
+      void el.offsetWidth;             /* restart the animation */
+      el.style.animation = "tick 12s linear infinite";
+    }
+  }
+  setInterval(function(){
+    try {
+      var ev = window.st && st.lastEvent;
+      if (ev && ev.etype === "now_playing" && ev.name) lastNP = ev.name;
+    } catch (e) {}
+    var text = "NOW PLAYING: " + (lastNP || "tuning\u2026");
+    if (text !== shown) { shown = text; apply(text); }
+  }, 1000);
+})();
+</script>
+<script type="module">
+import { initDiscordShell, isInsideDiscord } from './discord-shell.js';
+
+const workletCode = `
+class PCMProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.current = null;
+    this.offset = 0;
+    this.queue = [];
+    this.port.onmessage = (event) => {
+      if (event.data) this.queue.push(event.data);
+    };
+  }
+  process(inputs, outputs) {
+    const left = outputs[0][0];
+    const right = outputs[0][1];
+    for (let i = 0; i < left.length; i++) {
+      if (!this.current || this.offset >= this.current.length) {
+        if (this.queue.length === 0) {
+          left[i] = 0;
+          right[i] = 0;
+          continue;
+        }
+        this.current = this.queue.shift();
+        this.offset = 0;
+      }
+      left[i] = this.current[this.offset++];
+      right[i] = this.current[this.offset++];
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-processor', PCMProcessor);
+`;
+
+const btn = document.getElementById('playBtn');
+const status = document.getElementById('status');
+
+async function startAudio() {
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.innerText = 'Connecting...';
+  try {
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+    
+    let pcmNode;
+    if (audioCtx.audioWorklet) {
+        const blob = new Blob([workletCode], { type: 'application/javascript' });
+        await audioCtx.audioWorklet.addModule(URL.createObjectURL(blob));
+        const workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor', { outputChannelCount: [2] });
+        workletNode.connect(audioCtx.destination);
+        pcmNode = workletNode;
+    } else {
+        console.warn('AudioWorklet not available, falling back to ScriptProcessorNode');
+        const scriptNode = audioCtx.createScriptProcessor(4096, 0, 2);
+        const queue = [];
+        let current = null;
+        let offset = 0;
+        
+        scriptNode.onaudioprocess = (e) => {
+            const left = e.outputBuffer.getChannelData(0);
+            const right = e.outputBuffer.getChannelData(1);
+            const len = left.length;
+            for (let i = 0; i < len; i++) {
+                if (!current || offset >= current.length) {
+                    if (queue.length === 0) {
+                        left[i] = 0;
+                        right[i] = 0;
+                        continue;
+                    }
+                    current = queue.shift();
+                    offset = 0;
+                }
+                left[i] = current[offset++];
+                right[i] = current[offset++];
+            }
+        };
+        scriptNode.connect(audioCtx.destination);
+        pcmNode = {
+            port: {
+                postMessage: (data) => {
+                    queue.push(data);
+                }
+            }
+        };
+    }
+
+    const response = await fetch('/stream');
+    if (!response.body) throw new Error('ReadableStream unsupported');
+    const reader = response.body.getReader();
+    status.innerText = 'Streaming…';
+    btn.innerText = 'Live';
+
+    let headerBytesRemaining = 44;
+    // Carry-over for bytes that don't complete a 4-byte stereo frame. Network
+    // reads land on arbitrary byte boundaries; dropping the remainder (as the
+    // old code did) byte-shifts every later sample and plays as loud static.
+    let leftover = new Uint8Array(0);
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+
+      let chunk = value;
+      if (headerBytesRemaining > 0) {
+        if (chunk.byteLength <= headerBytesRemaining) {
+          headerBytesRemaining -= chunk.byteLength;
+          continue;
+        }
+        chunk = chunk.subarray(headerBytesRemaining);
+        headerBytesRemaining = 0;
+      }
+
+      let buf = chunk;
+      if (leftover.length > 0) {
+        buf = new Uint8Array(leftover.length + chunk.byteLength);
+        buf.set(leftover, 0);
+        buf.set(chunk, leftover.length);
+      }
+
+      const usableBytes = buf.byteLength & ~3;
+      leftover = buf.slice(usableBytes);
+      if (usableBytes === 0) continue;
+
+      // DataView: safe at any byteOffset, explicit little-endian (WAV PCM).
+      const view = new DataView(buf.buffer, buf.byteOffset, usableBytes);
+      const sampleCount = usableBytes >> 1;
+      const floatChunk = new Float32Array(sampleCount);
+      for (let i = 0; i < sampleCount; i++) {
+        floatChunk[i] = view.getInt16(i * 2, true) / 32768.0;
+      }
+      pcmNode.port.postMessage(floatChunk, [floatChunk.buffer]);
+    }
+  } catch (err) {
+    console.error(err);
+    status.innerText = 'Error: ' + err.message;
+    btn.disabled = false;
+    btn.innerText = '▶ Retry';
+  }
+}
+
+// The click doubles as the user gesture that lets AudioContext start.
+btn.addEventListener('click', startAudio);
+
+// When launched as a Discord Activity, complete the SDK/OAuth handshake up
+// front. Outside Discord this is skipped and the page behaves as before.
+if (isInsideDiscord()) {
+  status.innerText = 'Connecting to Discord…';
+  initDiscordShell()
+    .then(() => { status.innerText = 'In voice channel — press play'; })
+    .catch((err) => {
+      console.error(err);
+      status.innerText = 'Discord error: ' + err.message;
+    });
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+# systemd USER unit for the log/status endpoint (no root needed).
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp ~/aircheck-status/aircheck-status.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now aircheck-status
+[Unit]
+Description=aircheck status endpoint (journal + status over HTTP)
+
+[Service]
+ExecStart=/usr/bin/python3 %h/aircheck-status/logserver.py --host 127.0.0.1 --port 8775
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

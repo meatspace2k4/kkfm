@@ -1,0 +1,38 @@
+# build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.bin
+aircheck_pi
+
+# generated assets (proprietary-derived; never commit)
+assets.h
+assets.S
+assets_blob.bin
+
+# packer tooling and its inputs (supplied out of band)
+radio/packer.py
+radio/data/
+radio/Sound/
+*.bwav
+
+# tests (kept on disk, not shipped)
+radio/tests/
+watchdog/tests/
+watchdog/test_runner.py
+tests_cpp.cpp
+test_mocks.h
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# editors / os
+*.swp
+*~
+.vscode/
+.idea/
+.DS_Store
