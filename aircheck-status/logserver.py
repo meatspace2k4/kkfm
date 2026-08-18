@@ -173,6 +173,8 @@ class Handler(BaseHTTPRequestHandler):
                   [("Transfer-Encoding", "chunked")])
         try:
             for raw in proc.stdout:
+                if b"[WEB]" in raw:
+                    continue   # request lines carry visitor IP/UA; never relay
                 chunk = b"%x\r\n%s\r\n" % (len(raw), raw)
                 self.wfile.write(chunk)
                 self.wfile.flush()
