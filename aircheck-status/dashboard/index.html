@@ -1,14 +1,17 @@
 <!doctype html>
 <meta charset="utf-8">
+<meta name="viewport" content="width=900">
 <title>aircheck status</title>
 <style>
-  body { background:#0c1014; color:#ccc; font-family:monospace; margin:0; }
-  canvas { background:#0c1014; display:block; }
-  #diag { margin-top:8px; white-space:pre; color:#8a8; }
-  button { font-family:monospace; margin-top:8px; }
+  html, body { background:#0c1014; color:#ccc; font-family:monospace;
+               margin:0; overflow:auto; }
+  /* canvas at its true native pixel size, text never shrunk or crushed.
+     On a screen narrower than the content, the page scrolls to it. */
+  canvas { display:block; background:#0c1014; }
+  #flat, #diag { display:none; }
 </style>
 <canvas id="cv"></canvas>
 <button id="flat">2D mode (rotation -> 0; same render path)</button>
 <div id="diag"></div>
-<script src="terminal.js"></script>
-<script src="dashboard.js"></script>
+<script src="terminal.js?v=3"></script>
+<script src="dashboard.js?v=3"></script>

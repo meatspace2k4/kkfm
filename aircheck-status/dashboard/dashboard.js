@@ -337,10 +337,20 @@ function render() {
   var level = 0;
   if (link.state !== "CONNECTED") level = 2;
   var services = (snap && snap.services) || {};
+  /* match by suffix, not exact name: whatever prefix a given deployment's
+     units actually carry, "*aircheck.service" etc still resolves. */
   var units = ["aircheck.service", "aircheck-watchdog.service",
                "aircheck-tx-watchdog.service"];
-  units.forEach(function(u){
-    var s = services[u];
+  function findUnit(suffix) {
+    var keys = Object.keys(services);
+    for (var i = 0; i < keys.length; i++) {
+      if (keys[i].length >= suffix.length
+          && keys[i].slice(-suffix.length) === suffix) return keys[i];
+    }
+    return null;
+  }
+  units.forEach(function(suffix){
+    var s = services[findUnit(suffix)];
     if (s && s.active !== "active") level = Math.max(level, 2);
   });
   var tx = snap && snap.tx;
@@ -385,7 +395,8 @@ function render() {
   /* SYSTEM SERVICES */
   put(rows, 4, 2, "SYSTEM SERVICES", titleA);
   var y = 5;
-  units.forEach(function(u){
+  units.forEach(function(suffix){
+    var u = findUnit(suffix) || suffix;
     var s = services[u] || {active: (link.state === "CONNECTED" ? "CONNECT" : "OFFLINE"), sub: "-"};
     put(rows, y, 4, (u + "                                   ").slice(0, 35) + " ", bodyA);
     var color = s.active === "active" ? GREEN

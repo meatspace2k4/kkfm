@@ -210,14 +210,15 @@ function buildPrims() {
   return prims;
 }
 
+var VIEW = 1;   /* content scale is 1: buffer is native size, untouched */
 function draw() {
   var cv = document.getElementById("cv"), ctx = cv.getContext("2d");
   var chw = CFG.ch[0], chh = CFG.ch[1];
   var W = CFG.canvas[0]*chw, H = CFG.canvas[1]*chh;
-  if (cv.width !== W+260) { cv.width = W+260; cv.height = H+160; }
-  /* the flat interface starts at the viewport origin; the +260/+160 canvas
-     slack is all on the right/bottom, so rotation room exists only there
-     and a swing toward the top-left clips at the edge */
+  if (cv.width !== W) { cv.width = W; cv.height = H; }
+  /* the buffer is EXACTLY the content: no slack, so the element's box is
+     the interface and nothing dead participates in layout or zoom. A
+     rotation swing clips at the edges; that is cosmetic. */
   var OX = 0, OY = 0;
   ctx.setTransform(1,0,0,1,0,0);
   ctx.clearRect(0,0,cv.width,cv.height);
@@ -296,6 +297,8 @@ function _overGlyph(cell) {
   return !!(g && g.ch && g.ch !== " ");
 }
 function _canvasPoint(e) {
+  /* client px -> buffer px -> divide out the uniform content scale, so the
+     result is in grid coordinates whatever the window size */
   var cv = document.getElementById("cv");
   var r = cv.getBoundingClientRect();
   return [(e.clientX - r.left) * (cv.width / r.width),
@@ -384,6 +387,37 @@ window.addEventListener("wheel", function(e){
   scenePose.ry += e.deltaX * 0.004;
   scenePose.rx += e.deltaY * 0.004;
 }, {passive: false});
+
+/* touch: TAP ONLY. A short single tap clicks the cell (the play chip);
+   everything else is left to the browser. No touch selection, no touch
+   rotation. */
+function _touchCanvasPoint(t) {
+  var cv = document.getElementById("cv");
+  var r = cv.getBoundingClientRect();
+  return [(t.clientX - r.left) * (cv.width / r.width),
+          (t.clientY - r.top) * (cv.height / r.height)];
+}
+var touchStartCell = null, touchStartT = 0, touchStartXY = null;
+window.addEventListener("touchstart", function(e){
+  touchStartCell = null;
+  if (e.target !== document.getElementById("cv")) return;
+  if (e.touches.length !== 1) return;
+  touchStartCell = screenToCell.apply(null, _touchCanvasPoint(e.touches[0]));
+  touchStartT = Date.now();
+  touchStartXY = [e.touches[0].clientX, e.touches[0].clientY];
+}, {passive: true});
+window.addEventListener("touchend", function(e){
+  if (!touchStartCell) return;
+  var moved = false;
+  if (e.changedTouches.length === 1 && touchStartXY) {
+    var dx = e.changedTouches[0].clientX - touchStartXY[0];
+    var dy = e.changedTouches[0].clientY - touchStartXY[1];
+    moved = Math.sqrt(dx*dx + dy*dy) > 10;
+  }
+  if (!moved && Date.now() - touchStartT < 500 && window.termClick)
+    window.termClick(touchStartCell[0], touchStartCell[1]);
+  touchStartCell = null;
+}, {passive: true});
 document.getElementById("flat").onclick = function(){ scenePose.rx = scenePose.ry = 0; };
 
 fetch(SCRIPT_BASE + "scene.cfg").then(function(r){
