@@ -1,0 +1,17 @@
+# systemd USER unit for the Pi-side log/status endpoint (no root anywhere).
+# Install (as jpark on aircheck-pi):
+#   mkdir -p ~/.config/systemd/user
+#   cp ~/Aircheck/kkfm/aircheck-dash/aircheck-dash.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now aircheck-dash
+# Fronted by the dustytrails tunnel: aircheck-dash.funstuff.app -> :8775
+[Unit]
+Description=aircheck 3D dashboard data endpoint (journal + status over HTTP)
+
+[Service]
+ExecStart=/usr/bin/python3 %h/Aircheck/kkfm/aircheck-dash/logserver.py --host 127.0.0.1 --port 8775
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

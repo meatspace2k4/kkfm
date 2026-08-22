@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+sketch_dir=/home/jpark/Aircheck/kkfm/radio/si4713_sketch
+sketch_file="$sketch_dir/si4713_sketch.ino"
+build_dir=/tmp/si4713-build
+watchdog=acnh-aircheck-tx-watchdog.service
+
+if [[ $# -ne 2 || ! $1 =~ ^(8[8-9]|9[0-9]|10[0-7])\.[0-9]$ || ! $2 =~ ^[0-9]+$ ]]; then
+    echo "Usage: $0 FREQUENCY_MHZ TX_POWER_DBUV   Example: $0 92.7 95" >&2
+    exit 2
+fi
+
+frequency_mhz=$1
+tx_power_dbuv=$2
+frequency_code=${frequency_mhz/./}
+
+if (( frequency_code < 881 || frequency_code > 1079 )); then
+    echo "Frequency must be between 88.1 and 107.9 MHz" >&2
+    exit 2
+fi
+
+frequency_code="${frequency_code}0"
+
+if (( tx_power_dbuv < 88 || tx_power_dbuv > 115 )); then
+    echo "Transmit power must be between 88 and 115 dBuV" >&2
+    exit 2
+fi
+
+sed -i -E \
+    "s/^#define FIXED_FREQ[[:space:]]+[0-9]+.*/#define FIXED_FREQ      $frequency_code    \/\/ $frequency_mhz MHz (×10 kHz)/" \
+    "$sketch_file"
+sed -i -E \
+    "s/^#define TX_POWER_dBuV[[:space:]]+[0-9]+.*/#define TX_POWER_dBuV     $tx_power_dbuv/" \
+    "$sketch_file"
+sed -i -E \
+    's/^static bool g_frequency_selected = false;/static bool g_frequency_selected = true;/' \
+    "$sketch_file"
+
+mkdir -p "$build_dir"
+arduino-cli compile \
+    --fqbn arduino:avr:uno \
+    --output-dir "$build_dir" \
+    "$sketch_dir"
+
+sudo systemctl stop "$watchdog"
+restart_watchdog() {
+    sudo systemctl start "$watchdog"
+}
+trap restart_watchdog EXIT INT TERM
+
+for _ in $(seq 1 30); do
+    if ! fuser /dev/serial0 >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.1
+done
+
+if fuser /dev/serial0 >/dev/null 2>&1; then
+    echo "ERROR: /dev/serial0 is still in use" >&2
+    fuser -v /dev/serial0 >&2
+    exit 1
+fi
+
+read -r -p "Hold the Uno RESET button, then press Enter while still holding RESET: "
+echo "RELEASE RESET NOW"
+sleep 0.2
+
+avrdude \
+    -p atmega328p \
+    -c arduino \
+    -P /dev/serial0 \
+    -b 115200 \
+    -D \
+    -U "flash:w:$build_dir/si4713_sketch.ino.hex:i"
+
+trap - EXIT INT TERM
+sudo systemctl start "$watchdog"
+sleep 2
+cat /run/kkfm-watchdog/tx_status.json
