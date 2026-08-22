@@ -2,9 +2,12 @@
 #include <Adafruit_Si4713.h>
 
 /* ---------- user-adjustable ------------------------------------------- */
-#define FIXED_FREQ      8800    // 88.00 MHz (×10 kHz).  Use scanBand() if you prefer auto-scan
-#define TX_POWER_dBuV     115
+#define FIXED_FREQ      9270    // 92.7 MHz (×10 kHz)
+#define TX_POWER_dBuV     105
 #define LOG_MS           100   // serial log period
+#define SCAN_MIN_FREQ    8810   // 88.10 MHz
+#define SCAN_MAX_FREQ   10790   // 107.90 MHz
+#define SCAN_STEP          20   // 200 kHz US FM channel spacing
 // I2C hardening: prevents permanent hangs if Si4713 stops responding mid-run.
 #define I2C_CLOCK_HZ   100000  // 100 kHz is conservative and robust for longer wiring
 #define WIRE_TIMEOUT_US  25000 // 25 ms per I2C transaction; tune if needed
@@ -34,6 +37,8 @@
 Adafruit_Si4713 radio(RST_PIN);
 
 static uint32_t g_last_recovery_ms = 0;
+static uint16_t g_selected_freq = FIXED_FREQ;
+static bool g_frequency_selected = true;
 
 static void hardResetSi4713()
 {
@@ -88,6 +93,34 @@ static void i2cBusRecover()
 #endif
 }
 
+static uint16_t scanBestFrequency()
+{
+    uint16_t best_freq = FIXED_FREQ;
+    uint8_t best_noise = 0xFF;
+
+    Serial.println(F("SCAN_BEGIN"));
+    for (uint16_t freq = SCAN_MIN_FREQ; freq <= SCAN_MAX_FREQ; freq += SCAN_STEP) {
+        radio.readTuneMeasure(freq);
+        radio.readTuneStatus();
+
+        Serial.print(F("SCAN "));
+        Serial.print(freq / 100.0, 2);
+        Serial.print(' ');
+        Serial.println(radio.currNoiseLevel);
+
+        if (radio.currNoiseLevel < best_noise) {
+            best_noise = radio.currNoiseLevel;
+            best_freq = freq;
+        }
+    }
+
+    Serial.print(F("SCAN_BEST="));
+    Serial.print(best_freq / 100.0, 2);
+    Serial.print(F(" MHz NOISE="));
+    Serial.println(best_noise);
+    return best_freq;
+}
+
 static bool initRadio()
 {
     setupI2C();
@@ -97,9 +130,14 @@ static bool initRadio()
         return false;
     }
 
+    if (!g_frequency_selected) {
+        g_selected_freq = scanBestFrequency();
+        g_frequency_selected = true;
+    }
+
     /* --------- Frequency & output power -------------------------------- */
     radio.setTXpower(TX_POWER_dBuV);
-    radio.tuneFM(FIXED_FREQ);             // comment & call scanBand() if you want auto-scan
+    radio.tuneFM(g_selected_freq);
     /* ------------------------------------------------------------------ */
 
     /* --------- deviation, input pad, limiter --------------------------- */
@@ -190,7 +228,7 @@ void setup()
     }
 
     Serial.print(F("TX_FREQ="));
-    Serial.print(FIXED_FREQ / 100.0, 2);
+    Serial.print(g_selected_freq / 100.0, 2);
     Serial.print(F(" MHz  PWR="));
     Serial.print(TX_POWER_dBuV);
     Serial.println(F(" dBµV"));

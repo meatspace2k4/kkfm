@@ -625,8 +625,8 @@ def main() -> int:
     # Default to runtime tmpfs (status-path is only for the dashboard).
     # Set `WATCHDOG_STATUS_TO_DISK=1` if you explicitly want disk writes.
     p.add_argument("--status-path", default="")
-    # Writes a status JSON file for the dashboard; keep this relatively slow to avoid SD wear.
-    p.add_argument("--status-write-min-interval", type=float, default=5.0)
+    # The runtime status path is tmpfs, so publishing at 2 Hz does not add SD wear.
+    p.add_argument("--status-write-min-interval", type=float, default=0.5)
     p.set_defaults(func=cmd_monitor_tx)
 
     p = sub.add_parser("scan-assets")
@@ -671,5 +671,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 
