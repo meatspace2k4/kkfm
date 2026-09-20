@@ -983,7 +983,10 @@ while True:
                 sonos_room, sonos_ip = coord.room, coord.ip
                 sonos_state = "streaming"
                 sonos_transport = None
-                sonos_last_poll = 0.0
+                # First poll after the player has had time to open the stream
+                # (it reports TRANSITIONING/STOPPED while connecting).
+                sonos_last_poll = time.time() + 3.0
+                sonos_stopped_polls = 0
             except sonos.SonosError as e:
                 sonos_err = str(e)
                 sonos_state = "idle"
@@ -998,8 +1001,10 @@ while True:
             sonos_state = "idle"
             sonos_transport = None
 
+        sonos_stopped_polls: int = 0
+
         def _poll_sonos() -> None:
-            nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll
+            nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll, sonos_stopped_polls
             if sonos_state != "streaming" or not sonos_ip:
                 return
             if time.time() - sonos_last_poll < 3.0:
@@ -1008,8 +1013,12 @@ while True:
             try:
                 sonos_transport = sonos.transport_state(sonos_ip)
                 if sonos_transport in ("STOPPED", "NO_MEDIA_PRESENT"):
-                    sonos_err = f"Sonos {sonos_room}: transport {sonos_transport} (stream rejected or ended)"
-                    sonos_state = "idle"
+                    sonos_stopped_polls += 1
+                    if sonos_stopped_polls >= 2:
+                        sonos_err = f"Sonos {sonos_room}: transport {sonos_transport} (stream rejected or ended)"
+                        sonos_state = "idle"
+                else:
+                    sonos_stopped_polls = 0
             except sonos.SonosError as e:
                 sonos_err = str(e)
                 sonos_state = "idle"

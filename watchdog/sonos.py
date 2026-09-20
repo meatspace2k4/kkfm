@@ -155,6 +155,12 @@ def set_uri_and_play(coordinator_ip: str, url: str, title: str = "KKFM") -> None
         f"<CurrentURI>{html.escape(url)}</CurrentURI>"
         f"<CurrentURIMetaData>{html.escape(meta)}</CurrentURIMetaData>"
     )
+    # Stop whatever is loaded first (a previous attempt of this same URI included),
+    # so SetAVTransportURI starts the stream from a clean transport.
+    try:
+        stop(coordinator_ip)
+    except SonosError:
+        pass
     soap(coordinator_ip, "AVTransport", "/MediaRenderer/AVTransport/Control", "SetAVTransportURI", body)
     soap(coordinator_ip, "AVTransport", "/MediaRenderer/AVTransport/Control", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
 

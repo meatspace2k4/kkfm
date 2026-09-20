@@ -48,11 +48,11 @@ class TestSoapShape(unittest.TestCase):
 
         with mock.patch.object(sonos, "soap", side_effect=fake_soap):
             sonos.set_uri_and_play("192.168.10.156", "http://192.168.10.189:8791/stream", title="KKFM")
-        self.assertEqual([c[3] for c in calls], ["SetAVTransportURI", "Play"])
+        self.assertEqual([c[3] for c in calls], ["Stop", "SetAVTransportURI", "Play"])
         self.assertTrue(all(c[1] == "AVTransport" and c[0] == "192.168.10.156" for c in calls))
-        self.assertIn("http://192.168.10.189:8791/stream", calls[0][4])
-        self.assertNotIn("x-rincon-mp3radio", calls[0][4])
-        meta = html.unescape(calls[0][4])
+        self.assertIn("http://192.168.10.189:8791/stream", calls[1][4])
+        self.assertNotIn("x-rincon-mp3radio", calls[1][4])
+        meta = html.unescape(calls[1][4])
         self.assertIn("musicTrack", meta)
         self.assertIn('protocolInfo="http-get:*:audio/wav:*"', meta)
 
