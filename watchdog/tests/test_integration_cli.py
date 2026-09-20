@@ -7,7 +7,7 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 
-from kkfm.watchdog.run import cmd_monitor_logs, cmd_scan_assets
+from watchdog.run import cmd_monitor_logs, cmd_scan_assets
 
 
 class TestIntegrationCLI(unittest.TestCase):

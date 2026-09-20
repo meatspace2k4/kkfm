@@ -12,8 +12,8 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable, Optional
 
-from kkfm.watchdog.anomalies import AnomalyCode
-from kkfm.watchdog.events import Event, EventType
+from watchdog.anomalies import AnomalyCode
+from watchdog.events import Event, EventType
 
 
 class AnomalyTrigger(Enum):

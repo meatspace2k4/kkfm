@@ -1,7 +1,7 @@
 import unittest
 
-from kkfm.watchdog.anomalies import Anomaly, AnomalyCode, Severity
-from kkfm.watchdog.recovery import AutoRestartConfig, AutoRestarter
+from watchdog.anomalies import Anomaly, AnomalyCode, Severity
+from watchdog.recovery import AutoRestartConfig, AutoRestarter
 
 
 class TestAutoRestarter(unittest.TestCase):

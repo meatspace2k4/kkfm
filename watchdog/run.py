@@ -55,6 +55,13 @@ def _event_level(ev: Event) -> str:
     if et in (EventType.JINGLE_FAILED, EventType.COMM_FAILED):
         return "ERROR"
 
+    if et in (EventType.BGM_PICKED, EventType.BGM_CHANGEOVER, EventType.BGM_END, EventType.WEATHER_FETCHED):
+        return "INFO"
+    if et == EventType.WEATHER_FAILED:
+        return "WARN"
+    if et == EventType.BGM_FAILED:
+        return "ERROR"
+
     if et in (EventType.DAC_THROTTLE,):
         return "WARN"
 
@@ -339,17 +346,64 @@ def cmd_monitor_logs(args: argparse.Namespace) -> int:
         return 0
 
     if args.stdin:
-        for raw in sys.stdin:
+        # Same shape as the journalctl loop below: wake up at least once a second so the
+        # detector's timeout checks (dead air, BGM changeover/pick timeouts, weather
+        # staleness) run and the status file stays fresh even when the player is quiet
+        # for minutes (the hourly BGM fork logs only on the hour plus a heartbeat).
+        sfd = sys.stdin.fileno()
+        os.set_blocking(sfd, False)
+        buf = b""
+        eof = False
+        while True:
+            if eof:
+                time.sleep(1.0)
+                r = []
+            else:
+                r, _, _ = select.select([sfd], [], [], 1.0)
             now = time.time()
-            if maybe_note_bwav(raw, now):
-                maybe_write_status(now, force=True)
-            ev = parse_event(raw, default_ts=now)
-            if not ev:
-                maybe_write_status(now)
-                continue
-            last_ev = ev
-            for a in det.feed(ev):
+            if r:
+                while True:
+                    try:
+                        chunk = os.read(sfd, 65536)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        # The player's stdout closed: the process is gone. Report it the
+                        # same way systemd's "Stopped" line would, plus a critical anomaly,
+                        # then keep polling so dead-air keeps being reported until we are stopped.
+                        eof = True
+                        stop_ev = Event(EventType.UNIT_STOPPED, ts=now, raw="Stopped player (log stream closed)", name=None)
+                        last_ev = stop_ev
+                        for a in det.feed(stop_ev):
+                            rep.emit(a)
+                        rep.emit(Anomaly(
+                            code=AnomalyCode.RADIO_OFFLINE,
+                            severity=Severity.CRITICAL,
+                            ts=now,
+                            message="player process exited (log stream closed)",
+                        ))
+                        maybe_write_status(now, force=True)
+                        break
+                    buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    raw = line.decode("utf-8", errors="replace")
+                    if maybe_note_bwav(raw, now):
+                        maybe_write_status(now, force=True)
+                    ev = parse_event(raw, default_ts=now)
+                    if not ev:
+                        continue
+                    last_ev = ev
+                    for a in det.feed(ev):
+                        rep.emit(a)
+                        action = auto_restarter.consider(a)
+                        if action is not None:
+                            rep.emit(action)
+            for a in det.poll(now):
                 rep.emit(a)
+                action = auto_restarter.consider(a)
+                if action is not None:
+                    rep.emit(action)
             maybe_write_status(now)
         return 0
 
@@ -518,6 +572,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             out_dir=args.out_dir,
             refresh_s=float(args.refresh),
             ssh_target=ssh_target,
+            stream_port=int(getattr(args, "stream_port", 9000)),
         )
     )
 
@@ -653,6 +708,12 @@ def main() -> int:
         action="store_true",
         dest="clear_anomalies",
         help="Clear the anomalies log before starting the dashboard",
+    )
+    p.add_argument(
+        "--stream-port",
+        type=int,
+        default=9000,
+        help="Port the aircheck stream server listens on, for the 'p' play toggle",
     )
     p.set_defaults(func=cmd_dashboard)
 

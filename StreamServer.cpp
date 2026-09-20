@@ -173,8 +173,12 @@ void StreamServer::handle_client(int client_fd) {
         if (!range_value.empty() && handle_range_probe(client_fd, range_req)) {
             return;
         }
+        // A client that already fetched the 44-byte WAV header via a range probe
+        // (ffplay/ffmpeg/libav, browsers) comes back with "Range: bytes=44-" and
+        // expects PCM from there; answering 200 from byte 0 makes it bail out.
+        uint64_t resume_from = (range_req.valid && range_req.start >= WAV_HEADER_SIZE) ? range_req.start : 0;
         log_info(C_BLUE "[WEB] " C_RESET "Stream client " C_GREEN "connected" C_RESET);
-        stream_audio(client_fd, head_only);
+        stream_audio(client_fd, head_only, resume_from);
         log_info(C_BLUE "[WEB] " C_RESET "Stream client " C_YELLOW "disconnected" C_RESET);
     } else {
         send_not_found(client_fd);
@@ -233,10 +237,16 @@ void StreamServer::send_index(int fd, bool head_only) {
         ss << f.rdbuf();
         payload = ss.str();
     } else {
+#if defined(__GLIBC__)
         // get_current_dir_name() returns malloc'd memory; must free it
         char* cwd = get_current_dir_name();
         std::string cwd_str = cwd ? cwd : "(unknown)";
         free(cwd);
+#else
+        // Portable fallback (macOS/BSD have no get_current_dir_name).
+        char cwd_buf[4096];
+        std::string cwd_str = getcwd(cwd_buf, sizeof(cwd_buf)) ? std::string(cwd_buf) : std::string("(unknown)");
+#endif
         log_error("Failed to load browser/index.html (cwd: " + cwd_str + ")");
         send_not_found(fd);
         return;
@@ -265,20 +275,31 @@ void StreamServer::send_not_found(int fd) {
     send_string(fd, payload);
 }
 
-void StreamServer::stream_audio(int fd, bool head_only) {
+void StreamServer::stream_audio(int fd, bool head_only, uint64_t resume_from) {
     std::ostringstream hdr;
-    hdr << "HTTP/1.1 200 OK\r\n"
-        << "Content-Type: audio/wav\r\n"
-        << "Content-Length: " << STREAM_CONTENT_LENGTH << "\r\n"
-        << "Accept-Ranges: bytes\r\n"
+    if (resume_from > 0) {
+        // Live stream: any byte offset past the header maps to "audio from now".
+        hdr << "HTTP/1.1 206 Partial Content\r\n"
+            << "Content-Type: audio/wav\r\n"
+            << "Content-Length: " << (STREAM_CONTENT_LENGTH - resume_from) << "\r\n"
+            << "Content-Range: bytes " << resume_from << "-" << (STREAM_CONTENT_LENGTH - 1)
+            << "/" << STREAM_CONTENT_LENGTH << "\r\n";
+    } else {
+        hdr << "HTTP/1.1 200 OK\r\n"
+            << "Content-Type: audio/wav\r\n"
+            << "Content-Length: " << STREAM_CONTENT_LENGTH << "\r\n";
+    }
+    hdr << "Accept-Ranges: bytes\r\n"
         << "Cache-Control: no-store\r\n"
         << "Access-Control-Allow-Origin: *\r\n"
         << "Connection: close\r\n\r\n";
     if (!send_string(fd, hdr.str())) return;
     if (head_only) return;
 
-    WavHeader wav_head;
-    if (!send_all(fd, &wav_head, sizeof(wav_head))) return;
+    if (resume_from == 0) {
+        WavHeader wav_head;
+        if (!send_all(fd, &wav_head, sizeof(wav_head))) return;
+    }
 
     std::vector<int16_t> chunk(STREAM_CHUNK_FRAMES * CHANNELS, 0);
     uint64_t cursor = buffer.latest_cursor();

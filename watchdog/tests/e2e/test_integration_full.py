@@ -16,13 +16,13 @@ import time
 import unittest
 from pathlib import Path
 
-from kkfm.watchdog.anomalies import AnomalyCode, Severity
-from kkfm.watchdog.dashboard_headless import HeadlessDashboard
-from kkfm.watchdog.detector import Detector
-from kkfm.watchdog.events import Event, EventType
-from kkfm.watchdog.reporting import Reporter
-from kkfm.watchdog.tests.e2e.harness import E2ETestHarness
-from kkfm.watchdog.tests.e2e.injectors import AnomalyTrigger, EventInjector
+from watchdog.anomalies import AnomalyCode, Severity
+from watchdog.dashboard_headless import HeadlessDashboard
+from watchdog.detector import Detector
+from watchdog.events import Event, EventType
+from watchdog.reporting import Reporter
+from watchdog.tests.e2e.harness import E2ETestHarness
+from watchdog.tests.e2e.injectors import AnomalyTrigger, EventInjector
 
 
 class TestFullIntegration(unittest.TestCase):

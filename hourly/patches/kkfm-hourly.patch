@@ -1,0 +1,656 @@
+diff --git a/StreamServer.cpp b/StreamServer.cpp
+index c1b7426..0156278 100644
+--- a/StreamServer.cpp
++++ b/StreamServer.cpp
+@@ -173,8 +173,12 @@ void StreamServer::handle_client(int client_fd) {
+         if (!range_value.empty() && handle_range_probe(client_fd, range_req)) {
+             return;
+         }
++        // A client that already fetched the 44-byte WAV header via a range probe
++        // (ffplay/ffmpeg/libav, browsers) comes back with "Range: bytes=44-" and
++        // expects PCM from there; answering 200 from byte 0 makes it bail out.
++        uint64_t resume_from = (range_req.valid && range_req.start >= WAV_HEADER_SIZE) ? range_req.start : 0;
+         log_info(C_BLUE "[WEB] " C_RESET "Stream client " C_GREEN "connected" C_RESET);
+-        stream_audio(client_fd, head_only);
++        stream_audio(client_fd, head_only, resume_from);
+         log_info(C_BLUE "[WEB] " C_RESET "Stream client " C_YELLOW "disconnected" C_RESET);
+     } else {
+         send_not_found(client_fd);
+@@ -231,10 +235,16 @@ void StreamServer::send_index(int fd, bool head_only) {
+         ss << f.rdbuf();
+         payload = ss.str();
+     } else {
++#if defined(__GLIBC__)
+         // get_current_dir_name() returns malloc'd memory; must free it
+         char* cwd = get_current_dir_name();
+         std::string cwd_str = cwd ? cwd : "(unknown)";
+         free(cwd);
++#else
++        // Portable fallback (macOS/BSD have no get_current_dir_name).
++        char cwd_buf[4096];
++        std::string cwd_str = getcwd(cwd_buf, sizeof(cwd_buf)) ? std::string(cwd_buf) : std::string("(unknown)");
++#endif
+         log_error("Failed to load browser/index.html (cwd: " + cwd_str + ")");
+         send_not_found(fd);
+         return;
+@@ -263,20 +273,31 @@ void StreamServer::send_not_found(int fd) {
+     send_string(fd, payload);
+ }
+ 
+-void StreamServer::stream_audio(int fd, bool head_only) {
++void StreamServer::stream_audio(int fd, bool head_only, uint64_t resume_from) {
+     std::ostringstream hdr;
+-    hdr << "HTTP/1.1 200 OK\r\n"
+-        << "Content-Type: audio/wav\r\n"
+-        << "Content-Length: " << STREAM_CONTENT_LENGTH << "\r\n"
+-        << "Accept-Ranges: bytes\r\n"
++    if (resume_from > 0) {
++        // Live stream: any byte offset past the header maps to "audio from now".
++        hdr << "HTTP/1.1 206 Partial Content\r\n"
++            << "Content-Type: audio/wav\r\n"
++            << "Content-Length: " << (STREAM_CONTENT_LENGTH - resume_from) << "\r\n"
++            << "Content-Range: bytes " << resume_from << "-" << (STREAM_CONTENT_LENGTH - 1)
++            << "/" << STREAM_CONTENT_LENGTH << "\r\n";
++    } else {
++        hdr << "HTTP/1.1 200 OK\r\n"
++            << "Content-Type: audio/wav\r\n"
++            << "Content-Length: " << STREAM_CONTENT_LENGTH << "\r\n";
++    }
++    hdr << "Accept-Ranges: bytes\r\n"
+         << "Cache-Control: no-store\r\n"
+         << "Access-Control-Allow-Origin: *\r\n"
+         << "Connection: close\r\n\r\n";
+     if (!send_string(fd, hdr.str())) return;
+     if (head_only) return;
+ 
+-    WavHeader wav_head;
+-    if (!send_all(fd, &wav_head, sizeof(wav_head))) return;
++    if (resume_from == 0) {
++        WavHeader wav_head;
++        if (!send_all(fd, &wav_head, sizeof(wav_head))) return;
++    }
+ 
+     std::vector<int16_t> chunk(STREAM_CHUNK_FRAMES * CHANNELS, 0);
+     uint64_t cursor = buffer.latest_cursor();
+diff --git a/StreamServer.h b/StreamServer.h
+index 4b2b9c6..5c49edf 100644
+--- a/StreamServer.h
++++ b/StreamServer.h
+@@ -93,7 +93,7 @@ private:
+     bool read_request(int fd, std::string& method, std::string& path, std::string& headers_out);
+     void send_index(int fd, bool head_only);
+     void send_not_found(int fd);
+-    void stream_audio(int fd, bool head_only);
++    void stream_audio(int fd, bool head_only, uint64_t resume_from = 0);
+ 
+     bool send_all(int fd, const void* data, size_t len) {
+         if (fd < 0 || !data || len == 0) return true;
+diff --git a/acnh_aircheck_pi.cpp b/acnh_aircheck_pi.cpp
+index d96209a..1637c9c 100644
+--- a/acnh_aircheck_pi.cpp
++++ b/acnh_aircheck_pi.cpp
+@@ -80,7 +80,7 @@ static uint32_t try_read_bwav_sample_rate(const AssetMeta& meta) {
+     if (len < 96 || std::memcmp(data, "BWAV", 4) != 0) return 0;
+     uint16_t bom = read_u16(data + 4);
+     uint16_t chans = read_u16(data + 14);
+-    if (chans != 1 || bom != 0xFEFF) return 0;
++    if ((chans != 1 && chans != 2) || bom != 0xFEFF) return 0;
+     const uint8_t* ci = data + 16;
+     uint32_t rate = read_u32(ci + 4);
+     if (rate < 8000 || rate > 192000) return 0;
+@@ -824,7 +824,19 @@ float compute_song_first_intro_delay(float loop_start_sec, float lead_in_sec, fl
+ // ---------------------------------------------------------------------------
+ // Audio Core
+ // ---------------------------------------------------------------------------
++// One BWAV channel stream: its own ADPCM data pointer, coefficient table and
++// loop history. Rate / sample count / loop points are shared by all channels.
++struct AudioChannel {
++    const uint8_t* raw_data = nullptr;
++    size_t raw_len = 0;
++    uint32_t start_offset = 0;
++    int16_t  hist1 = 0;
++    int16_t  hist2 = 0;
++    std::vector<std::pair<int16_t, int16_t>> coeffs;
++};
++
+ struct AudioCtx {
++    // Channel 0 view (kept so existing mono call sites read as before).
+     const uint8_t* raw_data;
+     size_t raw_len;
+     const char* name;
+@@ -839,79 +851,117 @@ struct AudioCtx {
+     int16_t  hist1;
+     int16_t  hist2;
+     std::vector<std::pair<int16_t, int16_t>> coeffs;
++    // All channels (1 = mono radio asset, 2 = stereo BGM). ch[0] mirrors the fields above.
++    int channels = 1;
++    AudioChannel ch[2];
+ };
+ 
+ class BWAVParser {
+ public:
++    static constexpr size_t CHANNEL_INFO_SIZE = 0x4C;
++
+     static std::shared_ptr<AudioCtx> parse(const AssetMeta& meta) {
+-        const uint8_t* data = assets_blob + meta.offset;
+-        size_t len = meta.size;
++        return parse_bytes(assets_blob + meta.offset, meta.size, meta.name, meta.title, meta.id);
++    }
+ 
+-        if (len < 96 || std::memcmp(data, "BWAV", 4) != 0) return nullptr;
++    // Parse a BWAV image in memory (blob slice or a file read into a buffer that the
++    // caller keeps alive). Accepts 1 (mono) or 2 (stereo) channel streams; each
++    // channel-info block is CHANNEL_INFO_SIZE bytes starting at offset 16.
++    static std::shared_ptr<AudioCtx> parse_bytes(const uint8_t* data, size_t len,
++                                                 const char* name, const char* title, int id) {
++        if (!data || len < 96 || std::memcmp(data, "BWAV", 4) != 0) return nullptr;
+         uint16_t bom = read_u16(data + 4);
+         uint16_t chans = read_u16(data + 14);
+-        if (chans != 1 || bom != 0xFEFF) return nullptr;
++        if ((chans != 1 && chans != 2) || bom != 0xFEFF) return nullptr;
++        if (len < 16 + (size_t)chans * CHANNEL_INFO_SIZE) return nullptr;
+ 
+-        const uint8_t* ci = data + 16;
+-        
+-        uint32_t rate = read_u32(ci + 4);
+-        uint32_t total = read_u32(ci + 8);
+-        
+-        std::vector<std::pair<int16_t, int16_t>> coeffs;
+-        for(int i=0; i<8; ++i) {
+-            int off = 16 + (i*4);
+-            coeffs.push_back({read_s16(ci + off), read_s16(ci + off + 2)});
+-        }
++        auto ctx = std::make_shared<AudioCtx>();
++        ctx->channels = chans;
+ 
+-        uint32_t start  = read_u32(ci + 52); 
+-        uint32_t loops  = read_u32(ci + 56);
+-        uint32_t lend   = read_u32(ci + 60);
+-        uint32_t lstart = read_u32(ci + 64);
+-        
+-        int16_t h1      = read_s16(ci + 70); 
+-        int16_t h2      = read_s16(ci + 72);
++        for (int c = 0; c < chans; ++c) {
++            const uint8_t* ci = data + 16 + c * CHANNEL_INFO_SIZE;
+ 
+-        // Update UI State
+-        {
+-            std::lock_guard<std::mutex> lock(g_ui_state.mut);
+-            g_ui_state.current_bwav.name = meta.name;
+-            g_ui_state.current_bwav.rate = rate;
+-            g_ui_state.current_bwav.len = total;
+-            g_ui_state.current_bwav.loop_start = lstart;
+-            g_ui_state.current_bwav.loop_end = lend;
+-            g_ui_state.current_bwav.h1 = h1;
+-            g_ui_state.current_bwav.h2 = h2;
+-            g_ui_state.current_bwav.valid = true;
+-        }
++            uint32_t rate = read_u32(ci + 4);
++            uint32_t total = read_u32(ci + 8);
+ 
+-        debug_printf(C_YELLOW "[BWAV] " C_CYAN "%s" C_RESET " | Len: " C_GREEN "%u" C_RESET " | Loop: " C_GREEN "%u" C_RESET "-" C_GREEN "%u" C_RESET " | Hist: " C_GREEN "%d/%d" C_RESET "\n", 
+-               meta.name, total, lstart, lend, h1, h2);
++            std::vector<std::pair<int16_t, int16_t>> coeffs;
++            for(int i=0; i<8; ++i) {
++                int off = 16 + (i*4);
++                coeffs.push_back({read_s16(ci + off), read_s16(ci + off + 2)});
++            }
+ 
+-        if (start >= len) return nullptr;
++            uint32_t start  = read_u32(ci + 52);
++            uint32_t loops  = read_u32(ci + 56);
++            uint32_t lend   = read_u32(ci + 60);
++            uint32_t lstart = read_u32(ci + 64);
++
++            int16_t h1      = read_s16(ci + 70);
++            int16_t h2      = read_s16(ci + 72);
++
++            if (c == 0) {
++                // Update UI State
++                {
++                    std::lock_guard<std::mutex> lock(g_ui_state.mut);
++                    g_ui_state.current_bwav.name = name ? name : "";
++                    g_ui_state.current_bwav.rate = rate;
++                    g_ui_state.current_bwav.len = total;
++                    g_ui_state.current_bwav.loop_start = lstart;
++                    g_ui_state.current_bwav.loop_end = lend;
++                    g_ui_state.current_bwav.h1 = h1;
++                    g_ui_state.current_bwav.h2 = h2;
++                    g_ui_state.current_bwav.valid = true;
++                }
+ 
+-        auto ctx = std::make_shared<AudioCtx>();
+-        ctx->raw_data = data + start;
+-        ctx->raw_len = len - start;
+-        ctx->name = meta.name;
+-        ctx->title = meta.title;
+-        ctx->id = meta.id;
+-        ctx->rate = rate;
+-        ctx->total_samples = total;
+-        ctx->start_offset = start;
+-        ctx->loops = loops;
+-        ctx->loop_end = lend;
+-        ctx->loop_start = lstart;
+-        ctx->hist1 = h1;
+-        ctx->hist2 = h2;
+-        ctx->coeffs = coeffs;
++                debug_printf(C_YELLOW "[BWAV] " C_CYAN "%s" C_RESET " | Ch: " C_GREEN "%u" C_RESET " | Len: " C_GREEN "%u" C_RESET " | Loop: " C_GREEN "%u" C_RESET "-" C_GREEN "%u" C_RESET " | Hist: " C_GREEN "%d/%d" C_RESET "\n",
++                       (name ? name : "(null)"), (unsigned)chans, total, lstart, lend, h1, h2);
++
++                ctx->rate = rate;
++                ctx->total_samples = total;
++                ctx->loops = loops;
++                ctx->loop_end = lend;
++                ctx->loop_start = lstart;
++            } else {
++                // All channel streams share timing; refuse files where they disagree.
++                if (rate != ctx->rate || total != ctx->total_samples ||
++                    lend != ctx->loop_end || lstart != ctx->loop_start) {
++                    log_error(std::string("[BWAV] Channel ") + std::to_string(c) + " timing differs from channel 0: " + (name ? name : "(null)"));
++                    return nullptr;
++                }
++            }
++
++            if (start >= len) return nullptr;
++
++            ctx->ch[c].raw_data = data + start;
++            ctx->ch[c].raw_len = len - start;
++            ctx->ch[c].start_offset = start;
++            ctx->ch[c].hist1 = h1;
++            ctx->ch[c].hist2 = h2;
++            ctx->ch[c].coeffs = coeffs;
++        }
++
++        ctx->name = name;
++        ctx->title = title;
++        ctx->id = id;
++        // Channel 0 view.
++        ctx->raw_data = ctx->ch[0].raw_data;
++        ctx->raw_len = ctx->ch[0].raw_len;
++        ctx->start_offset = ctx->ch[0].start_offset;
++        ctx->hist1 = ctx->ch[0].hist1;
++        ctx->hist2 = ctx->ch[0].hist2;
++        ctx->coeffs = ctx->ch[0].coeffs;
+         return ctx;
+     }
+ };
+ 
+ class Decoder {
+     std::shared_ptr<AudioCtx> ctx;
+-    size_t ofs;     
+-    int16_t h1, h2;
++    int nch;                 // channel streams decoded in lockstep (1 or 2)
++    size_t ofs_c[2];         // per-channel byte offset into that channel's ADPCM data
++    int16_t h1_c[2], h2_c[2];// per-channel ADPCM history
++    // Channel-0 aliases so the shared loop / exhaustion logic reads exactly as before.
++    size_t& ofs = ofs_c[0];
++    int16_t& h1 = h1_c[0];
++    int16_t& h2 = h2_c[0];
+     size_t sample_pos;
+     bool looped;
+     size_t post_loop_pos;
+@@ -919,12 +969,25 @@ class Decoder {
+     size_t fade_lim;
+     bool fading_enabled;
+     bool oneshot_forced;
++    // Deferred fade (hourly fork hook): when armed, the radio-style post-loop
++    // fade (play then fade) begins at the NEXT loop-end hit rather than the first.
++    bool fade_armed;
++    size_t armed_play_lim;
++    size_t armed_fade_lim;
++    size_t loops_hit_count;
+ 
+ public:
+-   Decoder(std::shared_ptr<AudioCtx> c, bool oneshot, float fade_play_s, float fade_time_s) 
+-       : ctx(c), ofs(0), h1(c->hist1), h2(c->hist2),
+-         sample_pos(0), looped(false), post_loop_pos(0), oneshot_forced(oneshot)
++   Decoder(std::shared_ptr<AudioCtx> c, bool oneshot, float fade_play_s, float fade_time_s)
++       : ctx(c), nch(c->channels == 2 ? 2 : 1),
++         sample_pos(0), looped(false), post_loop_pos(0), oneshot_forced(oneshot),
++         fade_armed(false), armed_play_lim(0), armed_fade_lim(0), loops_hit_count(0)
+    {
++        for (int k = 0; k < 2; ++k) {
++            const AudioChannel& chn = ctx->ch[k < nch ? k : 0];
++            ofs_c[k] = 0;
++            h1_c[k] = chn.hist1;
++            h2_c[k] = chn.hist2;
++        }
+         if (!oneshot && fade_play_s > 0) {
+             fading_enabled = true;
+             play_lim = (size_t)(fade_play_s * ctx->rate);
+@@ -936,6 +999,19 @@ public:
+     }
+ 
+     bool has_looped() const { return looped; }
++    size_t position() const { return sample_pos; }
++
++    // Schedule the post-loop fade to start at the next loop-end hit.
++    // Same shape as the radio's end-of-song: play `fade_play_s` after the loop
++    // jump, then fade over `fade_time_s`. No effect on the radio (never called there).
++    void arm_fade_at_next_loop(float fade_play_s, float fade_time_s) {
++        armed_play_lim = (size_t)(fade_play_s * ctx->rate);
++        armed_fade_lim = (size_t)(fade_time_s * ctx->rate);
++        fade_armed = true;
++    }
++    bool is_fade_armed() const { return fade_armed; }
++    size_t loops_hit() const { return loops_hit_count; }
++    bool is_fading() const { return fading_enabled && looped; }
+ 
+     bool is_exhausted() const {
+         if (fading_enabled && looped && post_loop_pos >= play_lim + fade_lim) return true;
+@@ -945,28 +1021,44 @@ public:
+         return false;
+     }
+ 
+-   int decode_block(int16_t* out_14) {
++   // Mono callers: channel 0 only.
++   int decode_block(int16_t* out_14) { return decode_block(out_14, nullptr); }
++
++   // Decode one 14-sample ADPCM block for every channel stream in lockstep.
++   // out_r may be null; for a mono ctx it receives a copy of the left channel.
++   int decode_block(int16_t* out_14, int16_t* out_14_r) {
+        bool is_loopable = !oneshot_forced && (ctx->loop_end > 0) && (ctx->loop_start != 0xFFFFFFFF);
+        bool hit_loop = is_loopable && (sample_pos >= ctx->loop_end);
+-       
++
+        if (ofs >= ctx->raw_len && is_loopable) hit_loop = true;
+-       
++
+        int skip_samples = 0;
+ 
+        if (hit_loop) {
+           debug_printf(C_MAGENTA "[LOOP] " C_RESET "Hit Loop: " C_GREEN "%zu" C_RESET "\n", sample_pos);
+            size_t blk_idx = ctx->loop_start / BLK_SAMP;
+-           ofs = blk_idx * BLK_BYTES;
+-           
+-           h1 = ctx->hist1;
+-           h2 = ctx->hist2;
++           for (int k = 0; k < nch; ++k) {
++               ofs_c[k] = blk_idx * BLK_BYTES;
++               h1_c[k] = ctx->ch[k].hist1;
++               h2_c[k] = ctx->ch[k].hist2;
++           }
+ 
+            skip_samples = ctx->loop_start % BLK_SAMP;
+ 
+            debug_printf(C_MAGENTA "[LOOP] " C_RESET "Jump: " C_GREEN "%zu" C_RESET " | Blk: %zu | Skip: %d | Hist: " C_GREEN "%d/%d" C_RESET "\n", 
+                   (size_t)ctx->loop_start, blk_idx, skip_samples, h1, h2);
+ 
+-           if (!looped) {
++           loops_hit_count++;
++           if (fade_armed) {
++               // Deferred fade engages now: this loop pass plays play_lim samples then fades.
++               fade_armed = false;
++               fading_enabled = true;
++               play_lim = armed_play_lim;
++               fade_lim = armed_fade_lim;
++               looped = true;
++               post_loop_pos = 0;
++               debug_printf(C_MAGENTA "[LOOP] " C_RESET "Fade armed -> engaged at loop hit (play=%zu fade=%zu)\n", play_lim, fade_lim);
++           } else if (!looped) {
+                looped = true;
+                post_loop_pos = 0;
+            }
+@@ -978,46 +1070,65 @@ public:
+            if (!is_loopable) return 0;
+        }
+ 
+-       uint8_t hdr = ctx->raw_data[ofs++];
+-       int scale = 1 << (hdr & 0x0F);
+-       int c_idx = (hdr >> 4) & 0x7; 
+-       
+-       int16_t c1 = ctx->coeffs[c_idx].first;
+-       int16_t c2 = ctx->coeffs[c_idx].second;
++       // Block header per channel stream: scale + coefficient pair index.
++       int scale_c[2] = {1, 1};
++       int16_t c1_c[2] = {0, 0}, c2_c[2] = {0, 0};
++       for (int k = 0; k < nch; ++k) {
++           const AudioChannel& chn = ctx->ch[k];
++           if (ofs_c[k] >= chn.raw_len) return 0;
++           uint8_t hdr = chn.raw_data[ofs_c[k]++];
++           scale_c[k] = 1 << (hdr & 0x0F);
++           int c_idx = (hdr >> 4) & 0x7;
++           c1_c[k] = chn.coeffs[c_idx].first;
++           c2_c[k] = chn.coeffs[c_idx].second;
++       }
+ 
+        int out_idx = 0;
+ 
+-       auto process_sample = [&](int n, int sample_index_in_block) -> bool {
++       auto emit = [&](int idx, int16_t l, int16_t r) {
++           out_14[idx] = l;
++           if (out_14_r) out_14_r[idx] = r;
++       };
++
++       // n[k] is the nibble for channel k at this sample position.
++       auto process_sample = [&](const int* n, int sample_index_in_block) -> bool {
+            if (sample_index_in_block < skip_samples) return false;
+ 
+-           // Branchless sign extension: (n >= 8) ? n - 16 : n
+-           int sn = n - ((n & 8) << 1);
+-           
+-           int pred = ((sn * scale) << 11) + ((int)c1 * h1 + (int)c2 * h2) + 1024;
+-           int16_t samp = clamp16(pred >> 11);
+-           h2 = h1; h1 = samp;
++           int16_t samp_c[2] = {0, 0};
++           for (int k = 0; k < nch; ++k) {
++               // Branchless sign extension: (n >= 8) ? n - 16 : n
++               int sn = n[k] - ((n[k] & 8) << 1);
+ 
+-           int16_t out_samp = samp;
++               int pred = ((sn * scale_c[k]) << 11) + ((int)c1_c[k] * h1_c[k] + (int)c2_c[k] * h2_c[k]) + 1024;
++               int16_t samp = clamp16(pred >> 11);
++               h2_c[k] = h1_c[k]; h1_c[k] = samp;
++               samp_c[k] = samp;
++           }
++           if (nch == 1) samp_c[1] = samp_c[0];
++
++           int16_t out_l = samp_c[0];
++           int16_t out_r = samp_c[1];
+ 
+            if (looped) {
+                if (fading_enabled) {
+                    if (post_loop_pos >= play_lim + fade_lim) {
+-                       while(out_idx < 14) out_14[out_idx++] = 0;
+-                       return true; 
++                       while(out_idx < 14) { emit(out_idx, 0, 0); out_idx++; }
++                       return true;
+                    }
+                    if (post_loop_pos >= play_lim) {
+                        size_t fade_idx = post_loop_pos - play_lim;
+-                       int64_t s64 = (int64_t)out_samp;
+                        int64_t num = (int64_t)(fade_lim - fade_idx);
+                        int64_t den = (int64_t)fade_lim;
+                        if (den > 0) {
+-                           out_samp = (int16_t)((s64 * num) / den);
++                           out_l = (int16_t)(((int64_t)out_l * num) / den);
++                           out_r = (int16_t)(((int64_t)out_r * num) / den);
+                        }
+                    }
+                }
+                post_loop_pos++;
+            }
+-           out_14[out_idx++] = out_samp;
++           emit(out_idx, out_l, out_r);
++           out_idx++;
+            sample_pos++;
+            return false;
+        };
+@@ -1025,22 +1136,42 @@ public:
+        for (int i = 0; i < 7; ++i) {
+            if (is_loopable && sample_pos >= ctx->loop_end) return out_idx;
+ 
+-           if (ofs >= ctx->raw_len) return out_idx;
+-           uint8_t b = ctx->raw_data[ofs++];
+-           
++           uint8_t b_c[2] = {0, 0};
++           for (int k = 0; k < nch; ++k) {
++               const AudioChannel& chn = ctx->ch[k];
++               if (ofs_c[k] >= chn.raw_len) return out_idx;
++               b_c[k] = chn.raw_data[ofs_c[k]++];
++           }
++
+            // High nibble (first sample)
+-           if (process_sample((b >> 4) & 0xF, i * 2)) return out_idx;
++           int hi[2] = { (b_c[0] >> 4) & 0xF, (b_c[1] >> 4) & 0xF };
++           if (process_sample(hi, i * 2)) return out_idx;
+ 
+            if (is_loopable && sample_pos >= ctx->loop_end) return out_idx;
+ 
+            // Low nibble (second sample)
+-           if (process_sample(b & 0xF, i * 2 + 1)) return out_idx;
++           int lo[2] = { b_c[0] & 0xF, b_c[1] & 0xF };
++           if (process_sample(lo, i * 2 + 1)) return out_idx;
+        }
+        return out_idx;
+    }
+ };
+ 
+-class ITrack { public: virtual ~ITrack() = default; virtual bool done() = 0; virtual void pull(int16_t* out, int frames) = 0; virtual void set_vol(float v) = 0; virtual void ramp_to(float t, int f) = 0; virtual std::shared_ptr<Decoder> get_decoder() { return nullptr; } };
++class ITrack {
++public:
++    virtual ~ITrack() = default;
++    virtual bool done() = 0;
++    virtual void pull(int16_t* out, int frames) = 0;
++    // Interleaved L/R. Default: mono pull duplicated to both channels.
++    virtual void pull_stereo(int16_t* out, int frames) {
++        std::vector<int16_t> mono((size_t)frames, 0);
++        pull(mono.data(), frames);
++        for (int i = 0; i < frames; ++i) { out[i * 2] = mono[i]; out[i * 2 + 1] = mono[i]; }
++    }
++    virtual void set_vol(float v) = 0;
++    virtual void ramp_to(float t, int f) = 0;
++    virtual std::shared_ptr<Decoder> get_decoder() { return nullptr; }
++};
+ 
+ class Track : public ITrack {
+    std::shared_ptr<Decoder> dec;
+@@ -1052,7 +1183,7 @@ class Track : public ITrack {
+    int delay_left;
+    bool is_done, announced;
+    std::string title;
+-   int16_t spill_buf[14]; int spill_idx, spill_avail;
++   int16_t spill_buf[14]; int16_t spill_buf_r[14]; int spill_idx, spill_avail;
+ public:
+    Track(std::shared_ptr<AudioCtx> ctx, float vol, int delay_samps, std::string t, bool oneshot, float fp, float ft)
+        : vol_q15(volume_to_q15(vol)),
+@@ -1094,29 +1225,38 @@ public:
+        ramp_total_samples = f;
+        ramp_remaining_samples = f;
+    }
++    // Mono view: left channel only (radio assets are mono, so L == R anyway).
+     void pull(int16_t* out, int frames) override {
++        std::vector<int16_t> st((size_t)frames * 2, 0);
++        pull_stereo(st.data(), frames);
++        for (int i = 0; i < frames; ++i) out[i] = st[i * 2];
++    }
++
++    void pull_stereo(int16_t* out, int frames) override {
+         if (is_done) return;
+ 
+         int p = 0;
+         if (delay_left > 0) { int take = std::min(delay_left, frames); delay_left -= take; p += take; }
+ 
+-        if (p < frames && !announced && !title.empty()) { 
++        if (p < frames && !announced && !title.empty()) {
+             std::string msg = C_BOLD "Now Playing: " C_RESET + title;
+             g_log_buffer.add(msg);
+-            
++
+             {
+                 std::lock_guard<std::mutex> lock(g_ui_state.mut);
+                 g_ui_state.now_playing = title;
+                 g_ui_state.status_text = "LIVE";
+                 g_ui_state.status_color = C_GREEN;
+             }
+-            announced = true; 
++            announced = true;
+             g_tui.render();
+         }
+ 
+         while (p < frames) {
+             while (spill_idx < spill_avail && p < frames) {
+-               int32_t s = spill_buf[spill_idx++];
++               int32_t s = spill_buf[spill_idx];
++               int32_t r = spill_buf_r[spill_idx];
++               spill_idx++;
+                int current_vol = vol_q15;
+                if (ramp_remaining_samples > 0) {
+                    int elapsed = ramp_total_samples - ramp_remaining_samples;
+@@ -1135,11 +1275,14 @@ public:
+                    }
+                }
+                s = (s * current_vol) >> 15;
+-               out[p++] = (int16_t)s;
++               r = (r * current_vol) >> 15;
++               out[p * 2] = (int16_t)s;
++               out[p * 2 + 1] = (int16_t)r;
++               p++;
+             }
+            if (p >= frames) break;
+            if (dec->is_exhausted()) { is_done = true; break; }
+-           int produced = dec->decode_block(spill_buf);
++           int produced = dec->decode_block(spill_buf, spill_buf_r);
+            if (produced == 0) { is_done = true; break; }
+            spill_idx = 0; spill_avail = produced;
+        }
+@@ -1177,42 +1320,41 @@ class Mixer {
+ 
+ public:
+     Mixer() {
+-        mix_buf.resize(MIX_BLOCK_FRAMES);
+-        tr_buf.resize(MIX_BLOCK_FRAMES);
++        mix_buf.resize(MIX_BLOCK_FRAMES * 2);
++        tr_buf.resize(MIX_BLOCK_FRAMES * 2);
+     }
+ 
++    virtual ~Mixer() = default;
++
+     void start() {}
+     void stop() {}
+ 
+-    void mix_block(int16_t* out, int frames) {
++    // Mixes interleaved stereo. Mono tracks contribute L == R, so radio output is unchanged.
++    virtual void mix_block(int16_t* out, int frames) {
+         std::lock_guard<std::mutex> lock(mut);
+-        if ((int)mix_buf.size() < frames) {
+-            mix_buf.resize(frames);
+-            tr_buf.resize(frames);
++        const size_t n = (size_t)frames * 2;
++        if (mix_buf.size() < n) {
++            mix_buf.resize(n);
++            tr_buf.resize(n);
+         }
+-        std::fill(mix_buf.begin(), mix_buf.begin() + frames, 0);
++        std::fill(mix_buf.begin(), mix_buf.begin() + n, 0);
+         tracks.erase(std::remove_if(tracks.begin(), tracks.end(),
+                                     [](const std::shared_ptr<ITrack>& t) { return t->done(); }),
+                      tracks.end());
+         if (tracks.empty()) {
+-            for (int i = 0; i < frames; ++i) {
+-                out[i * 2] = 0;
+-                out[i * 2 + 1] = 0;
+-            }
++            std::fill(out, out + n, 0);
+             return;
+         }
+         for (auto& tr : tracks) {
+-            std::fill(tr_buf.begin(), tr_buf.begin() + frames, 0);
+-            tr->pull(tr_buf.data(), frames);
+-            for (int i = 0; i < frames; ++i) {
++            std::fill(tr_buf.begin(), tr_buf.begin() + n, 0);
++            tr->pull_stereo(tr_buf.data(), frames);
++            for (size_t i = 0; i < n; ++i) {
+                 mix_buf[i] += tr_buf[i];
+             }
+         }
+-        for (int i = 0; i < frames; ++i) {
++        for (size_t i = 0; i < n; ++i) {
+             int32_t s = (mix_buf[i] * MASTER_GAIN_Q15) >> 15;
+-            int16_t sample = clamp16(s);
+-            out[i * 2] = sample;
+-            out[i * 2 + 1] = sample;
++            out[i] = clamp16(s);
+         }
+     }
+ 

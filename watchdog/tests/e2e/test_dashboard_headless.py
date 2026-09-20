@@ -16,7 +16,7 @@ import time
 import unittest
 from pathlib import Path
 
-from kkfm.watchdog.dashboard_headless import HeadlessDashboard, DashboardSnapshot
+from watchdog.dashboard_headless import HeadlessDashboard, DashboardSnapshot
 
 
 class TestHeadlessDashboard(unittest.TestCase):
