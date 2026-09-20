@@ -973,13 +973,23 @@ while True:
                 host = sonos.local_ip_towards(coord_ip)
             return f"http://{host}:{stream_port}/stream"
 
+        sonos_title: Optional[str] = None
+
+        def _sonos_track_title() -> str:
+            # What the Sonos shows as the track: the BWAV file name the service is
+            # playing (from the log monitor's status), until source names exist.
+            if isinstance(last_bwav_name, str) and last_bwav_name:
+                return _pretty_bwav_label(last_bwav_name)
+            return "KKFM Aircheck"
+
         def _start_sonos() -> None:
-            nonlocal sonos_state, sonos_room, sonos_ip, sonos_err, sonos_transport, sonos_last_poll
+            nonlocal sonos_state, sonos_room, sonos_ip, sonos_err, sonos_transport, sonos_last_poll, sonos_title
             sonos_err = None
             try:
                 coord = sonos.find_coordinator()
                 url = _stream_url_for_sonos(coord.ip)
-                sonos.set_uri_and_play(coord.ip, url, title="KKFM Aircheck")
+                sonos_title = _sonos_track_title()
+                sonos.set_uri_and_play(coord.ip, url, title=sonos_title)
                 sonos_room, sonos_ip = coord.room, coord.ip
                 sonos_state = "streaming"
                 sonos_transport = None
@@ -1004,13 +1014,21 @@ while True:
         sonos_stopped_polls: int = 0
 
         def _poll_sonos() -> None:
-            nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll, sonos_stopped_polls
+            nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll, sonos_stopped_polls, sonos_title
             if sonos_state != "streaming" or not sonos_ip:
                 return
             if time.time() - sonos_last_poll < 3.0:
                 return
             sonos_last_poll = time.time()
             try:
+                # New track on the service: re-hand the stream over with the new title so
+                # the Sonos shows the file now playing (a live URI's title is fixed at handoff).
+                new_title = _sonos_track_title()
+                if new_title != sonos_title:
+                    sonos_title = new_title
+                    sonos.set_uri_and_play(sonos_ip, _stream_url_for_sonos(sonos_ip), title=sonos_title)
+                    sonos_stopped_polls = 0
+                    return
                 sonos_transport = sonos.transport_state(sonos_ip)
                 if sonos_transport in ("STOPPED", "NO_MEDIA_PRESENT"):
                     sonos_stopped_polls += 1
