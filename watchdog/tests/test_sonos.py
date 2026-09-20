@@ -50,8 +50,13 @@ class TestSoapShape(unittest.TestCase):
             sonos.set_uri_and_play("192.168.10.156", "http://192.168.10.189:8791/stream", title="KKFM")
         self.assertEqual([c[3] for c in calls], ["SetAVTransportURI", "Play"])
         self.assertTrue(all(c[1] == "AVTransport" and c[0] == "192.168.10.156" for c in calls))
-        self.assertIn("http://192.168.10.189:8791/stream", calls[0][4])
+        self.assertIn("x-rincon-mp3radio://192.168.10.189:8791/stream", calls[0][4])
+        self.assertNotIn("http://192.168.10.189", calls[0][4].split("CurrentURIMetaData")[0])
         self.assertIn("audioBroadcast", html.unescape(calls[0][4]))
+
+    def test_radio_uri(self) -> None:
+        self.assertEqual(sonos.radio_uri("http://h:1/stream"), "x-rincon-mp3radio://h:1/stream")
+        self.assertEqual(sonos.radio_uri("x-rincon-mp3radio://h:1/s"), "x-rincon-mp3radio://h:1/s")
 
     def test_transport_state_parse(self) -> None:
         with mock.patch.object(sonos, "soap", return_value="<r><CurrentTransportState>PLAYING</CurrentTransportState></r>"):

@@ -132,7 +132,18 @@ def local_ip_towards(ip: str) -> str:
         s.close()
 
 
+def radio_uri(url: str) -> str:
+    """Sonos treats a plain http:// URI as a file (needs a known length and a
+    file MIME type) and answers 714 for a live stream. Live HTTP streams are
+    addressed with the x-rincon-mp3radio scheme, which makes the player open the
+    URL as a radio stream and sniff the audio format from the data."""
+    if url.startswith("http://"):
+        return "x-rincon-mp3radio://" + url[len("http://"):]
+    return url
+
+
 def set_uri_and_play(coordinator_ip: str, url: str, title: str = "KKFM") -> None:
+    url = radio_uri(url)
     meta = (
         '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
         'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
