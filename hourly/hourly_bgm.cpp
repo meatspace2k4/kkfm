@@ -72,6 +72,23 @@ void handle_shutdown_signal(int) {
 
 // Engine sample rate from a BGM header (the radio reads it from its blob).
 void init_engine_sample_rate_from_dir(const std::string& dir) {
+#ifdef HOURLY_USE_BLOB
+    (void)dir;
+    for (size_t i = 0; i < hourly_assets_count; ++i) {
+        const HourlyAsset& a = hourly_assets[i];
+        const uint8_t* head = hourly_assets_blob + a.offset;
+        if (a.size < 96 || std::memcmp(head, "BWAV", 4) != 0) continue;
+        uint16_t chans = read_u16(head + 14);
+        if (chans != 1 && chans != 2) continue;
+        uint32_t rate = read_u32(head + 16 + 4);
+        if (rate < 8000 || rate > 192000) continue;
+        g_engine_sample_rate.store(rate);
+        log_info_f(C_BLUE "[AUDIO] " C_RESET "Engine sample rate from packed BWAV header: %uHz (%u ch, %zu assets)", rate, (unsigned)chans, hourly_assets_count);
+        return;
+    }
+    log_error("[AUDIO] No BGM header in the packed assets; using default sample rate");
+    return;
+#endif
     for (int hour = 0; hour < 24; ++hour) {
         for (hourly::Weather w : {hourly::Weather::Sunny, hourly::Weather::Rainy, hourly::Weather::Snowy}) {
             std::ifstream f(dir + "/" + hourly::bgm_filename(hour, w), std::ios::binary);

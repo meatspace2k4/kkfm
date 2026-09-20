@@ -16,6 +16,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 import wave
 from pathlib import Path
@@ -108,6 +109,39 @@ class TestBgmFiles(unittest.TestCase):
                 self.assertNotEqual(c0["coeffs"], c1["coeffs"])
                 n += 1
         self.assertEqual(n, 72)
+
+
+class TestPacker(unittest.TestCase):
+    """hourly/packer_hourly.py packs the set the way the radio packer does."""
+
+    def test_pack_table_matches_files(self) -> None:
+        sys.path.insert(0, str(HOURLY))
+        import packer_hourly
+
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "hourly"))
+            entries = packer_hourly.pack(str(SOUND_DIR), td)
+            self.assertEqual(len(entries), 72)
+            blob = Path(td) / packer_hourly.BLOB
+            hdr = (Path(td) / packer_hourly.HDR).read_text()
+            asm = (Path(td) / packer_hourly.ASM).read_text()
+            self.assertIn("hourly_assets_count = 72", hdr)
+            self.assertIn("hourly_assets_blob", asm)
+            self.assertIn(f'.incbin "{packer_hourly.BLOB}"', asm)
+            expect_off = 0
+            with open(blob, "rb") as b:
+                for off, size, hour, w, name in entries:
+                    self.assertEqual(off, expect_off)            # contiguous
+                    self.assertEqual(size, (SOUND_DIR / name).stat().st_size)
+                    self.assertEqual(name, f"BGM_24Hour_{hour:02d}_{WEATHERS[w]}.bwav")
+                    b.seek(off)
+                    img = b.read(size)
+                    h = parse_stereo_header(img[:512])           # header intact in the blob
+                    self.assertEqual(h["channels"], 2)
+                    self.assertEqual(img[-4:], b"\x00\x00\x00\x00")  # CRC zeroed like the radio packer
+                    self.assertEqual(img[:-4], (SOUND_DIR / name).read_bytes()[:-4])
+                    expect_off += size
+            self.assertEqual(blob.stat().st_size, expect_off)
 
 
 class TestLogLines(unittest.TestCase):

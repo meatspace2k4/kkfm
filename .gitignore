@@ -120,3 +120,6 @@ secrets/
 hourly/Stream
 hourly/out/
 hourly_bgm
+hourly_assets_blob.bin
+hourly_assets.S
+hourly/hourly_assets.h

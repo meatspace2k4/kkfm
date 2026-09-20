@@ -569,8 +569,58 @@ static void test_stream_server_range_resume() {
     server.stop();
 }
 
+#ifdef HOURLY_USE_BLOB
+// Packed build: every hour/weather resolves inside the blob, parses as the same
+// stereo header as the file, and decodes audio straight from rodata.
+static void test_packed_assets_cover_all_hours_and_decode() {
+    ASSERT_EQ((int)hourly_assets_count, 72);
+    const Weather ws[3] = {Weather::Sunny, Weather::Rainy, Weather::Snowy};
+    for (int h = 0; h < 24; ++h) {
+        for (Weather w : ws) {
+            const HourlyAsset* a = find_hourly_asset(h, w);
+            ASSERT(a != nullptr);
+            ASSERT_STREQ(a->name, bgm_filename(h, w));
+            auto lb = load_bwav_blob(h, w, hour_title(h, w));
+            ASSERT(lb != nullptr);
+            ASSERT_EQ(lb->ctx->channels, 2);
+            ASSERT_EQ((int)lb->ctx->rate, 48000);
+            ASSERT(lb->ctx->loop_end == lb->ctx->total_samples);
+            ASSERT(lb->bytes.empty());   // no copy: points into the blob
+            ASSERT(lb->ctx->raw_data >= hourly_assets_blob + a->offset);
+            ASSERT(lb->ctx->raw_data < hourly_assets_blob + a->offset + a->size);
+        }
+    }
+    // Blob decode == file decode for the first second of hour 00 Sunny, when the files are present.
+    auto blob = load_bwav_blob(0, Weather::Sunny, "x");
+    Mixer m1; auto t1 = m1.add(blob->ctx, VOL_DEFAULT, 0.0f, false, 0.0f, 0.0f);
+    std::vector<int16_t> b1(MIX_BLOCK_FRAMES * 2), b2(MIX_BLOCK_FRAMES * 2);
+    auto file = load_bwav_file(sound_dir() + "/" + bgm_filename(0, Weather::Sunny), "x", 0);
+    size_t nonzero = 0;
+    if (file) {
+        Mixer m2; auto t2 = m2.add(file->ctx, VOL_DEFAULT, 0.0f, false, 0.0f, 0.0f);
+        for (int k = 0; k < 110; ++k) {
+            m1.mix_block(b1.data(), MIX_BLOCK_FRAMES);
+            m2.mix_block(b2.data(), MIX_BLOCK_FRAMES);
+            ASSERT(b1 == b2);
+            for (auto s : b1) if (s) nonzero++;
+        }
+    } else {
+        for (int k = 0; k < 110; ++k) { m1.mix_block(b1.data(), MIX_BLOCK_FRAMES); for (auto s : b1) if (s) nonzero++; }
+    }
+    ASSERT(nonzero > 1000);
+    ASSERT(!t1->done());
+}
+#endif
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "-v") g_verbose = true;
+#ifdef HOURLY_USE_BLOB
+    setenv("ACNH_DEBUG", "false", 1);
+    run_test("packed_assets_cover_all_hours_and_decode", test_packed_assets_cover_all_hours_and_decode);
+    { int failed = 0; for (const auto& r : g_results) if (!r.passed) failed++;
+      std::cout << "\n" << g_results.size() << " run, " << failed << " failed" << std::endl;
+      return failed > 0 ? 1 : 0; }
+#endif
     // Log buffer prints straight to stdout when not a TTY; keep test output readable.
     setenv("ACNH_DEBUG", "false", 1);
 
