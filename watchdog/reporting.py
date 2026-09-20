@@ -101,8 +101,10 @@ class Reporter:
         anomalies_env = os.environ.get("WATCHDOG_ANOMALIES_TO_DISK")
         flags_env = os.environ.get("WATCHDOG_FLAGS_TO_DISK")
 
-        # Anomalies default to DISK (persist across reboots) unless in test environment
-        self._anomalies_to_disk = (anomalies_env != "0") if anomalies_env is not None else (not is_temp_out_dir)
+        # Anomalies default to DISK (persist across reboots). A temp out_dir (tests) must
+        # ALSO stay on disk under that temp dir: sending it to the shared runtime tmpfs
+        # puts test fixtures into the live dashboard's anomaly list.
+        self._anomalies_to_disk = (anomalies_env != "0") if anomalies_env is not None else True
         # Flags default to tmpfs (transient) unless explicitly enabled
         self._flags_to_disk = (flags_env == "1") if flags_env is not None else is_temp_out_dir
 

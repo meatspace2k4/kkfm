@@ -4,13 +4,16 @@ import atexit
 import json
 import os
 import signal
+import struct
 import subprocess
+import threading
 import time
 import curses
 import select
 import shutil
 import sys
 import tempfile
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -244,7 +247,136 @@ def _fmt_kv(label: str, val: Any, width: int) -> str:
     return s if width <= 0 else s.ljust(width)
 
 
-def run_dashboard(*, out_dir: str, refresh_s: float = 1.0, ssh_target: Optional[str] = None) -> int:
+def _stream_host(ssh_target: Optional[str]) -> str:
+    if ssh_target and "@" in ssh_target:
+        return ssh_target.split("@", 1)[1]
+    return ssh_target or "127.0.0.1"
+
+
+# SAFETY - HARD LOCK, matching the jukebox's BwavPlayer (jukebox-web/lib/
+# bwavPlayer.js): corrupt or distorted audio must never reach the speaker.
+# That player owns its whole pipeline (fetch -> decode -> Web Audio graph)
+# and layers three defenses: a source integrity gate before decode, a
+# post-decode PCM sanity check, and a live output watchdog that hard-locks
+# on a sustained rail-level run (the signature of decode corruption).
+#
+# This player is a subprocess (ffplay/mpv) we don't own the decode of, so we
+# take over exactly the part we can: WE fetch /stream ourselves instead of
+# letting the player hit the URL, validate its WAV header once (the source
+# integrity gate — bad magic/format/rate/channels means the server or the
+# link is broken, refuse to play garbage), then scan every PCM sample as it
+# passes through (the output watchdog, moved upstream of the player instead
+# of downstream of it) before forwarding raw bytes into the player's stdin.
+# Any failure calls _hard_lock(): the player is killed immediately and
+# playback refuses to restart until a deliberate 'r' reset, same as the
+# jukebox's latch — fail closed, silent, and stay there.
+class StreamIntegrityError(Exception):
+    pass
+
+
+_WAV_HEADER_STRUCT = struct.Struct("<4sI4s4sIHHIIHH4sI")
+
+# Rail-run watchdog: mirrors bwavPlayer.js's RAIL_LEVEL=0.999 / RAIL_RUN_LIMIT
+# =4096 (a sustained near-full-scale run == square-wave/DC-rail == the
+# signature of corruption, not real audio, which never sits at rail for
+# long). Same order of magnitude here: 4096 interleaved int16 samples of a
+# 48kHz stereo stream is ~43ms, comparable to the web player's ~85ms of mono
+# samples.
+_RAIL_LEVEL_INT16 = 32735  # ~0.999 * 32767
+_RAIL_RUN_LIMIT = 4096
+
+
+def _validate_wav_header(header_bytes: bytes) -> None:
+    if len(header_bytes) != _WAV_HEADER_STRUCT.size:
+        raise StreamIntegrityError(f"short WAV header ({len(header_bytes)} bytes)")
+    (riff, _file_size, wave, fmt, fmt_size, fmt_tag, channels,
+     sample_rate, _byte_rate, _block_align, bits, data, _data_size) = _WAV_HEADER_STRUCT.unpack(header_bytes)
+    if riff != b"RIFF" or wave != b"WAVE" or fmt != b"fmt " or data != b"data":
+        raise StreamIntegrityError("bad WAV magic")
+    if fmt_size != 16 or fmt_tag != 1:
+        raise StreamIntegrityError(f"unsupported format tag {fmt_tag}")
+    if channels != 2 or sample_rate != 48000 or bits != 16:
+        raise StreamIntegrityError(f"unexpected format {channels}ch/{sample_rate}Hz/{bits}bit")
+
+
+def _stream_relay(url: str, stdin_pipe: Any, stop_flag: dict, lock_holder: dict) -> None:
+    """Runs on a background thread. Owns the network fetch so the player
+    subprocess never talks to the server directly; forwards validated raw
+    PCM to its stdin. Any integrity-gate failure sets lock_holder and stops
+    forwarding; a plain network hiccup just ends the thread (the player then
+    exits on stdin EOF and the main loop reports that the normal way)."""
+    rail_run = 0
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url), timeout=10) as resp:
+            _validate_wav_header(resp.read(_WAV_HEADER_STRUCT.size))
+            while not stop_flag["stop"]:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                n = len(chunk) - (len(chunk) % 2)
+                if n:
+                    for s in struct.unpack(f"<{n // 2}h", chunk[:n]):
+                        if abs(s) >= _RAIL_LEVEL_INT16:
+                            rail_run += 1
+                            if rail_run >= _RAIL_RUN_LIMIT:
+                                raise StreamIntegrityError(
+                                    f"sustained rail-level run ({_RAIL_RUN_LIMIT} samples): "
+                                    "corrupt/distorted stream"
+                                )
+                        else:
+                            rail_run = 0
+                try:
+                    stdin_pipe.write(chunk)
+                    stdin_pipe.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    break
+    except StreamIntegrityError as e:
+        lock_holder["locked"] = True
+        lock_holder["reason"] = str(e)
+    except Exception as e:
+        stop_flag["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        # Tell the main loop the feed is gone (server exited, connection dropped).
+        # ffplay/mpv do not exit on stdin EOF by themselves, so without this the
+        # dashboard would keep showing PLAYING with nothing coming out.
+        stop_flag["ended"] = True
+        try:
+            stdin_pipe.close()
+        except Exception:
+            pass
+
+
+def _player_cmd(bin_path: str) -> list[str]:
+    """Raw s16le PCM from stdin: matches the web player, which pushes raw
+    PCM straight into an AudioWorklet with no buffering, no format probing,
+    and (since the player never opens the URL) none of the seek/Range
+    handling that /stream's infinite-length WAV framing can't support."""
+    name = os.path.basename(bin_path)
+    if name.startswith("mpv"):
+        return [
+            bin_path, "--no-video", "--really-quiet", "--no-terminal",
+            "--demuxer=rawaudio", "--demuxer-rawaudio-format=s16le",
+            "--demuxer-rawaudio-rate=48000", "--demuxer-rawaudio-channels=2",
+            "-",
+        ]
+    return [
+        # -sample_rate/-ch_layout, not -ar/-ac: those are demuxer-private
+        # AVOptions on the s16le demuxer (`ffmpeg -h demuxer=s16le`), the
+        # -ar/-ac CLI aliases don't route to it as an input option here.
+        bin_path, "-nodisp", "-loglevel", "error",
+        "-f", "s16le", "-sample_rate", "48000", "-ch_layout", "stereo",
+        "-fflags", "nobuffer", "-flags", "low_delay",
+        "-i", "-",
+    ]
+
+
+def run_dashboard(
+    *,
+    out_dir: str,
+    refresh_s: float = 1.0,
+    ssh_target: Optional[str] = None,
+    stream_port: int = 9000,
+) -> int:
     global _terminal_active, _original_terminal_settings
 
     # Set up signal handlers for graceful terminal restoration
@@ -266,6 +398,7 @@ def run_dashboard(*, out_dir: str, refresh_s: float = 1.0, ssh_target: Optional[
             out_dir=out_dir,
             refresh_s=refresh_s,
             ssh_target=ssh_target,
+            stream_port=stream_port,
         )
     finally:
         _restore_terminal()
@@ -274,8 +407,17 @@ def run_dashboard(*, out_dir: str, refresh_s: float = 1.0, ssh_target: Optional[
         signal.signal(signal.SIGINT, old_sigint)
 
 
-def _run_dashboard_impl(*, out_dir: str, refresh_s: float, ssh_target: Optional[str]) -> int:
+def _run_dashboard_impl(
+    *, out_dir: str, refresh_s: float, ssh_target: Optional[str], stream_port: int = 9000
+) -> int:
     out_path = Path(out_dir)
+    stream_url = f"http://{_stream_host(ssh_target)}:{stream_port}/stream"
+    player_bin = shutil.which("ffplay") or shutil.which("mpv")
+    player_proc_holder: dict[str, Any] = {"proc": None, "stop_flag": None}
+    # Set by _stream_relay's integrity gate; a background thread writes this,
+    # the main loop reads it once per tick (plain dict assignment is atomic
+    # enough under the GIL for this - worst case a one-tick-stale read).
+    player_lock_holder: dict[str, Any] = {"locked": False, "reason": None}
     tx_status: Path = out_path / "tx_status.json"
     log_status: Path = out_path / "log_status.json"
 
@@ -808,6 +950,66 @@ while True:
         last_comm_state: Optional[str] = None
         last_bwav_name: Optional[str] = None
         last_bwav_src: Optional[str] = None
+        last_song_name: Optional[str] = None
+        jingle_playing_now: bool = False
+        comm_playing_now: bool = False
+
+        player_state: str = "idle"  # "idle" | "playing" | "locked"
+        player_err: Optional[str] = None
+
+        def _stop_player() -> None:
+            nonlocal player_state, player_err
+            stop_flag = player_proc_holder["stop_flag"]
+            if stop_flag is not None:
+                stop_flag["stop"] = True
+            proc = player_proc_holder["proc"]
+            player_proc_holder["proc"] = None
+            player_proc_holder["stop_flag"] = None
+            player_state = "idle"
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        proc.kill()
+                except Exception:
+                    pass
+
+        def _reset_player_lock() -> None:
+            nonlocal player_state, player_err
+            player_lock_holder["locked"] = False
+            player_lock_holder["reason"] = None
+            player_state = "idle"
+            player_err = None
+
+        def _start_player() -> None:
+            nonlocal player_state, player_err
+            if not player_bin:
+                player_err = "no audio player found (install ffplay or mpv)"
+                return
+            try:
+                proc = subprocess.Popen(
+                    _player_cmd(player_bin),
+                    stdin=subprocess.PIPE,      # we feed this ourselves (see
+                    stdout=subprocess.DEVNULL,  # _stream_relay) - the player
+                    stderr=subprocess.PIPE,     # never touches the network
+                )
+                if proc.stderr is not None:
+                    os.set_blocking(proc.stderr.fileno(), False)
+                player_proc_holder["proc"] = proc
+                stop_flag = {"stop": False}
+                player_proc_holder["stop_flag"] = stop_flag
+                player_state = "playing"
+                player_err = None
+                threading.Thread(
+                    target=_stream_relay,
+                    args=(stream_url, proc.stdin, stop_flag, player_lock_holder),
+                    daemon=True,
+                ).start()
+            except Exception as e:
+                player_err = f"player launch failed: {e}"
+                player_state = "idle"
 
         last_log_epoch: Optional[str] = None
         last_tx_epoch: Optional[str] = None
@@ -843,6 +1045,56 @@ while True:
                 ch = -1
             if ch in (ord("q"), ord("Q")):
                 return
+            if ch in (ord("r"), ord("R")) and player_state == "locked":
+                _reset_player_lock()
+            if ch in (ord("p"), ord("P")) and player_state != "locked":
+                if player_state == "idle":
+                    _start_player()
+                else:
+                    _stop_player()
+
+            if player_lock_holder["locked"] and player_state != "locked":
+                # The relay thread's integrity gate tripped: kill playback
+                # outright and latch. Only an explicit 'r' clears this, same
+                # as the jukebox's hardLock()/reset() - a bad stream can't
+                # quietly "recover" into noise.
+                proc = player_proc_holder["proc"]
+                player_proc_holder["proc"] = None
+                player_proc_holder["stop_flag"] = None
+                if proc is not None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                player_state = "locked"
+                player_err = player_lock_holder["reason"] or "stream-integrity hard-lock"
+            elif player_state != "locked":
+                proc = player_proc_holder["proc"]
+                sf = player_proc_holder.get("stop_flag")
+                if proc is not None and proc.poll() is None and isinstance(sf, dict) and sf.get("ended") and not sf.get("stop"):
+                    # Stream feed ended while the player is still alive: stop it and say so.
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    player_proc_holder["proc"] = None
+                    player_proc_holder["stop_flag"] = None
+                    player_state = "idle"
+                    player_err = "stream ended: " + (sf.get("error") or "server closed the connection")
+                    proc = None
+                if proc is not None and proc.poll() is not None:
+                    rc = proc.returncode
+                    player_proc_holder["proc"] = None
+                    player_proc_holder["stop_flag"] = None
+                    player_state = "idle"
+                    tail = ""
+                    if proc.stderr is not None:
+                        try:
+                            tail = proc.stderr.read().decode("utf-8", errors="ignore").strip()
+                        except Exception:
+                            tail = ""
+                        tail = tail.splitlines()[-1] if tail else ""
+                    player_err = tail if tail else f"player exited (code {rc})"
 
             try:
                 stdscr.erase()
@@ -886,6 +1138,8 @@ while True:
                                 level = max(level, 2)
                                 break
 
+                onair_flag = False
+                onair_flag = False
                 tx_snap = remote.get("tx") if isinstance(remote, dict) else None
                 if isinstance(tx_snap, dict):
                     now_ts = time.time()
@@ -929,6 +1183,7 @@ while True:
                             audio_present = False
 
                     if telemetry_fresh and isinstance(audio_present, bool):
+                        onair_flag = audio_present
                         if audio_present:
                             tx_silence_since_ts = None
                         else:
@@ -967,7 +1222,54 @@ while True:
                 stdscr.addnstr(0, 0, header.center(max_x), max(0, max_x - 1))
                 stdscr.attroff(header_color | curses.A_BOLD)
 
+                # PLAY CHIP: station on-air state, plus what's on air (song title,
+                # or a bare "Jingle"/"Commercial" hint while those play). Toggled
+                # with 'p', which spawns a real player (ffplay/mpv) against the
+                # stream endpoint, same on-air source of truth as the header level.
                 y = 2
+                if y < max_y:
+                    locked = player_state == "locked"
+                    listening = player_state == "playing"
+                    chip_attr = curses.color_pair(8) | curses.A_BOLD
+                    if locked:
+                        chip = "  ✕ LOCKED  "
+                        chip_attr = curses.color_pair(13) | curses.A_BOLD  # magenta, matches CRITICAL
+                    elif listening:
+                        chip = "  PLAYING...  "
+                    elif onair_flag:
+                        chip = "  ● LIVE  "
+                    else:
+                        chip = "  ▶ PLAY  "
+                    stdscr.attron(chip_attr)
+                    stdscr.addnstr(y, 2, chip, max(0, max_x - 3))
+                    stdscr.attroff(chip_attr)
+                    hint_col = 2 + len(chip) + 1
+                    if hint_col < max_x:
+                        if locked:
+                            stdscr.attron(curses.color_pair(13) | curses.A_BOLD)
+                            hint = f"{player_err or 'stream-integrity hard-lock'} (press 'r' to reset)"
+                            stdscr.addnstr(y, hint_col, hint[:70], max(0, max_x - hint_col - 1))
+                            stdscr.attroff(curses.color_pair(13) | curses.A_BOLD)
+                        elif player_err:
+                            stdscr.attron(curses.color_pair(2))
+                            stdscr.addnstr(y, hint_col, player_err[:70], max(0, max_x - hint_col - 1))
+                            stdscr.attroff(curses.color_pair(2))
+                        elif listening:
+                            onair_title = (
+                                last_song_name
+                                if (not jingle_playing_now and not comm_playing_now and last_song_name)
+                                else None
+                            )
+                            if onair_title:
+                                stdscr.attron(title_text_attr)
+                                stdscr.addnstr(y, hint_col, onair_title, max(0, max_x - hint_col - 1))
+                                stdscr.attroff(title_text_attr)
+                        else:
+                            stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+                            stdscr.addnstr(y, hint_col, "<-- press 'p' to LISTEN!", max(0, max_x - hint_col - 1))
+                            stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
+
+                y = 4
                 if y < max_y:
                     stdscr.attron(section_title_attr)
                     stdscr.addnstr(y, 2, "SYSTEM SERVICES", max(0, max_x - 3))
@@ -1190,6 +1492,7 @@ while True:
                                 last_comm_state = None
                                 last_bwav_name = None
                                 last_bwav_src = None
+                                last_song_name = None
                                 prev_jingle_playing = False
                                 prev_comm_playing = False
 
@@ -1201,6 +1504,7 @@ while True:
                             last_comm_state = None
                             last_bwav_name = None
                             last_bwav_src = None
+                            last_song_name = None
                             prev_jingle_playing = False
                             prev_comm_playing = False
 
@@ -1220,6 +1524,17 @@ while True:
                             else:
                                 wd = _systemctl_state("acnh-aircheck-watchdog.service", ssh_target=ssh_target)
                         wd_active = wd.active == "active"
+                        # No systemd (local run, e.g. macOS): the log monitor is up when its
+                        # status file is fresh and the PID it recorded is alive.
+                        if not wd_active and not ssh_target and not log_stale:
+                            try:
+                                mon_pid = int(ls.get("pid") or 0)
+                                if mon_pid > 0:
+                                    os.kill(mon_pid, 0)
+                                    wd = ServiceState(name=wd.name, active="active", sub=f"pid {mon_pid}", since="")
+                                    wd_active = True
+                            except Exception:
+                                pass
 
                         le = ls.get("last_event") or {}
                         bwav = ls.get("last_bwav") or {}
@@ -1248,6 +1563,8 @@ while True:
                             elif etype == "commercial_end":
                                 last_comm_name = ename
                                 last_comm_state = "ENDED"
+                            elif etype == "now_playing":
+                                last_song_name = ename
 
                         jingle_playing_now = bool(jing.get("started_name"))
                         comm_playing_now = bool(com.get("started_name"))
@@ -1610,5 +1927,17 @@ while True:
                 time.sleep(0.05)
                 continue
 
-    curses.wrapper(draw)
+    try:
+        curses.wrapper(draw)
+    finally:
+        proc = player_proc_holder["proc"]
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
     return 0

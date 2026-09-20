@@ -27,6 +27,14 @@ class EventType(str, Enum):
     DAC_THROTTLE = "dac_throttle"
     DAC_UNDERRUN = "dac_underrun"
 
+    # Hourly BGM fork ([HOURLY] lines)
+    BGM_PICKED = "bgm_picked"            # name = BGM_24Hour_HH_<Weather>.bwav
+    BGM_CHANGEOVER = "bgm_changeover"    # name = file being faded; raw carries "HH -> HH"
+    BGM_END = "bgm_end"                  # name = file that finished its fade
+    BGM_FAILED = "bgm_failed"            # name = path that failed to load
+    WEATHER_FETCHED = "weather_fetched"  # name = Sunny | Rainy | Snowy
+    WEATHER_FAILED = "weather_failed"
+
 
 @dataclass(frozen=True)
 class Event:

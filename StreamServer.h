@@ -94,7 +94,7 @@ private:
     bool read_request(int fd, std::string& method, std::string& path, std::string& headers_out);
     void send_index(int fd, bool head_only);
     void send_not_found(int fd);
-    void stream_audio(int fd, bool head_only);
+    void stream_audio(int fd, bool head_only, uint64_t resume_from = 0);
 
     bool send_all(int fd, const void* data, size_t len) {
         if (fd < 0 || !data || len == 0) return true;
