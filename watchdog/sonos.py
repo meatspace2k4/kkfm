@@ -132,26 +132,24 @@ def local_ip_towards(ip: str) -> str:
         s.close()
 
 
-def radio_uri(url: str) -> str:
-    """Sonos treats a plain http:// URI as a file (needs a known length and a
-    file MIME type) and answers 714 for a live stream. Live HTTP streams are
-    addressed with the x-rincon-mp3radio scheme, which makes the player open the
-    URL as a radio stream and sniff the audio format from the data."""
-    if url.startswith("http://"):
-        return "x-rincon-mp3radio://" + url[len("http://"):]
-    return url
-
-
-def set_uri_and_play(coordinator_ip: str, url: str, title: str = "KKFM") -> None:
-    url = radio_uri(url)
-    meta = (
+def didl_for_wav_stream(url: str, title: str) -> str:
+    """The /stream endpoint is 16-bit PCM WAV. Sonos plays it as an http-get
+    audio/wav track when the metadata says so; without the res/protocolInfo it
+    answers 714 (illegal MIME), and the x-rincon-mp3radio scheme makes it sniff
+    the PCM as MP3 (static)."""
+    return (
         '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
         'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
         '<item id="-1" parentID="-1" restricted="true">'
         f"<dc:title>{html.escape(title)}</dc:title>"
-        "<upnp:class>object.item.audioItem.audioBroadcast</upnp:class>"
+        "<upnp:class>object.item.audioItem.musicTrack</upnp:class>"
+        f'<res protocolInfo="http-get:*:audio/wav:*">{html.escape(url)}</res>'
         "</item></DIDL-Lite>"
     )
+
+
+def set_uri_and_play(coordinator_ip: str, url: str, title: str = "KKFM") -> None:
+    meta = didl_for_wav_stream(url, title)
     body = (
         "<InstanceID>0</InstanceID>"
         f"<CurrentURI>{html.escape(url)}</CurrentURI>"
