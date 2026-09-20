@@ -34,8 +34,19 @@ from watchdog.ansi import strip_ansi  # noqa: E402
 WEATHERS = ("Sunny", "Rainy", "Snowy")
 CH_INFO = 0x4C
 RATE = 48000
-FADE_PLAY_S = 10.0
-FADE_TIME_S = 7.0
+
+
+def _engine_const(name: str) -> float:
+    """Read a `const float NAME = X.Yf;` from the engine so the tests follow it."""
+    src = (REPO / "acnh_aircheck_pi.cpp").read_text(errors="ignore")
+    m = re.search(rf"const\s+float\s+{name}\s*=\s*([0-9.]+)f?\s*;", src)
+    if not m:
+        raise RuntimeError(f"{name} not found in acnh_aircheck_pi.cpp")
+    return float(m.group(1))
+
+
+FADE_PLAY_S = _engine_const("FADE_PLAY_DURATION")
+FADE_TIME_S = _engine_const("FADE_TIME_DURATION")
 
 
 def u16(b: bytes, o: int) -> int:
@@ -117,15 +128,19 @@ class TestLogLines(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertEqual(m.group("name").strip(), "BGM_24Hour_13_Sunny.bwav")
 
-    def test_no_radio_events_emitted_by_fork_lines(self) -> None:
-        for line in (
-            "[HOURLY] Hour 13 -> picked BGM_24Hour_13_Sunny.bwav (weather=Sunny)",
-            "[HOURLY] Changeover 13 -> 14: BGM_24Hour_13_Sunny.bwav fades at its next loop end (hour changed)",
-            "[HOURLY] Track end: BGM_24Hour_13_Sunny.bwav (loops=37)",
-            "[HOURLY] Weather fetched: Rainy (wmo=61 rain=0.40mm showers=0.00mm snow=0.00cm at 2026-09-20T12:45)",
-        ):
+    def test_fork_lines_are_bgm_events_not_radio_events(self) -> None:
+        expected = {
+            "[HOURLY] Hour 13 -> picked BGM_24Hour_13_Sunny.bwav (weather=Sunny)": EventType.BGM_PICKED,
+            "[HOURLY] Changeover 13 -> 14: BGM_24Hour_13_Sunny.bwav fades at its next loop end (hour changed)": EventType.BGM_CHANGEOVER,
+            "[HOURLY] Track end: BGM_24Hour_13_Sunny.bwav (loops=37)": EventType.BGM_END,
+            "[HOURLY] Weather fetched: Rainy (wmo=61 rain=0.40mm showers=0.00mm snow=0.00cm at 2026-09-20T12:45)": EventType.WEATHER_FETCHED,
+        }
+        radio_types = {t for t in EventType if t.value.startswith(("jingle_", "commercial_"))}
+        for line, et in expected.items():
             ev = parse_event(line, default_ts=0.0)
-            self.assertIsNone(ev, line)   # informational; no jingle/commercial state machine involvement
+            self.assertIsNotNone(ev, line)
+            self.assertEqual(ev.etype, et, line)
+            self.assertNotIn(ev.etype, radio_types)
 
 
 class TestDecodedWav(unittest.TestCase):
