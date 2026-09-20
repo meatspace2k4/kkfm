@@ -33,17 +33,12 @@ $CXX $CXXFLAGS -DKKFM_TEST_MODE hourly/tests_hourly.cpp StreamServer.cpp -o "$OU
 "$OUT/hourly_tests" -v
 
 echo "== python suite"
-# The watchdog package imports as `kkfm.watchdog`; give it a parent named kkfm.
-PYROOT="$(mktemp -d)"
-ln -s "$ROOT" "$PYROOT/kkfm"
-PYTHONPATH="$PYROOT" python3 -m unittest hourly.tests.test_hourly -v
+python3 -m unittest hourly.tests.test_hourly -v
 
 echo "== watchdog suite (isolated out dir so fixtures never reach the dashboard)"
 WDOUT="$(mktemp -d)"
-PYTHONPATH="$PYROOT" WATCHDOG_OUT_DIR="$WDOUT" python3 -m watchdog.run selftest -v \
-  | grep -E "hourly_bgm|run,|✗" || true
-PYTHONPATH="$PYROOT" WATCHDOG_OUT_DIR="$WDOUT" python3 -m unittest watchdog.tests.test_hourly_bgm_detector
-rm -f "$PYROOT/kkfm"; rmdir "$PYROOT"
+WATCHDOG_OUT_DIR="$WDOUT" python3 watchdog_run.py selftest -v | grep -E "hourly_bgm|sonos|stdin|run,|✗" || true
+WATCHDOG_OUT_DIR="$WDOUT" python3 -m unittest watchdog.tests.test_hourly_bgm_detector watchdog.tests.test_sonos
 
 build_player
 echo "== done; outputs in $OUT"

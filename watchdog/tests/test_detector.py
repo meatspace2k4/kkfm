@@ -1,8 +1,8 @@
 import unittest
 
-from kkfm.watchdog.detector import Detector
-from kkfm.watchdog.events import Event, EventType
-from kkfm.watchdog.anomalies import AnomalyCode
+from watchdog.detector import Detector
+from watchdog.events import Event, EventType
+from watchdog.anomalies import AnomalyCode
 
 
 class TestDetector(unittest.TestCase):

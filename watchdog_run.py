@@ -19,7 +19,9 @@ import sys
 
 
 def _ensure_repo_root_on_path() -> None:
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+    # The watchdog package lives next to this file; the checkout directory can
+    # have any name (worktrees, copies), so import it from here, not by name.
+    repo_root = os.path.abspath(os.path.dirname(__file__))
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
 
@@ -41,12 +43,11 @@ def main() -> int:
     # Single source of truth:
     # Always delegate to the package CLI (which includes the real dashboard).
     try:
-        from kkfm.watchdog.run import main as pkg_main
+        from watchdog.run import main as pkg_main
     except Exception as e:
         raise SystemExit(
-            "kkfm.watchdog is not importable from this checkout. "
-            "Run from the repo root, or install the package (recommended):\n\n"
-            "  python3 -m pip install -e kkfm/watchdog\n\n"
+            "watchdog package is not importable from this checkout "
+            f"({os.path.dirname(os.path.abspath(__file__))}).\n\n"
             f"Original error: {e}"
         )
 
