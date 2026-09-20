@@ -22,6 +22,7 @@ import errno
 
 from .paths import get_runtime_status_dir
 from .health_check import WatchdogHealthMonitor, read_status_file
+from . import sonos
 
 
 # Track whether terminal needs restoration (for signal handlers)
@@ -957,6 +958,62 @@ while True:
         player_state: str = "idle"  # "idle" | "playing" | "locked"
         player_err: Optional[str] = None
 
+        # STREAM chip ('s'): hand the /stream URL to the Sonos zone-group
+        # coordinator (SetAVTransportURI + Play) and show its transport state.
+        sonos_state: str = "idle"  # "idle" | "streaming"
+        sonos_room: Optional[str] = None
+        sonos_ip: Optional[str] = None
+        sonos_err: Optional[str] = None
+        sonos_transport: Optional[str] = None
+        sonos_last_poll: float = 0.0
+
+        def _stream_url_for_sonos(coord_ip: str) -> str:
+            host = _stream_host(ssh_target)
+            if host in ("127.0.0.1", "localhost", "::1"):
+                host = sonos.local_ip_towards(coord_ip)
+            return f"http://{host}:{stream_port}/stream"
+
+        def _start_sonos() -> None:
+            nonlocal sonos_state, sonos_room, sonos_ip, sonos_err, sonos_transport, sonos_last_poll
+            sonos_err = None
+            try:
+                coord = sonos.find_coordinator()
+                url = _stream_url_for_sonos(coord.ip)
+                sonos.set_uri_and_play(coord.ip, url, title="KKFM Aircheck")
+                sonos_room, sonos_ip = coord.room, coord.ip
+                sonos_state = "streaming"
+                sonos_transport = None
+                sonos_last_poll = 0.0
+            except sonos.SonosError as e:
+                sonos_err = str(e)
+                sonos_state = "idle"
+
+        def _stop_sonos() -> None:
+            nonlocal sonos_state, sonos_err, sonos_transport
+            if sonos_ip:
+                try:
+                    sonos.stop(sonos_ip)
+                except sonos.SonosError as e:
+                    sonos_err = str(e)
+            sonos_state = "idle"
+            sonos_transport = None
+
+        def _poll_sonos() -> None:
+            nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll
+            if sonos_state != "streaming" or not sonos_ip:
+                return
+            if time.time() - sonos_last_poll < 3.0:
+                return
+            sonos_last_poll = time.time()
+            try:
+                sonos_transport = sonos.transport_state(sonos_ip)
+                if sonos_transport in ("STOPPED", "NO_MEDIA_PRESENT"):
+                    sonos_err = f"Sonos {sonos_room}: transport {sonos_transport} (stream rejected or ended)"
+                    sonos_state = "idle"
+            except sonos.SonosError as e:
+                sonos_err = str(e)
+                sonos_state = "idle"
+
         def _stop_player() -> None:
             nonlocal player_state, player_err
             stop_flag = player_proc_holder["stop_flag"]
@@ -1052,6 +1109,12 @@ while True:
                     _start_player()
                 else:
                     _stop_player()
+            if ch in (ord("s"), ord("S")):
+                if sonos_state == "idle":
+                    _start_sonos()
+                else:
+                    _stop_sonos()
+            _poll_sonos()
 
             if player_lock_holder["locked"] and player_state != "locked":
                 # The relay thread's integrity gate tripped: kill playback
@@ -1269,7 +1332,31 @@ while True:
                             stdscr.addnstr(y, hint_col, "<-- press 'p' to LISTEN!", max(0, max_x - hint_col - 1))
                             stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
 
-                y = 4
+                # STREAM CHIP: 's' sends the stream URL to the Sonos group coordinator.
+                y = 3
+                if y < max_y:
+                    streaming = sonos_state == "streaming"
+                    chip_attr = curses.color_pair(8) | curses.A_BOLD
+                    chip = "  STREAMING...  " if streaming else "  ⇢ STREAM  "
+                    stdscr.attron(chip_attr)
+                    stdscr.addnstr(y, 2, chip, max(0, max_x - 3))
+                    stdscr.attroff(chip_attr)
+                    hint_col = 2 + len(chip) + 1
+                    if hint_col < max_x:
+                        if sonos_err:
+                            stdscr.attron(curses.color_pair(2))
+                            stdscr.addnstr(y, hint_col, sonos_err[:90], max(0, max_x - hint_col - 1))
+                            stdscr.attroff(curses.color_pair(2))
+                        elif streaming:
+                            stdscr.attron(title_text_attr)
+                            stdscr.addnstr(y, hint_col, f"Sonos {sonos_room} ({sonos_ip})  {sonos_transport or 'starting'}", max(0, max_x - hint_col - 1))
+                            stdscr.attroff(title_text_attr)
+                        else:
+                            stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+                            stdscr.addnstr(y, hint_col, "<-- press 's' to STREAM to Sonos", max(0, max_x - hint_col - 1))
+                            stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
+
+                y = 5
                 if y < max_y:
                     stdscr.attron(section_title_attr)
                     stdscr.addnstr(y, 2, "SYSTEM SERVICES", max(0, max_x - 3))
