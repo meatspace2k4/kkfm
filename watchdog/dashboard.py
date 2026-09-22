@@ -121,9 +121,45 @@ def _run_ssh(ssh_target: str, cmd: list[str], timeout_s: float = 1.0) -> str:
     )
 
 
-def _systemctl_state(unit: str, *, ssh_target: Optional[str] = None) -> ServiceState:
+@dataclass(frozen=True)
+class DashboardProfile:
+    """Which service set the dashboard watches."""
+    name: str
+    units: tuple[str, ...]
+    watchdog_unit: str           # unit whose log monitor feeds RADIO LOGIC MONITOR
+    user_units: bool             # systemctl --user instead of the system manager
+    stream_port: int
+    status_dir: Optional[str]    # remote dir holding log_status.json / tx_status.json (None: radio defaults)
+    anomalies: Optional[str]     # remote anomalies.jsonl (None: radio defaults)
+
+
+PROFILES: dict[str, DashboardProfile] = {
+    "radio": DashboardProfile(
+        name="radio",
+        units=("acnh-aircheck.service", "acnh-aircheck-watchdog.service", "acnh-aircheck-tx-watchdog.service"),
+        watchdog_unit="acnh-aircheck-watchdog.service",
+        user_units=False,
+        stream_port=9000,
+        status_dir=None,
+        anomalies=None,
+    ),
+    # Hourly BGM on the Pi: user units from hourly/deploy/, packed build on the USB.
+    "hourly": DashboardProfile(
+        name="hourly",
+        units=("acnh-hourly.service", "acnh-hourly-watchdog.service"),
+        watchdog_unit="acnh-hourly-watchdog.service",
+        user_units=True,
+        stream_port=8791,
+        status_dir="/run/user/{uid}/kkfm-hourly",
+        anomalies="/mnt/kkfm-usb/kkfm/hourly-build/watchdog/out/anomalies.jsonl",
+    ),
+}
+
+
+def _systemctl_state(unit: str, *, ssh_target: Optional[str] = None, user: bool = False) -> ServiceState:
     cmd = [
         "systemctl",
+        *(["--user"] if user else []),
         "show",
         unit,
         "-p",
@@ -376,7 +412,8 @@ def run_dashboard(
     out_dir: str,
     refresh_s: float = 1.0,
     ssh_target: Optional[str] = None,
-    stream_port: int = 9000,
+    stream_port: Optional[int] = None,
+    profile: str = "radio",
 ) -> int:
     global _terminal_active, _original_terminal_settings
 
@@ -400,6 +437,7 @@ def run_dashboard(
             refresh_s=refresh_s,
             ssh_target=ssh_target,
             stream_port=stream_port,
+            profile=profile,
         )
     finally:
         _restore_terminal()
@@ -409,8 +447,12 @@ def run_dashboard(
 
 
 def _run_dashboard_impl(
-    *, out_dir: str, refresh_s: float, ssh_target: Optional[str], stream_port: int = 9000
+    *, out_dir: str, refresh_s: float, ssh_target: Optional[str], stream_port: Optional[int] = None,
+    profile: str = "radio",
 ) -> int:
+    prof = PROFILES[profile]
+    if stream_port is None:
+        stream_port = prof.stream_port
     out_path = Path(out_dir)
     stream_url = f"http://{_stream_host(ssh_target)}:{stream_port}/stream"
     player_bin = shutil.which("ffplay") or shutil.which("mpv")
@@ -452,11 +494,7 @@ def _run_dashboard_impl(
         if anoms is not None:
             anomalies_jsonl = anoms
 
-    units = [
-        "acnh-aircheck.service",
-        "acnh-aircheck-watchdog.service",
-        "acnh-aircheck-tx-watchdog.service",
-    ]
+    units = list(prof.units)
 
     if not ssh_target:
         allow_local = os.environ.get("WATCHDOG_ALLOW_LOCAL_DASHBOARD") == "1"
@@ -497,6 +535,7 @@ def _run_dashboard_impl(
     class _RemoteStream:
         def __init__(self, target: str, out_dir_s: str, refresh: float) -> None:
             self.target = target
+            self.profile = prof
             self.out_dir_s = out_dir_s
             self.refresh = float(refresh)
             self.proc: subprocess.Popen[str] | None = None
@@ -604,6 +643,11 @@ def _run_dashboard_impl(
                 self.out_dir_s,
                 "--refresh",
                 str(self.refresh),
+                "--units",
+                ",".join(self.profile.units),
+                *(["--user-units"] if self.profile.user_units else []),
+                *(["--status-dir", self.profile.status_dir] if self.profile.status_dir else []),
+                *(["--anomalies", self.profile.anomalies] if self.profile.anomalies else []),
             ]
 
             try:
@@ -634,7 +678,7 @@ def run(cmd, timeout_s=1.0):
 
 def systemctl_state(unit: str):
     out = run([
-        "systemctl","show",unit,
+        "systemctl",*(["--user"] if USER_UNITS else []),"show",unit,
         "-p","ActiveState","-p","SubState","-p","ActiveEnterTimestamp",
         "--no-pager",
     ], timeout_s=1.0)
@@ -677,11 +721,20 @@ def tail_jsonl(p: Path, n: int):
 ap = argparse.ArgumentParser()
 ap.add_argument("--out-dir", required=True)
 ap.add_argument("--refresh", type=float, default=1.0)
+ap.add_argument("--units", default="acnh-aircheck.service,acnh-aircheck-watchdog.service,acnh-aircheck-tx-watchdog.service")
+ap.add_argument("--user-units", action="store_true")
+ap.add_argument("--status-dir", default="")
+ap.add_argument("--anomalies", default="")
 args = ap.parse_args()
 
 out_path = Path(args.out_dir)
+USER_UNITS = bool(args.user_units)
+STATUS_DIR = Path(args.status_dir.format(uid=os.getuid())) if args.status_dir else None
+ANOMALIES = Path(args.anomalies.format(uid=os.getuid())) if args.anomalies else None
 
 def get_status_path(filename):
+    if STATUS_DIR is not None:
+        return STATUS_DIR / filename
     uid = os.getuid()
     cands = [
         Path("/run/kkfm-watchdog") / filename,
@@ -698,6 +751,8 @@ def get_status_path(filename):
     return out_path / filename
 
 def get_anomalies_path():
+    if ANOMALIES is not None:
+        return ANOMALIES
     uid = os.getuid()
     cands = [
         Path("/run/kkfm-watchdog") / "anomalies.jsonl",
@@ -713,11 +768,7 @@ def get_anomalies_path():
             continue
     return out_path / "anomalies.jsonl"
 
-units = [
-    "acnh-aircheck.service",
-    "acnh-aircheck-watchdog.service",
-    "acnh-aircheck-tx-watchdog.service",
-]
+units = [u for u in args.units.split(",") if u]
 
 while True:
     snap = {
@@ -1409,7 +1460,7 @@ while True:
                             else:
                                 st = ServiceState(name=u, active="CONNECT", sub="-", since="")
                         else:
-                            st = _systemctl_state(u, ssh_target=ssh_target)
+                            st = _systemctl_state(u, ssh_target=ssh_target, user=prof.user_units)
                     
                     u_disp = u
                     if max_x < 50:
@@ -1624,19 +1675,19 @@ while True:
 
                         wd = None
                         if isinstance(remote, dict) and isinstance(remote.get("services"), dict):
-                            rst = remote["services"].get("acnh-aircheck-watchdog.service")
+                            rst = remote["services"].get(prof.watchdog_unit)
                             if isinstance(rst, dict):
                                 wd = ServiceState(
-                                    name="acnh-aircheck-watchdog.service",
+                                    name=prof.watchdog_unit,
                                     active=str(rst.get("active") or "?"),
                                     sub=str(rst.get("sub") or "?"),
                                     since=str(rst.get("since") or ""),
                                 )
                         if wd is None:
                             if ssh_target and remote_stream:
-                                wd = ServiceState(name="acnh-aircheck-watchdog.service", active="CONNECT", sub="-", since="")
+                                wd = ServiceState(name=prof.watchdog_unit, active="CONNECT", sub="-", since="")
                             else:
-                                wd = _systemctl_state("acnh-aircheck-watchdog.service", ssh_target=ssh_target)
+                                wd = _systemctl_state(prof.watchdog_unit, ssh_target=ssh_target, user=prof.user_units)
                         wd_active = wd.active == "active"
                         # No systemd (local run, e.g. macOS): the log monitor is up when its
                         # status file is fresh and the PID it recorded is alive.

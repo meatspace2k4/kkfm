@@ -572,7 +572,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             out_dir=args.out_dir,
             refresh_s=float(args.refresh),
             ssh_target=ssh_target,
-            stream_port=int(getattr(args, "stream_port", 9000)),
+            stream_port=getattr(args, "stream_port", None),
+            profile=str(getattr(args, "profile", "radio")),
         )
     )
 
@@ -712,8 +713,14 @@ def main() -> int:
     p.add_argument(
         "--stream-port",
         type=int,
-        default=9000,
-        help="Port the aircheck stream server listens on, for the 'p' play toggle",
+        default=None,
+        help="Port of the stream server for the 'p'/'s' chips (default: the profile's port)",
+    )
+    p.add_argument(
+        "--profile",
+        choices=["radio", "hourly"],
+        default="radio",
+        help="Service set to watch: radio (acnh-aircheck*, port 9000) or hourly (acnh-hourly* user units, port 8791)",
     )
     p.set_defaults(func=cmd_dashboard)
 
