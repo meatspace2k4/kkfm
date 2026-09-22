@@ -9,11 +9,11 @@
  *
  * Behaviour:
  *  - hour of day (local wall clock, 0..23) selects BGM_24Hour_HH_<Weather>.bwav
- *  - <Weather> is the in-memory SLC "now" observation (Sunny/Rainy/Snowy),
- *    refreshed at :14 :29 :44 :59; a refresh never changes the playing track
- *  - the track plays from frame 0 and loops in the Decoder until the hour
- *    changes; then the Decoder's radio fade is armed for the next loop hit,
- *    the track ends, 1 s of silence follows, and the next hour's file starts
+ *  - <Weather> comes from Apple WeatherKit for SLC, refreshed at :14 :29 :44 :59
+ *    for the 15-minute block starting at the coming quarter
+ *  - the track plays from frame 0 and loops in the Decoder until the hour or
+ *    the block's weather changes; then the Decoder's radio fade is armed for the
+ *    next loop hit, the track ends, 1 s of silence follows, and the new file starts
  */
 #pragma once
 
@@ -56,105 +56,220 @@ inline bool weather_from_name(const std::string& s, Weather& out) {
     return false;
 }
 
-// Game weather from measured precipitation only (no weather-code forecast):
-// any snowfall -> Snowy, any other precipitation -> Rainy, none -> Sunny.
-inline Weather weather_from_precip(double precipitation_mm, double rain_mm, double snowfall_cm) {
-    if (snowfall_cm > 0.0) return Weather::Snowy;
-    if (rain_mm > 0.0 || precipitation_mm > 0.0) return Weather::Rainy;
-    return Weather::Sunny;
-}
-
+// ---------------------------------------------------------------------------
+// Apple WeatherKit (REST): https://weatherkit.apple.com/api/v1/weather/...
+// dataSets=forecastNextHour gives minute-by-minute precipitation chance and
+// intensity plus summary periods with a condition (clear / precipitation /
+// rain / snow). The pick uses the 15-minute block that starts at the coming
+// quarter: any precipitation chance or intensity in it counts as precipitation;
+// Snowy when a summary period covering it says snow, else Rainy; else Sunny.
+// ---------------------------------------------------------------------------
 struct WeatherObservation {
     bool valid = false;
     Weather weather = Weather::Sunny;
-    double precipitation_mm = 0.0;
-    double rain_mm = 0.0;
-    double snowfall_cm = 0.0;
-    std::string time;   // label of the 15-minute block used (local ISO time)
+    double max_chance = 0.0;        // 0..1, max precipitationChance over the block
+    double max_intensity = 0.0;     // mm/h, max precipitationIntensity over the block
+    std::string condition;          // summary condition covering the block
+    std::time_t block_start = 0;    // epoch seconds, block = [start, start+900)
 };
 
 // Salt Lake City proper (city centre), not South Salt Lake / West Valley.
 constexpr double SLC_LATITUDE  = 40.7608;
 constexpr double SLC_LONGITUDE = -111.8910;
 
-// 15-minute blocks; each value is the sum over the 15 minutes PRECEDING its time
-// label, so the block covering [T, T+15) carries the label T+15.
-inline std::string open_meteo_url() {
+inline std::string weatherkit_url() {
     char buf[512];
     std::snprintf(buf, sizeof(buf),
-                  "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
-                  "&minutely_15=precipitation,rain,snowfall&past_minutely_15=1&forecast_minutely_15=4"
-                  "&timezone=America%%2FDenver",
+                  "https://weatherkit.apple.com/api/v1/weather/en/%.4f/%.4f"
+                  "?dataSets=forecastNextHour&timezone=America/Denver&countryCode=US",
                   SLC_LATITUDE, SLC_LONGITUDE);
     return std::string(buf);
 }
 
-// Label of the block that follows the refresh: a refresh at :14 (one minute before
-// the quarter) targets [:15, :30), labelled :30. Same for :29 -> :45, :44 -> :00,
-// :59 -> :15. Any other minute targets the block after the next quarter boundary.
-inline std::string next_block_label(const std::tm& now) {
+// Start of the block that follows the refresh: a refresh at :14 (one minute before
+// the quarter) targets [:15, :30); :29 -> :30, :44 -> :45, :59 -> :00. Any other
+// minute targets the block starting at the next quarter boundary.
+inline std::time_t next_block_start(const std::tm& now) {
     std::tm t = now;
     t.tm_sec = 0;
     t.tm_isdst = -1;
     int m = t.tm_min + 1;                 // one minute ahead: :14 -> :15
-    int q = ((m + 14) / 15) * 15;         // ceil to the quarter
-    t.tm_min = q + 15;                    // end of the block that starts there
-    std::time_t tt = std::mktime(&t);
-    std::tm out{};
-    if (std::tm* p = std::localtime(&tt)) out = *p;
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d",
-                  out.tm_year + 1900, out.tm_mon + 1, out.tm_mday, out.tm_hour, out.tm_min);
-    return std::string(buf);
+    t.tm_min = ((m + 14) / 15) * 15;      // ceil to the quarter
+    return std::mktime(&t);
 }
 
-// Pull one block out of the "minutely_15" arrays by its time label. Anything
-// malformed or a missing label yields false and leaves `out` untouched.
-inline bool parse_open_meteo_block(const std::string& json, const std::string& label, WeatherObservation& out) {
-    size_t sec = json.find("\"minutely_15\":{");
-    if (sec == std::string::npos) sec = json.find("\"minutely_15\": {");
-    if (sec == std::string::npos) return false;
-    size_t open = json.find('{', sec);
-    size_t close = json.find('}', open);
-    if (open == std::string::npos || close == std::string::npos) return false;
-    std::string obj = json.substr(open, close - open + 1);
+// "2026-09-22T23:15:00Z" -> epoch seconds (UTC).
+inline bool parse_iso_utc(const std::string& s, std::time_t& out) {
+    std::tm t{};
+    int y, mo, d, h, mi, se = 0;
+    if (std::sscanf(s.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &se) < 5) return false;
+    t.tm_year = y - 1900; t.tm_mon = mo - 1; t.tm_mday = d; t.tm_hour = h; t.tm_min = mi; t.tm_sec = se;
+    out = timegm(&t);
+    return true;
+}
 
-    auto array_of = [&](const char* key) -> std::vector<std::string> {
-        std::vector<std::string> v;
-        std::regex re(std::string("\"") + key + "\"\\s*:\\s*\\[([^\\]]*)\\]");
-        std::smatch m;
-        if (!std::regex_search(obj, m, re)) return v;
-        std::string body = m[1].str();
-        size_t pos = 0;
-        while (pos <= body.size()) {
-            size_t comma = body.find(',', pos);
-            std::string item = trim(body.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
-            v.push_back(item);
-            if (comma == std::string::npos) break;
-            pos = comma + 1;
-        }
-        return v;
-    };
-
-    auto times = array_of("time");
-    auto precip = array_of("precipitation");
-    auto rain = array_of("rain");
-    auto snow = array_of("snowfall");
-    for (size_t i = 0; i < times.size(); ++i) {
-        if (times[i] != label) continue;
-        if (i >= precip.size() || i >= rain.size() || i >= snow.size()) return false;
-        if (precip[i] == "null" || rain[i] == "null" || snow[i] == "null" || precip[i].empty()) return false;
-        WeatherObservation o;
-        o.precipitation_mm = std::atof(precip[i].c_str());
-        o.rain_mm = std::atof(rain[i].c_str());
-        o.snowfall_cm = std::atof(snow[i].c_str());
-        o.time = label;
-        o.weather = weather_from_precip(o.precipitation_mm, o.rain_mm, o.snowfall_cm);
-        o.valid = true;
-        out = o;
-        return true;
+// Objects of a flat JSON array `"key":[{...},{...}]` (objects without nested braces).
+inline std::vector<std::string> json_array_objects(const std::string& json, const char* key) {
+    std::vector<std::string> out;
+    std::string needle = std::string("\"") + key + "\"";
+    size_t k = json.find(needle);
+    if (k == std::string::npos) return out;
+    size_t lb = json.find('[', k);
+    if (lb == std::string::npos) return out;
+    size_t pos = lb + 1;
+    while (pos < json.size()) {
+        size_t ob = json.find_first_of("{]", pos);
+        if (ob == std::string::npos || json[ob] == ']') break;
+        size_t cb = json.find('}', ob);
+        if (cb == std::string::npos) break;
+        out.push_back(json.substr(ob, cb - ob + 1));
+        pos = cb + 1;
     }
-    return false;
+    return out;
+}
+
+inline bool json_num(const std::string& obj, const char* key, double& v) {
+    std::regex re(std::string("\"") + key + "\"\\s*:\\s*(-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)");
+    std::smatch m;
+    if (!std::regex_search(obj, m, re)) return false;
+    v = std::atof(m[1].str().c_str());
+    return true;
+}
+
+inline bool json_str(const std::string& obj, const char* key, std::string& v) {
+    std::regex re(std::string("\"") + key + "\"\\s*:\\s*\"([^\"]*)\"");
+    std::smatch m;
+    if (!std::regex_search(obj, m, re)) return false;
+    v = m[1].str();
+    return true;
+}
+
+// Evaluate the block [start, start+900) from a WeatherKit forecastNextHour response.
+inline bool parse_weatherkit_block(const std::string& json, std::time_t start, WeatherObservation& out) {
+    if (json.find("\"forecastNextHour\"") == std::string::npos) return false;
+    const std::time_t end = start + 900;
+    WeatherObservation o;
+    o.block_start = start;
+    int minutes_in_block = 0;
+    for (const auto& obj : json_array_objects(json, "minutes")) {
+        std::string ts;
+        std::time_t t;
+        if (!json_str(obj, "startTime", ts) || !parse_iso_utc(ts, t)) continue;
+        if (t < start || t >= end) continue;
+        double chance = 0, intensity = 0;
+        json_num(obj, "precipitationChance", chance);
+        json_num(obj, "precipitationIntensity", intensity);
+        o.max_chance = std::max(o.max_chance, chance);
+        o.max_intensity = std::max(o.max_intensity, intensity);
+        minutes_in_block++;
+    }
+    if (minutes_in_block == 0) return false;   // block not covered by the forecast
+    for (const auto& obj : json_array_objects(json, "summary")) {
+        std::string ts, te, cond;
+        std::time_t t0, t1 = end;
+        if (!json_str(obj, "startTime", ts) || !parse_iso_utc(ts, t0)) continue;
+        if (json_str(obj, "endTime", te)) parse_iso_utc(te, t1);
+        json_str(obj, "condition", cond);
+        if (t0 < end && t1 > start) {          // overlaps the block
+            if (o.condition.empty() || cond == "snow" || (cond != "clear" && o.condition == "clear")) o.condition = cond;
+        }
+    }
+    bool precip = o.max_chance > 0.0 || o.max_intensity > 0.0;
+    if (!precip) o.weather = Weather::Sunny;
+    else if (o.condition == "snow") o.weather = Weather::Snowy;
+    else o.weather = Weather::Rainy;
+    o.valid = true;
+    out = o;
+    return true;
+}
+
+// --- WeatherKit auth: ES256 JWT signed with the developer key (.p8) via the openssl CLI.
+inline std::string base64url(const std::string& in) {
+    static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    size_t i = 0;
+    while (i + 2 < in.size()) {
+        uint32_t n = ((uint8_t)in[i] << 16) | ((uint8_t)in[i + 1] << 8) | (uint8_t)in[i + 2];
+        out += tbl[(n >> 18) & 63]; out += tbl[(n >> 12) & 63]; out += tbl[(n >> 6) & 63]; out += tbl[n & 63];
+        i += 3;
+    }
+    if (i + 1 == in.size()) {
+        uint32_t n = ((uint8_t)in[i] << 16);
+        out += tbl[(n >> 18) & 63]; out += tbl[(n >> 12) & 63];
+    } else if (i + 2 == in.size()) {
+        uint32_t n = ((uint8_t)in[i] << 16) | ((uint8_t)in[i + 1] << 8);
+        out += tbl[(n >> 18) & 63]; out += tbl[(n >> 12) & 63]; out += tbl[(n >> 6) & 63];
+    }
+    return out;
+}
+
+// DER ECDSA signature (SEQUENCE { INTEGER r, INTEGER s }) -> raw 64-byte r||s for ES256.
+inline bool ecdsa_der_to_raw(const std::string& der, std::string& raw) {
+    size_t p = 0;
+    auto byte = [&](uint8_t& b) { if (p >= der.size()) return false; b = (uint8_t)der[p++]; return true; };
+    uint8_t tag, len;
+    if (!byte(tag) || tag != 0x30 || !byte(len)) return false;
+    if (len & 0x80) { size_t nl = len & 0x7F; p += nl; }
+    std::string parts[2];
+    for (int k = 0; k < 2; ++k) {
+        uint8_t il;
+        if (!byte(tag) || tag != 0x02 || !byte(il)) return false;
+        if (p + il > der.size()) return false;
+        std::string v = der.substr(p, il);
+        p += il;
+        while (v.size() > 32 && v[0] == '\0') v.erase(0, 1);
+        if (v.size() > 32) return false;
+        parts[k] = std::string(32 - v.size(), '\0') + v;
+    }
+    raw = parts[0] + parts[1];
+    return true;
+}
+
+struct WeatherKitCreds {
+    std::string key_file;    // AuthKey_XXXXXXXXXX.p8
+    std::string key_id;      // 10-char key identifier
+    std::string team_id;     // Apple Developer team ID
+    std::string service_id;  // WeatherKit service identifier (e.g. com.example.weatherkit-client)
+    bool complete() const { return !key_file.empty() && !key_id.empty() && !team_id.empty() && !service_id.empty(); }
+};
+
+inline WeatherKitCreds weatherkit_creds_from_env() {
+    WeatherKitCreds c;
+    if (const char* v = std::getenv("HOURLY_WK_KEY_FILE")) c.key_file = v;
+    if (const char* v = std::getenv("HOURLY_WK_KEY_ID")) c.key_id = v;
+    if (const char* v = std::getenv("HOURLY_WK_TEAM_ID")) c.team_id = v;
+    if (const char* v = std::getenv("HOURLY_WK_SERVICE_ID")) c.service_id = v;
+    return c;
+}
+
+inline std::string jwt_signing_input(const WeatherKitCreds& c, std::time_t now, int ttl_s = 3600) {
+    std::string header = "{\"alg\":\"ES256\",\"kid\":\"" + c.key_id + "\",\"id\":\"" + c.team_id + "." + c.service_id + "\"}";
+    std::string payload = "{\"iss\":\"" + c.team_id + "\",\"iat\":" + std::to_string((long long)now) +
+                          ",\"exp\":" + std::to_string((long long)(now + ttl_s)) + ",\"sub\":\"" + c.service_id + "\"}";
+    return base64url(header) + "." + base64url(payload);
+}
+
+// Signs `input` with the .p8 key through `openssl dgst -sha256 -sign`; "" on failure.
+inline std::string es256_sign(const std::string& input, const std::string& key_file) {
+    // base64url output is [A-Za-z0-9._-] only, so single-quoting is safe.
+    std::string cmd = "printf %s '" + input + "' | openssl dgst -sha256 -sign '" + key_file + "' -binary 2>/dev/null";
+    FILE* f = popen(cmd.c_str(), "r");
+    if (!f) return "";
+    std::string der;
+    char buf[256];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) der.append(buf, n);
+    if (pclose(f) != 0) return "";
+    std::string raw;
+    if (!ecdsa_der_to_raw(der, raw)) return "";
+    return base64url(raw);
+}
+
+inline std::string weatherkit_jwt(const WeatherKitCreds& c, std::time_t now) {
+    std::string input = jwt_signing_input(c, now);
+    std::string sig = es256_sign(input, c.key_file);
+    if (sig.empty()) return "";
+    return input + "." + sig;
 }
 
 // Refresh cadence: every 15 minutes, one minute early (:14 :29 :44 :59).
@@ -168,8 +283,9 @@ inline bool weather_refresh_due(const std::tm& now, int last_slot) {
 }
 
 // Runs `curl` (present on the Mac and the Pi) and returns the body, or "" on failure.
-inline std::string http_get_via_curl(const std::string& url, int timeout_s = 15) {
-    std::string cmd = "curl -sS --max-time " + std::to_string(timeout_s) + " '" + url + "' 2>/dev/null";
+inline std::string http_get_via_curl(const std::string& url, int timeout_s = 15, const std::string& bearer = "") {
+    std::string auth = bearer.empty() ? "" : (" -H 'Authorization: Bearer " + bearer + "'");
+    std::string cmd = "curl -sS --fail --max-time " + std::to_string(timeout_s) + auth + " '" + url + "' 2>/dev/null";
     FILE* f = popen(cmd.c_str(), "r");
     if (!f) return "";
     std::string body;
@@ -181,21 +297,33 @@ inline std::string http_get_via_curl(const std::string& url, int timeout_s = 15)
     return body;
 }
 
-// In-memory weather for the upcoming 15-minute block. The pick reads current(); it never fetches.
+// In-memory weather for the upcoming 15-minute block (Apple WeatherKit). The pick reads current(); it never fetches.
 class WeatherState {
     mutable std::mutex mut;
     WeatherObservation obs;
     bool has_override = false;
     Weather override_w = Weather::Sunny;
-    std::string url;
-    std::function<std::string(const std::string&)> fetcher;
+    // Returns the raw WeatherKit response for the request made at `now`.
+    std::function<std::string(std::time_t)> fetcher;
 
 public:
-    WeatherState()
-        : url(open_meteo_url()), fetcher([](const std::string& u) { return http_get_via_curl(u); }) {}
+    WeatherState() {
+        WeatherKitCreds c = weatherkit_creds_from_env();
+        fetcher = [c](std::time_t now) -> std::string {
+            if (!c.complete()) {
+                log_error("[HOURLY] WeatherKit credentials missing (HOURLY_WK_KEY_FILE, HOURLY_WK_KEY_ID, HOURLY_WK_TEAM_ID, HOURLY_WK_SERVICE_ID)");
+                return "";
+            }
+            std::string jwt = weatherkit_jwt(c, now);
+            if (jwt.empty()) {
+                log_error("[HOURLY] WeatherKit JWT signing failed (key file " + c.key_file + ")");
+                return "";
+            }
+            return http_get_via_curl(weatherkit_url(), 15, jwt);
+        };
+    }
 
-    void set_url(const std::string& u) { std::lock_guard<std::mutex> l(mut); url = u; }
-    void set_fetcher(std::function<std::string(const std::string&)> f) { std::lock_guard<std::mutex> l(mut); fetcher = std::move(f); }
+    void set_fetcher(std::function<std::string(std::time_t)> f) { std::lock_guard<std::mutex> l(mut); fetcher = std::move(f); }
     void set_override(Weather w) { std::lock_guard<std::mutex> l(mut); has_override = true; override_w = w; }
     bool overridden() const { std::lock_guard<std::mutex> l(mut); return has_override; }
 
@@ -206,24 +334,29 @@ public:
     }
     WeatherObservation observation() const { std::lock_guard<std::mutex> l(mut); return obs; }
 
-    // Fetch and replace the in-memory observation with the precipitation of the
-    // 15-minute block that follows `now` (see next_block_label). On any failure the
-    // previous observation is kept and false is returned.
+    // Fetch WeatherKit and replace the in-memory observation with the 15-minute block
+    // that follows `now` (see next_block_start). On any failure the previous
+    // observation is kept and false is returned.
     bool refresh(const std::tm& now) {
-        std::string u;
-        std::function<std::string(const std::string&)> f;
-        { std::lock_guard<std::mutex> l(mut); u = url; f = fetcher; }
-        std::string body = f ? f(u) : "";
-        std::string label = next_block_label(now);
+        std::function<std::string(std::time_t)> f;
+        { std::lock_guard<std::mutex> l(mut); f = fetcher; }
+        std::tm copy = now;
+        copy.tm_isdst = -1;
+        std::time_t now_t = std::mktime(&copy);
+        std::string body = f ? f(now_t) : "";
+        std::time_t start = next_block_start(now);
         WeatherObservation o;
-        if (body.empty() || !parse_open_meteo_block(body, label, o)) {
+        if (body.empty() || !parse_weatherkit_block(body, start, o)) {
             log_error("[HOURLY] Weather fetch failed; keeping previous observation");
             return false;
         }
         { std::lock_guard<std::mutex> l(mut); obs = o; }
+        std::tm lt{};
+        if (std::tm* p = std::localtime(&start)) lt = *p;
         log_info_f(C_YELLOW "[HOURLY] " C_RESET "Weather fetched: " C_BOLD "%s" C_RESET
-                   " (block ending %s: precip=%.2fmm rain=%.2fmm snow=%.2fcm)",
-                   weather_name(o.weather), o.time.c_str(), o.precipitation_mm, o.rain_mm, o.snowfall_cm);
+                   " (block %02d:%02d-%02d:%02d: chance=%.0f%% intensity=%.2fmm/h condition=%s)",
+                   weather_name(o.weather), lt.tm_hour, lt.tm_min, lt.tm_hour + (lt.tm_min + 15) / 60, (lt.tm_min + 15) % 60,
+                   o.max_chance * 100.0, o.max_intensity, o.condition.empty() ? "?" : o.condition.c_str());
         return true;
     }
 };

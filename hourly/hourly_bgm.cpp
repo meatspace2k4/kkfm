@@ -10,7 +10,8 @@
  * Same env as the radio: ACNH_STREAM_PORT, ACNH_LOCALHOST_ONLY, ACNH_AUDIO_DEVICE,
  * ACNH_AUDIO_DEVICE_INDEX, ACNH_DISABLE_DAC, ACNH_DEBUG.
  * Fork env: HOURLY_SOUND_DIR (default hourly/Stream), HOURLY_HEARTBEAT_S,
- * HOURLY_WEATHER_OVERRIDE=Sunny|Rainy|Snowy, HOURLY_WEATHER_URL,
+ * HOURLY_WEATHER_OVERRIDE=Sunny|Rainy|Snowy,
+ * WeatherKit: HOURLY_WK_KEY_FILE, HOURLY_WK_KEY_ID, HOURLY_WK_TEAM_ID, HOURLY_WK_SERVICE_ID,
  * test hooks HOURLY_TEST_LOOPS_BEFORE_SWITCH, HOURLY_TEST_MAX_TRACKS, HOURLY_WAV_DUMP.
  */
 #include "hourly_core.h"
@@ -128,7 +129,6 @@ int main(int argc, char** argv) {
     bool localhost_only = env_truthy(std::getenv("ACNH_LOCALHOST_ONLY"));
 
     hourly::WeatherState weather;
-    if (const char* u = std::getenv("HOURLY_WEATHER_URL")) if (*u) weather.set_url(u);
     if (const char* ov = std::getenv("HOURLY_WEATHER_OVERRIDE")) {
         hourly::Weather w;
         if (hourly::weather_from_name(ov, w)) {

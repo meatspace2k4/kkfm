@@ -87,76 +87,163 @@ static void test_hour_title() {
 // ---------------------------------------------------------------------------
 // Weather
 // ---------------------------------------------------------------------------
-// minutely_15 response with the given block labels; precipitation per label.
-struct Block { const char* label; double precip, rain, snow; };
-static std::string minutely_json(std::initializer_list<Block> blocks) {
-    std::string t, p, r, sn;
-    for (const auto& b : blocks) {
-        if (!t.empty()) { t += ","; p += ","; r += ","; sn += ","; }
-        t += std::string("\"") + b.label + "\"";
-        p += std::to_string(b.precip); r += std::to_string(b.rain); sn += std::to_string(b.snow);
+// WeatherKit forecastNextHour response: 60 minutes from `first` (epoch), chance per
+// minute from `chance_at(i)`, and summary periods (offset minutes, condition).
+static std::string iso_utc(std::time_t t) {
+    std::tm g{};
+    gmtime_r(&t, &g);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:00Z", g.tm_year + 1900, g.tm_mon + 1, g.tm_mday, g.tm_hour, g.tm_min);
+    return buf;
+}
+static std::string wk_json(std::time_t first, std::function<double(int)> chance_at,
+                           std::vector<std::pair<int, std::string>> summary = {{0, "clear"}},
+                           std::function<double(int)> intensity_at = [](int) { return 0.0; }) {
+    std::string mins;
+    for (int i = 0; i < 60; ++i) {
+        if (i) mins += ",";
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "{\"startTime\":\"%s\",\"precipitationChance\":%.2f,\"precipitationIntensity\":%.2f}",
+                      iso_utc(first + i * 60).c_str(), chance_at(i), intensity_at(i));
+        mins += buf;
     }
-    return "{\"latitude\":40.746216,\"timezone\":\"America/Denver\","
-           "\"minutely_15_units\":{\"time\":\"iso8601\",\"precipitation\":\"mm\",\"rain\":\"mm\",\"snowfall\":\"cm\"},"
-           "\"minutely_15\":{\"time\":[" + t + "],\"precipitation\":[" + p + "],\"rain\":[" + r + "],\"snowfall\":[" + sn + "]}}";
+    std::string sum;
+    for (size_t k = 0; k < summary.size(); ++k) {
+        if (k) sum += ",";
+        sum += "{\"startTime\":\"" + iso_utc(first + summary[k].first * 60) + "\"";
+        if (k + 1 < summary.size()) sum += ",\"endTime\":\"" + iso_utc(first + summary[k + 1].first * 60) + "\"";
+        sum += ",\"condition\":\"" + summary[k].second + "\",\"precipitationChance\":0.0,\"precipitationIntensity\":0.0}";
+    }
+    return "{\"forecastNextHour\":{\"name\":\"NextHourForecast\",\"metadata\":{\"attributionURL\":\"x\",\"version\":1},"
+           "\"summary\":[" + sum + "],\"forecastStart\":\"" + iso_utc(first) + "\",\"minutes\":[" + mins + "]}}";
 }
+static std::time_t local_epoch(int hour, int minute) { std::tm t = make_tm(hour, minute); t.tm_isdst = -1; return std::mktime(&t); }
 
-static void test_weather_from_precip() {
-    ASSERT(weather_from_precip(0, 0, 0) == Weather::Sunny);
-    ASSERT(weather_from_precip(0.1, 0.1, 0) == Weather::Rainy);
-    ASSERT(weather_from_precip(0.2, 0, 0) == Weather::Rainy);     // showers/drizzle count via total
-    ASSERT(weather_from_precip(0.7, 0, 0.5) == Weather::Snowy);
-    ASSERT(weather_from_precip(1.0, 0.8, 0.1) == Weather::Snowy); // any snow wins
-}
-
-static void test_next_block_label() {
+static void test_next_block_start() {
     // One minute before each quarter targets the block that starts at that quarter.
-    ASSERT_STREQ(next_block_label(make_tm(12, 14)), "2026-09-20T12:30");   // [12:15, 12:30)
-    ASSERT_STREQ(next_block_label(make_tm(12, 29)), "2026-09-20T12:45");
-    ASSERT_STREQ(next_block_label(make_tm(12, 44)), "2026-09-20T13:00");
-    ASSERT_STREQ(next_block_label(make_tm(12, 59)), "2026-09-20T13:15");   // [13:00, 13:15)
-    ASSERT_STREQ(next_block_label(make_tm(23, 59)), "2026-09-21T00:15");   // day wrap
-    ASSERT_STREQ(next_block_label(make_tm(12, 5)),  "2026-09-20T12:30");   // startup mid-block
+    ASSERT(next_block_start(make_tm(12, 14)) == local_epoch(12, 15));
+    ASSERT(next_block_start(make_tm(12, 29)) == local_epoch(12, 30));
+    ASSERT(next_block_start(make_tm(12, 44)) == local_epoch(12, 45));
+    ASSERT(next_block_start(make_tm(12, 59)) == local_epoch(13, 0));
+    ASSERT(next_block_start(make_tm(12, 5))  == local_epoch(12, 15));   // startup mid-block
+    ASSERT(next_block_start(make_tm(23, 59)) == local_epoch(23, 59) + 60);  // day wrap
 }
 
-static void test_parse_block_picks_the_next_block_not_the_current() {
-    // Sunny now, rainy in the next block: the next block wins.
-    std::string j = minutely_json({{"2026-09-20T12:15", 0, 0, 0}, {"2026-09-20T12:30", 0.4, 0.4, 0}, {"2026-09-20T12:45", 0, 0, 0}});
+static void test_weatherkit_next_block_not_current() {
+    std::time_t t0 = local_epoch(12, 14);
+    // Dry now, 15% chance only from 12:20: the next block [12:15, 12:30) is precipitation.
+    std::string j = wk_json(t0, [](int i) { return i >= 6 ? 0.15 : 0.0; });
     WeatherObservation o;
-    ASSERT(parse_open_meteo_block(j, "2026-09-20T12:30", o));
+    ASSERT(parse_weatherkit_block(j, local_epoch(12, 15), o));
     ASSERT(o.weather == Weather::Rainy);
-    ASSERT_STREQ(o.time, "2026-09-20T12:30");
-    ASSERT(parse_open_meteo_block(j, "2026-09-20T12:15", o));
+    ASSERT(std::fabs(o.max_chance - 0.15) < 1e-9);
+    // Any chance above zero counts, however small.
+    j = wk_json(t0, [](int i) { return i == 10 ? 0.01 : 0.0; });
+    ASSERT(parse_weatherkit_block(j, local_epoch(12, 15), o));
+    ASSERT(o.weather == Weather::Rainy);
+    // 0% for the whole block: Sunny, even if precipitation comes after it.
+    j = wk_json(t0, [](int i) { return i >= 16 ? 0.9 : 0.0; });
+    ASSERT(parse_weatherkit_block(j, local_epoch(12, 15), o));
     ASSERT(o.weather == Weather::Sunny);
-    std::string snow = minutely_json({{"2026-01-01T03:15", 0.7, 0, 0.98}});
-    ASSERT(parse_open_meteo_block(snow, "2026-01-01T03:15", o));
-    ASSERT(o.weather == Weather::Snowy);
-    ASSERT(std::fabs(o.snowfall_cm - 0.98) < 1e-6);
+    // Intensity without a chance value still counts.
+    j = wk_json(t0, [](int) { return 0.0; }, {{0, "rain"}}, [](int i) { return i == 3 ? 0.4 : 0.0; });
+    ASSERT(parse_weatherkit_block(j, local_epoch(12, 15), o));
+    ASSERT(o.weather == Weather::Rainy);
 }
 
-static void test_parse_block_garbage_keeps_previous() {
+static void test_weatherkit_snow_from_summary() {
+    std::time_t t0 = local_epoch(12, 14);
+    std::string j = wk_json(t0, [](int) { return 0.3; }, {{0, "clear"}, {5, "snow"}, {40, "clear"}});
+    WeatherObservation o;
+    ASSERT(parse_weatherkit_block(j, local_epoch(12, 15), o));
+    ASSERT(o.weather == Weather::Snowy);
+    ASSERT_STREQ(o.condition, "snow");
+    j = wk_json(t0, [](int) { return 0.3; }, {{0, "precipitation"}});
+    ASSERT(parse_weatherkit_block(j, local_epoch(12, 15), o));
+    ASSERT(o.weather == Weather::Rainy);
+}
+
+static void test_weatherkit_garbage_keeps_previous() {
     WeatherObservation o;
     o.valid = true; o.weather = Weather::Rainy;
-    ASSERT(!parse_open_meteo_block("", "2026-09-20T12:30", o));
-    ASSERT(!parse_open_meteo_block("<html>502</html>", "2026-09-20T12:30", o));
-    ASSERT(!parse_open_meteo_block("{\"error\":true,\"reason\":\"x\"}", "2026-09-20T12:30", o));
-    ASSERT(!parse_open_meteo_block(minutely_json({{"2026-09-20T12:15", 0, 0, 0}}), "2026-09-20T12:30", o));  // label missing
-    ASSERT(!parse_open_meteo_block("{\"minutely_15\":{\"time\":[\"2026-09-20T12:30\"],\"precipitation\":[null],\"rain\":[null],\"snowfall\":[null]}}",
-                                   "2026-09-20T12:30", o));
+    ASSERT(!parse_weatherkit_block("", local_epoch(12, 15), o));
+    ASSERT(!parse_weatherkit_block("<html>401</html>", local_epoch(12, 15), o));
+    ASSERT(!parse_weatherkit_block("{\"reason\":\"NOT_ENABLED\"}", local_epoch(12, 15), o));
+    // Forecast that does not cover the block.
+    ASSERT(!parse_weatherkit_block(wk_json(local_epoch(14, 0), [](int) { return 0.5; }), local_epoch(12, 15), o));
     ASSERT(o.weather == Weather::Rainy);
 }
 
 static void test_weather_state_refresh_and_failure() {
     WeatherState ws;
     ASSERT(ws.current() == Weather::Sunny);                 // before any fetch
-    ws.set_fetcher([](const std::string&) { return minutely_json({{"2026-09-20T12:15", 0, 0, 0}, {"2026-09-20T12:30", 0.4, 0.4, 0}}); });
+    ws.set_fetcher([](std::time_t now) { return wk_json(now, [](int i) { return i > 2 ? 0.2 : 0.0; }); });
     ASSERT(ws.refresh(make_tm(12, 14)));
     ASSERT(ws.current() == Weather::Rainy);
-    ws.set_fetcher([](const std::string&) { return std::string(""); });
+    ws.set_fetcher([](std::time_t) { return std::string(""); });
     ASSERT(!ws.refresh(make_tm(12, 29)));
     ASSERT(ws.current() == Weather::Rainy);                 // previous kept
     ws.set_override(Weather::Snowy);
     ASSERT(ws.current() == Weather::Snowy);
+}
+
+static void test_base64url_and_der_to_raw() {
+    ASSERT_STREQ(base64url("f"), "Zg");
+    ASSERT_STREQ(base64url("fo"), "Zm8");
+    ASSERT_STREQ(base64url("foo"), "Zm9v");
+    ASSERT_STREQ(base64url(std::string("\xfb\xff", 2)), "-_8");
+    // r with a leading 0x00 pad (33 bytes), s short (31 bytes).
+    std::string r(32, '\x81'), sv(31, '\x02');
+    std::string der = std::string("\x30\x44\x02\x21\x00", 5) + r + std::string("\x02\x1f", 2) + sv;
+    std::string raw;
+    ASSERT(ecdsa_der_to_raw(der, raw));
+    ASSERT_EQ((int)raw.size(), 64);
+    ASSERT(raw.substr(0, 32) == r);
+    ASSERT(raw.substr(32) == std::string(1, '\0') + sv);
+}
+
+// Real ES256 signature with a throwaway P-256 key; verified by openssl against the public key.
+static void test_weatherkit_jwt_signature_verifies() {
+    std::string dir = out_dir();
+    std::string key = dir + "/wk_test_key.p8", pub = dir + "/wk_test_pub.pem";
+    std::string gen = "openssl ecparam -name prime256v1 -genkey -noout 2>/dev/null | openssl pkcs8 -topk8 -nocrypt -out '" + key +
+                      "' 2>/dev/null && openssl ec -in '" + key + "' -pubout -out '" + pub + "' 2>/dev/null";
+    ASSERT(std::system(gen.c_str()) == 0);
+    WeatherKitCreds c{key, "ABC123DEFG", "TEAM123456", "com.example.weatherkit"};
+    std::string jwt = weatherkit_jwt(c, 1789000000);
+    size_t d1 = jwt.find('.'), d2 = jwt.rfind('.');
+    ASSERT(d1 != std::string::npos && d2 != d1);
+    std::string input = jwt.substr(0, d2), sig = jwt.substr(d2 + 1);
+    ASSERT_EQ((int)sig.size(), 86);                          // 64 raw bytes, base64url, no padding
+    ASSERT_STREQ(jwt.substr(0, d1), base64url("{\"alg\":\"ES256\",\"kid\":\"ABC123DEFG\",\"id\":\"TEAM123456.com.example.weatherkit\"}"));
+    // raw r||s back to DER, then openssl verifies.
+    std::string raw;
+    {
+        std::string b64 = sig;
+        for (auto& ch : b64) { if (ch == '-') ch = '+'; else if (ch == '_') ch = '/'; }
+        while (b64.size() % 4) b64 += '=';
+        std::string cmd = "printf %s '" + b64 + "' | openssl base64 -d -A";
+        FILE* f = popen(cmd.c_str(), "r");
+        char buf[128]; size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) raw.append(buf, n);
+        pclose(f);
+    }
+    ASSERT_EQ((int)raw.size(), 64);
+    auto der_int = [](std::string v) {
+        while (v.size() > 1 && v[0] == '\0' && !((uint8_t)v[1] & 0x80)) v.erase(0, 1);
+        if ((uint8_t)v[0] & 0x80) v = std::string(1, '\0') + v;
+        return std::string("\x02", 1) + (char)v.size() + v;
+    };
+    std::string body = der_int(raw.substr(0, 32)) + der_int(raw.substr(32));
+    std::string der = std::string("\x30", 1) + (char)body.size() + body;
+    std::ofstream(dir + "/wk_sig.der", std::ios::binary) << der;
+    std::ofstream(dir + "/wk_input.txt", std::ios::binary) << input;
+    std::string verify = "openssl dgst -sha256 -verify '" + pub + "' -signature '" + dir + "/wk_sig.der' '" + dir + "/wk_input.txt' 2>&1";
+    FILE* f = popen(verify.c_str(), "r");
+    std::string out; char buf[128]; size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    pclose(f);
+    ASSERT(out.find("Verified OK") != std::string::npos);
 }
 
 static void test_refresh_slots_one_minute_early() {
@@ -183,13 +270,11 @@ static void test_refresh_slots_one_minute_early() {
     ASSERT(!weather_refresh_due(make_tm(23, 59), last));
 }
 
-static void test_open_meteo_url_targets_slc_proper() {
-    std::string u = open_meteo_url();
-    ASSERT(u.find("latitude=40.7608") != std::string::npos);
-    ASSERT(u.find("longitude=-111.8910") != std::string::npos);
-    ASSERT(u.find("minutely_15=precipitation,rain,snowfall") != std::string::npos);
-    ASSERT(u.find("weather_code") == std::string::npos);   // precipitation only, no condition forecast
-    ASSERT(u.find("hourly=") == std::string::npos);
+static void test_weatherkit_url_targets_slc_proper() {
+    std::string u = weatherkit_url();
+    ASSERT(u.rfind("https://weatherkit.apple.com/api/v1/weather/en/40.7608/-111.8910?", 0) == 0);
+    ASSERT(u.find("dataSets=forecastNextHour") != std::string::npos);
+    ASSERT(u.find("timezone=America/Denver") != std::string::npos);
 }
 
 // ---------------------------------------------------------------------------
@@ -437,8 +522,7 @@ static void test_player_changeover_only_on_hour() {
     Mixer mixer;
     WeatherState ws;
     int fetches = 0;
-    ws.set_fetcher([&](const std::string&) { fetches++; return minutely_json(
-        {{"2026-09-20T09:30", 0, 0, 0}, {"2026-09-20T10:30", 0, 0, 0}}); });
+    ws.set_fetcher([&](std::time_t now) { fetches++; return wk_json(now, [](int) { return 0.0; }); });
     PlayerOptions o;
     o.sound_dir = sound_dir();
     o.heartbeat_s = 0;
@@ -499,8 +583,6 @@ static void test_player_changeover_only_on_hour() {
 static void test_player_changeover_on_weather_change() {
     Mixer mixer;
     WeatherState ws;
-    ws.set_fetcher([&](const std::string&) { return minutely_json(
-        {{"2026-09-20T09:30", 0.5, 0.5, 0}}); });
     PlayerOptions o;
     o.sound_dir = sound_dir();
     o.heartbeat_s = 0;
@@ -508,13 +590,12 @@ static void test_player_changeover_on_weather_change() {
     o.test_max_tracks = 2;
     HourlyPlayer p(mixer, ws, o);
 
-    // Startup 09:05 (next block 09:30 is rainy, but the startup pick already reads it), so
-    // start Sunny by overriding the first fetch: first call returns no rain.
+    // Startup 09:05 fetch is dry (Sunny pick); the 09:14 refresh sees a 15% chance for [09:15, 09:30).
     int calls = 0;
-    ws.set_fetcher([&](const std::string&) {
+    ws.set_fetcher([&](std::time_t now) {
         calls++;
-        return calls == 1 ? minutely_json({{"2026-09-20T09:30", 0, 0, 0}})
-                          : minutely_json({{"2026-09-20T09:30", 0.5, 0.5, 0}});
+        return calls == 1 ? wk_json(now, [](int) { return 0.0; })
+                          : wk_json(now, [](int) { return 0.15; });
     });
     auto t0 = std::chrono::steady_clock::now();
     p.set_clock([&]() {
@@ -688,13 +769,15 @@ int main(int argc, char** argv) {
     run_test("filename_all_hours_and_weathers", test_filename_all_hours_and_weathers);
     run_test("hour_index_is_zero_based_local_hour", test_hour_index_is_zero_based_local_hour);
     run_test("hour_title", test_hour_title);
-    run_test("weather_from_precip", test_weather_from_precip);
-    run_test("next_block_label", test_next_block_label);
-    run_test("parse_block_picks_the_next_block_not_the_current", test_parse_block_picks_the_next_block_not_the_current);
-    run_test("parse_block_garbage_keeps_previous", test_parse_block_garbage_keeps_previous);
+    run_test("next_block_start", test_next_block_start);
+    run_test("weatherkit_next_block_not_current", test_weatherkit_next_block_not_current);
+    run_test("weatherkit_snow_from_summary", test_weatherkit_snow_from_summary);
+    run_test("weatherkit_garbage_keeps_previous", test_weatherkit_garbage_keeps_previous);
+    run_test("base64url_and_der_to_raw", test_base64url_and_der_to_raw);
+    run_test("weatherkit_jwt_signature_verifies", test_weatherkit_jwt_signature_verifies);
     run_test("weather_state_refresh_and_failure", test_weather_state_refresh_and_failure);
     run_test("refresh_slots_one_minute_early", test_refresh_slots_one_minute_early);
-    run_test("open_meteo_url_targets_slc_proper", test_open_meteo_url_targets_slc_proper);
+    run_test("weatherkit_url_targets_slc_proper", test_weatherkit_url_targets_slc_proper);
     run_test("all_72_files_parse_as_stereo", test_all_72_files_parse_as_stereo);
     run_test("mono_header_still_parses_and_rejects_bad", test_mono_header_still_parses_and_rejects_bad);
     run_test("loop_once_then_radio_fade", test_loop_once_then_radio_fade);
