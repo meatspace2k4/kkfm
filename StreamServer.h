@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <fstream>
+#include <functional>
 
 extern void log_error(const std::string& msg);
 extern void log_info(const std::string& msg);
@@ -77,6 +78,10 @@ class StreamServer {
     std::set<int> active_client_fds;
     std::atomic<int> active_client_count{0};
 
+    std::mutex control_mutex;
+    std::function<std::string(const std::string&)> control_handler;
+    void send_control(int fd, const std::string& path);
+
 public:
     explicit StreamServer(PCMBuffer& buf)
         : buffer(buf), running(false), listen_fd(-1), port(DEFAULT_STREAM_PORT) {}
@@ -85,6 +90,13 @@ public:
 
     bool start(uint16_t listen_port, bool localhost_only = false);
     void stop();
+
+    // Optional GET /control/... handler (set by a player that accepts commands).
+    // Receives the request path; returns the plain-text reply. Unset: 404.
+    void set_control_handler(std::function<std::string(const std::string&)> h) {
+        std::lock_guard<std::mutex> lock(control_mutex);
+        control_handler = std::move(h);
+    }
 
 private:
     void accept_loop();

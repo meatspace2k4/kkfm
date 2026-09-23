@@ -167,7 +167,9 @@ void StreamServer::handle_client(int client_fd) {
         return p == "/stream" || p == "/stream.wav" || p == "/stream.pcm" || p == "/stream.raw";
     };
 
-    if (path == "/" || path == "/index.html") {
+    if (path == "/control" || path.rfind("/control/", 0) == 0) {
+        send_control(client_fd, path);
+    } else if (path == "/" || path == "/index.html") {
         send_index(client_fd, head_only);
     } else if (is_stream_path(path)) {
         if (!range_value.empty() && handle_range_probe(client_fd, range_req)) {
@@ -262,6 +264,27 @@ void StreamServer::send_index(int fd, bool head_only) {
     if (!head_only) {
         send_string(fd, payload);
     }
+}
+
+void StreamServer::send_control(int fd, const std::string& path) {
+    std::function<std::string(const std::string&)> h;
+    {
+        std::lock_guard<std::mutex> lock(control_mutex);
+        h = control_handler;
+    }
+    if (!h) {
+        send_not_found(fd);
+        return;
+    }
+    std::string payload = h(path);
+    std::ostringstream hdr;
+    hdr << "HTTP/1.1 200 OK\r\n"
+        << "Content-Type: text/plain; charset=utf-8\r\n"
+        << "Content-Length: " << payload.size() << "\r\n"
+        << "Cache-Control: no-store\r\n"
+        << "Connection: close\r\n\r\n";
+    send_string(fd, hdr.str());
+    send_string(fd, payload);
 }
 
 void StreamServer::send_not_found(int fd) {

@@ -25,7 +25,7 @@ BGM_PICK_RE = re.compile(r"\[HOURLY\]\s+Hour\s+(?P<hour>\d{2})\s+->\s+picked\s+(
 BGM_CHANGEOVER_RE = re.compile(r"\[HOURLY\]\s+Changeover\s+(?P<from>\d{2})\s+->\s+(?P<to>\d{2}):\s+(?P<name>\S+)\s+fades")
 BGM_END_RE = re.compile(r"\[HOURLY\]\s+Track end:\s+(?P<name>\S+)\s+\(loops=(?P<loops>\d+)\)")
 BGM_FAIL_RE = re.compile(r"\[HOURLY\]\s+BGM failed to load:\s+(?P<name>.+)$")
-WEATHER_OK_RE = re.compile(r"\[HOURLY\]\s+Weather fetched:\s+(?P<name>\w+)")
+WEATHER_OK_RE = re.compile(r"\[HOURLY\]\s+Weather (?:fetched|set):\s+(?P<name>\w+)")
 WEATHER_FAIL_RE = re.compile(r"\[HOURLY\]\s+Weather fetch failed")
 
 # systemd lifecycle messages (included in `journalctl -u <unit>`) often look like:

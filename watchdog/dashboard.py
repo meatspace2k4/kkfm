@@ -14,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import urllib.request
+import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -1064,6 +1065,25 @@ while True:
 
         sonos_stopped_polls: int = 0
 
+        # Player controls over HTTP (hourly player: /control/weather/<w>, /control/skip).
+        control_msg: dict[str, Any] = {"text": None}
+
+        def _send_control(path: str, label: str) -> None:
+            url = f"http://{_stream_host(ssh_target)}:{stream_port}{path}"
+            control_msg["text"] = f"{label}: sending..."
+
+            def _go() -> None:
+                try:
+                    with urllib.request.urlopen(url, timeout=4) as resp:
+                        body = resp.read().decode("utf-8", errors="replace").strip()
+                    control_msg["text"] = f"{label}: {body}"
+                except urllib.error.HTTPError as e:
+                    control_msg["text"] = f"{label}: not supported by this player (HTTP {e.code})"
+                except Exception as e:
+                    control_msg["text"] = f"{label}: failed ({e})"
+
+            threading.Thread(target=_go, daemon=True).start()
+
         def _poll_sonos() -> None:
             nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll, sonos_stopped_polls, sonos_title
             if sonos_state != "streaming" or not sonos_ip:
@@ -1180,8 +1200,14 @@ while True:
                 ch = -1
             if ch in (ord("q"), ord("Q")):
                 return
-            if ch in (ord("r"), ord("R")) and player_state == "locked":
-                _reset_player_lock()
+            if ch in (ord("r"), ord("R")):
+                if player_state == "locked":
+                    _reset_player_lock()
+                else:
+                    _send_control("/control/skip", "next track")
+            if ch in (ord("1"), ord("2"), ord("3")):
+                w = {ord("1"): "sunny", ord("2"): "rainy", ord("3"): "snowy"}[ch]
+                _send_control(f"/control/weather/{w}", f"weather {w}")
             if ch in (ord("p"), ord("P")) and player_state != "locked":
                 if player_state == "idle":
                     _start_player()
@@ -1410,6 +1436,16 @@ while True:
                             stdscr.addnstr(y, hint_col, "<-- press 'p' to LISTEN!", max(0, max_x - hint_col - 1))
                             stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
 
+                # CONTROLS: 1/2/3 set the player's weather, 'r' queues the next track.
+                y = 4
+                if y < max_y:
+                    ctl = "1 Sunny  2 Rainy  3 Snowy  r next track"
+                    if control_msg["text"]:
+                        ctl += "   |  " + str(control_msg["text"])
+                    stdscr.attron(curses.color_pair(3))
+                    stdscr.addnstr(y, 4, ctl, max(0, max_x - 5))
+                    stdscr.attroff(curses.color_pair(3))
+
                 # STREAM CHIP: 's' sends the stream URL to the Sonos group coordinator.
                 y = 3
                 if y < max_y:
@@ -1434,7 +1470,7 @@ while True:
                             stdscr.addnstr(y, hint_col, "<-- press 's' to STREAM to Sonos", max(0, max_x - hint_col - 1))
                             stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
 
-                y = 5
+                y = 6
                 if y < max_y:
                     stdscr.attron(section_title_attr)
                     stdscr.addnstr(y, 2, "SYSTEM SERVICES", max(0, max_x - 3))

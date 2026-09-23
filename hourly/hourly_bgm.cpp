@@ -157,6 +157,23 @@ int main(int argc, char** argv) {
     hourly::HourlyPlayer player(mixer, weather, opt);
     g_player = &player;
 
+    // Dashboard controls: /control/weather/{sunny|rainy|snowy}, /control/skip
+    server.set_control_handler([&](const std::string& path) -> std::string {
+        const std::string wpre = "/control/weather/";
+        if (path.rfind(wpre, 0) == 0) {
+            hourly::Weather w;
+            if (!hourly::weather_from_name(path.substr(wpre.size()), w)) return "error: unknown weather\n";
+            weather.set_manual(w);
+            return std::string("ok: weather ") + hourly::weather_name(w) + "\n";
+        }
+        if (path == "/control/skip") {
+            player.request_skip();
+            log_info(C_YELLOW "[HOURLY] " C_RESET "Skip requested: next track queued after this one fades");
+            return "ok: next track queued\n";
+        }
+        return "error: unknown control\n";
+    });
+
     pump.start();
     if (!server.start(port, localhost_only)) {
         log_error("[WEB] Failed to start HTTP server on port " + std::to_string(port));

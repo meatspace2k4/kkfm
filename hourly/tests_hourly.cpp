@@ -175,7 +175,7 @@ static void test_weatherkit_garbage_keeps_previous() {
 }
 
 static void test_weather_state_refresh_and_failure() {
-    WeatherState ws;
+    WeatherState ws(WeatherSource::WeatherKit);
     ASSERT(ws.current() == Weather::Sunny);                 // before any fetch
     ws.set_fetcher([](std::time_t now) { return wk_json(now, [](int i) { return i > 2 ? 0.2 : 0.0; }); });
     ASSERT(ws.refresh(make_tm(12, 14)));
@@ -185,6 +185,55 @@ static void test_weather_state_refresh_and_failure() {
     ASSERT(ws.current() == Weather::Rainy);                 // previous kept
     ws.set_override(Weather::Snowy);
     ASSERT(ws.current() == Weather::Snowy);
+}
+
+// Open-Meteo current: the last completed 15 minutes, rejected unless interval is 900 and fresh.
+static std::string om_json(const char* time, int interval, double precip, double rain, double showers, double snow) {
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+        "{\"latitude\":40.746216,\"timezone\":\"America/Denver\",\"current_units\":{\"time\":\"iso8601\",\"interval\":\"seconds\"},"
+        "\"current\":{\"time\":\"%s\",\"interval\":%d,\"precipitation\":%.2f,\"rain\":%.2f,\"showers\":%.2f,\"snowfall\":%.2f}}",
+        time, interval, precip, rain, showers, snow);
+    return buf;
+}
+
+static void test_open_meteo_last_15_minutes() {
+    std::time_t now = local_epoch(12, 49);
+    WeatherObservation o;
+    ASSERT(parse_open_meteo_current(om_json("2026-09-20T12:45", 900, 0, 0, 0, 0), now, o));
+    ASSERT(o.weather == Weather::Sunny);
+    ASSERT_STREQ(o.time, "2026-09-20T12:45");
+    ASSERT(parse_open_meteo_current(om_json("2026-09-20T12:45", 900, 0.1, 0.1, 0, 0), now, o));
+    ASSERT(o.weather == Weather::Rainy);
+    ASSERT(parse_open_meteo_current(om_json("2026-09-20T12:45", 900, 0.2, 0, 0.2, 0), now, o));
+    ASSERT(o.weather == Weather::Rainy);                                        // showers
+    ASSERT(parse_open_meteo_current(om_json("2026-09-20T12:45", 900, 0.5, 0, 0, 0.4), now, o));
+    ASSERT(o.weather == Weather::Snowy);
+}
+
+static void test_open_meteo_rejects_hourly_and_stale() {
+    std::time_t now = local_epoch(12, 49);
+    WeatherObservation o;
+    o.valid = true; o.weather = Weather::Rainy;
+    ASSERT(!parse_open_meteo_current(om_json("2026-09-20T12:00", 3600, 0, 0, 0, 0), now, o));   // hourly
+    ASSERT(!parse_open_meteo_current(om_json("2026-09-20T11:45", 900, 0, 0, 0, 0), now, o));    // an hour old
+    ASSERT(!parse_open_meteo_current(om_json("2026-09-20T13:30", 900, 0, 0, 0, 0), now, o));    // future block
+    ASSERT(!parse_open_meteo_current("{\"error\":true}", now, o));
+    ASSERT(!parse_open_meteo_current("", now, o));
+    ASSERT(o.weather == Weather::Rainy);
+    ASSERT(open_meteo_url().find("current=precipitation,rain,showers,snowfall") != std::string::npos);
+}
+
+static void test_weather_state_open_meteo_and_manual() {
+    WeatherState ws(WeatherSource::OpenMeteo);
+    ws.set_fetcher([](std::time_t) { return om_json("2026-09-20T12:00", 900, 0.3, 0.3, 0, 0); });
+    ASSERT(ws.refresh(make_tm(12, 14)));
+    ASSERT(ws.current() == Weather::Rainy);
+    ws.set_manual(Weather::Snowy);                          // dashboard '3'
+    ASSERT(ws.current() == Weather::Snowy);
+    ws.set_fetcher([](std::time_t) { return om_json("2026-09-20T12:15", 900, 0, 0, 0, 0); });
+    ASSERT(ws.refresh(make_tm(12, 29)));                    // next scheduled refresh replaces it
+    ASSERT(ws.current() == Weather::Sunny);
 }
 
 static void test_base64url_and_der_to_raw() {
@@ -520,7 +569,7 @@ static void test_mono_ctx_mixes_l_equals_r() {
 // hour change, and a weather refresh never touches the playing track.
 static void test_player_changeover_only_on_hour() {
     Mixer mixer;
-    WeatherState ws;
+    WeatherState ws(WeatherSource::WeatherKit);
     int fetches = 0;
     ws.set_fetcher([&](std::time_t now) { fetches++; return wk_json(now, [](int) { return 0.0; }); });
     PlayerOptions o;
@@ -582,7 +631,7 @@ static void test_player_changeover_only_on_hour() {
 // the track finishes its loop + fade, and the same hour's rainy file is picked next.
 static void test_player_changeover_on_weather_change() {
     Mixer mixer;
-    WeatherState ws;
+    WeatherState ws(WeatherSource::WeatherKit);
     PlayerOptions o;
     o.sound_dir = sound_dir();
     o.heartbeat_s = 0;
@@ -638,6 +687,74 @@ static void test_player_changeover_on_weather_change() {
     ASSERT_EQ(p.last_pick_weather.load(), (int)Weather::Rainy);
 }
 
+static std::string http_fetch_path(uint16_t port, const std::string& path, size_t want_bytes);
+
+// Skip ('r'): the hour and weather stay, the playing track is not cut; its fade is armed
+// and the next track is picked when it ends.
+static void test_player_skip_queues_next_track() {
+    Mixer mixer;
+    WeatherState ws(WeatherSource::OpenMeteo);
+    ws.set_override(Weather::Sunny);
+    PlayerOptions o;
+    o.sound_dir = sound_dir();
+    o.heartbeat_s = 0;
+    o.gap_s = 0.05f;
+    o.test_max_tracks = 2;
+    HourlyPlayer p(mixer, ws, o);
+    p.set_clock([]() { return make_tm(9, 5); });
+
+    std::atomic<bool> pumping{true};
+    std::vector<int16_t> block(MIX_BLOCK_FRAMES * 2, 0);
+    std::thread pump([&]() {
+        auto next = std::chrono::steady_clock::now();
+        while (pumping) {
+            mixer.mix_block(block.data(), MIX_BLOCK_FRAMES);
+            next += std::chrono::microseconds((int64_t)MIX_BLOCK_FRAMES * 1000000 / 48000 / 40);
+            std::this_thread::sleep_until(next);
+        }
+    });
+    std::thread runner([&]() { p.run(); });
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline && p.picks.load() < 1)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    ASSERT_EQ(p.arms.load(), 0);
+    p.request_skip();
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline && p.arms.load() == 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_EQ(p.arms.load(), 1);
+    ASSERT_EQ(p.track_ends.load(), 0);            // armed, not cut
+    ASSERT_EQ(p.last_arm_to.load(), 9);
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(40);
+    while (std::chrono::steady_clock::now() < deadline && p.picks.load() < 2)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    p.request_stop();
+    runner.join();
+    pumping = false;
+    pump.join();
+    ASSERT_EQ(p.track_ends.load(), 1);
+    ASSERT_EQ(p.picks.load(), 2);
+    ASSERT_EQ(p.last_pick_hour.load(), 9);
+}
+
+// /control route: handler reply when set, 404 when not (radio).
+static void test_stream_server_control_route() {
+    PCMBuffer buffer;
+    StreamServer server(buffer);
+    const uint16_t port = 18792;
+    ASSERT(server.start(port, true));
+    std::string r = http_fetch_path(port, "/control/skip", 400);
+    ASSERT(r.rfind("HTTP/1.1 404", 0) == 0);
+    std::string seen;
+    server.set_control_handler([&](const std::string& path) { seen = path; return std::string("ok: done\n"); });
+    r = http_fetch_path(port, "/control/weather/rainy", 400);
+    ASSERT(r.rfind("HTTP/1.1 200", 0) == 0);
+    ASSERT(r.find("ok: done") != std::string::npos);
+    ASSERT_STREQ(seen, "/control/weather/rainy");
+    server.stop();
+}
+
 // StreamServer: libav clients (ffplay/ffmpeg, the dashboard player) probe "Range: bytes=0-",
 // receive the 44-byte WAV header, then resume with "Range: bytes=44-". The resume must be a
 // 206 that continues with PCM, not a 200 that restarts at the RIFF header.
@@ -655,6 +772,29 @@ static std::string http_fetch(uint16_t port, const std::string& range, size_t wa
     ::send(fd, req.data(), req.size(), 0);
     std::string out;
     char buf[4096];
+    timeval tv{2, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    while (out.size() < want_bytes) {
+        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        out.append(buf, (size_t)n);
+    }
+    ::close(fd);
+    return out;
+}
+
+static std::string http_fetch_path(uint16_t port, const std::string& path, size_t want_bytes) {
+    int fd = ::socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) throw std::runtime_error("socket");
+    sockaddr_in6 addr{};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_loopback;
+    addr.sin6_port = htons(port);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) { ::close(fd); throw std::runtime_error("connect"); }
+    std::string req = "GET " + path + " HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    ::send(fd, req.data(), req.size(), 0);
+    std::string out;
+    char buf[1024];
     timeval tv{2, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     while (out.size() < want_bytes) {
@@ -773,6 +913,9 @@ int main(int argc, char** argv) {
     run_test("weatherkit_next_block_not_current", test_weatherkit_next_block_not_current);
     run_test("weatherkit_snow_from_summary", test_weatherkit_snow_from_summary);
     run_test("weatherkit_garbage_keeps_previous", test_weatherkit_garbage_keeps_previous);
+    run_test("open_meteo_last_15_minutes", test_open_meteo_last_15_minutes);
+    run_test("open_meteo_rejects_hourly_and_stale", test_open_meteo_rejects_hourly_and_stale);
+    run_test("weather_state_open_meteo_and_manual", test_weather_state_open_meteo_and_manual);
     run_test("base64url_and_der_to_raw", test_base64url_and_der_to_raw);
     run_test("weatherkit_jwt_signature_verifies", test_weatherkit_jwt_signature_verifies);
     run_test("weather_state_refresh_and_failure", test_weather_state_refresh_and_failure);
@@ -786,7 +929,9 @@ int main(int argc, char** argv) {
     run_test("mono_ctx_mixes_l_equals_r", test_mono_ctx_mixes_l_equals_r);
     run_test("player_changeover_only_on_hour", test_player_changeover_only_on_hour);
     run_test("player_changeover_on_weather_change", test_player_changeover_on_weather_change);
+    run_test("player_skip_queues_next_track", test_player_skip_queues_next_track);
     run_test("stream_server_range_resume", test_stream_server_range_resume);
+    run_test("stream_server_control_route", test_stream_server_control_route);
 
     int failed = 0;
     for (const auto& r : g_results) if (!r.passed) failed++;

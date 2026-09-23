@@ -9,8 +9,9 @@
  *
  * Behaviour:
  *  - hour of day (local wall clock, 0..23) selects BGM_24Hour_HH_<Weather>.bwav
- *  - <Weather> comes from Apple WeatherKit for SLC, refreshed at :14 :29 :44 :59
- *    for the 15-minute block starting at the coming quarter
+ *  - <Weather> is refreshed at :14 :29 :44 :59 from Open-Meteo (precipitation
+ *    over the last completed 15 minutes; default) or Apple WeatherKit (the
+ *    15-minute block starting at the coming quarter), HOURLY_WEATHER_SOURCE
  *  - the track plays from frame 0 and loops in the Decoder until the hour or
  *    the block's weather changes; then the Decoder's radio fade is armed for the
  *    next loop hit, the track ends, 1 s of silence follows, and the new file starts
@@ -67,11 +68,19 @@ inline bool weather_from_name(const std::string& s, Weather& out) {
 struct WeatherObservation {
     bool valid = false;
     Weather weather = Weather::Sunny;
+    // WeatherKit (next 15-minute block)
     double max_chance = 0.0;        // 0..1, max precipitationChance over the block
     double max_intensity = 0.0;     // mm/h, max precipitationIntensity over the block
     std::string condition;          // summary condition covering the block
     std::time_t block_start = 0;    // epoch seconds, block = [start, start+900)
+    // Open-Meteo (current = the last completed 15 minutes)
+    double precipitation_mm = 0.0;
+    double rain_mm = 0.0;
+    double showers_mm = 0.0;
+    double snowfall_cm = 0.0;
+    std::string time;               // label of that 15-minute block (its end, local time)
 };
+
 
 // Salt Lake City proper (city centre), not South Salt Lake / West Valley.
 constexpr double SLC_LATITUDE  = 40.7608;
@@ -141,6 +150,60 @@ inline bool json_str(const std::string& obj, const char* key, std::string& v) {
     std::smatch m;
     if (!std::regex_search(obj, m, re)) return false;
     v = m[1].str();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Open-Meteo "current": precipitation, rain, showers and snowfall are sums over
+// the preceding 15 minutes (HRRR 15-minutely data for North America); `time`
+// is the end of that window and `interval` must be 900. Anything else (hourly
+// data, stale data) is rejected rather than used.
+// ---------------------------------------------------------------------------
+inline std::string open_meteo_url() {
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+                  "&current=precipitation,rain,showers,snowfall&timezone=America%%2FDenver",
+                  40.7608, -111.8910);
+    return std::string(buf);
+}
+
+inline Weather weather_from_precip(double precipitation_mm, double rain_mm, double showers_mm, double snowfall_cm) {
+    if (snowfall_cm > 0.0) return Weather::Snowy;
+    if (precipitation_mm > 0.0 || rain_mm > 0.0 || showers_mm > 0.0) return Weather::Rainy;
+    return Weather::Sunny;
+}
+
+// max_age_s: the block must have ended within this many seconds of `now`.
+inline bool parse_open_meteo_current(const std::string& json, std::time_t now, WeatherObservation& out,
+                                     int max_age_s = 1800) {
+    size_t cur = json.find("\"current\":{");
+    if (cur == std::string::npos) cur = json.find("\"current\": {");
+    if (cur == std::string::npos) return false;
+    size_t open = json.find('{', cur);
+    size_t close = json.find('}', open);
+    if (open == std::string::npos || close == std::string::npos) return false;
+    std::string obj = json.substr(open, close - open + 1);
+
+    double interval = 0;
+    if (!json_num(obj, "interval", interval) || (int)interval != 900) return false;   // 15-minute data only
+    WeatherObservation o;
+    if (!json_str(obj, "time", o.time)) return false;
+    {
+        std::tm t{};
+        int y, mo, d, h, mi;
+        if (std::sscanf(o.time.c_str(), "%d-%d-%dT%d:%d", &y, &mo, &d, &h, &mi) != 5) return false;
+        t.tm_year = y - 1900; t.tm_mon = mo - 1; t.tm_mday = d; t.tm_hour = h; t.tm_min = mi; t.tm_isdst = -1;
+        std::time_t end = std::mktime(&t);
+        if (now - end > max_age_s || end - now > 900) return false;              // stale or from the future
+    }
+    if (!json_num(obj, "precipitation", o.precipitation_mm)) return false;
+    json_num(obj, "rain", o.rain_mm);
+    json_num(obj, "showers", o.showers_mm);
+    json_num(obj, "snowfall", o.snowfall_cm);
+    o.weather = weather_from_precip(o.precipitation_mm, o.rain_mm, o.showers_mm, o.snowfall_cm);
+    o.valid = true;
+    out = o;
     return true;
 }
 
@@ -298,16 +361,29 @@ inline std::string http_get_via_curl(const std::string& url, int timeout_s = 15,
 }
 
 // In-memory weather for the upcoming 15-minute block (Apple WeatherKit). The pick reads current(); it never fetches.
+enum class WeatherSource { OpenMeteo, WeatherKit };
+
+// HOURLY_WEATHER_SOURCE=weatherkit selects Apple WeatherKit; anything else (default) Open-Meteo.
+inline WeatherSource weather_source_from_env() {
+    const char* v = std::getenv("HOURLY_WEATHER_SOURCE");
+    if (v && to_lower_copy(trim(v)) == "weatherkit") return WeatherSource::WeatherKit;
+    return WeatherSource::OpenMeteo;
+}
+
 class WeatherState {
     mutable std::mutex mut;
     WeatherObservation obs;
     bool has_override = false;
     Weather override_w = Weather::Sunny;
-    // Returns the raw WeatherKit response for the request made at `now`.
+    WeatherSource source = WeatherSource::OpenMeteo;
+    // Returns the raw response for the request made at `now`.
     std::function<std::string(std::time_t)> fetcher;
 
-public:
-    WeatherState() {
+    void install_fetcher() {
+        if (source == WeatherSource::OpenMeteo) {
+            fetcher = [](std::time_t) { return http_get_via_curl(open_meteo_url()); };
+            return;
+        }
         WeatherKitCreds c = weatherkit_creds_from_env();
         fetcher = [c](std::time_t now) -> std::string {
             if (!c.complete()) {
@@ -323,6 +399,11 @@ public:
         };
     }
 
+public:
+    explicit WeatherState(WeatherSource src = weather_source_from_env()) : source(src) { install_fetcher(); }
+
+    WeatherSource weather_source() const { std::lock_guard<std::mutex> l(mut); return source; }
+    void set_source(WeatherSource src) { std::lock_guard<std::mutex> l(mut); source = src; install_fetcher(); }
     void set_fetcher(std::function<std::string(std::time_t)> f) { std::lock_guard<std::mutex> l(mut); fetcher = std::move(f); }
     void set_override(Weather w) { std::lock_guard<std::mutex> l(mut); has_override = true; override_w = w; }
     bool overridden() const { std::lock_guard<std::mutex> l(mut); return has_override; }
@@ -334,29 +415,55 @@ public:
     }
     WeatherObservation observation() const { std::lock_guard<std::mutex> l(mut); return obs; }
 
-    // Fetch WeatherKit and replace the in-memory observation with the 15-minute block
-    // that follows `now` (see next_block_start). On any failure the previous
-    // observation is kept and false is returned.
+    // Set the in-memory weather by hand (dashboard 1/2/3). The next scheduled
+    // refresh replaces it like any other observation.
+    void set_manual(Weather w) {
+        {
+            std::lock_guard<std::mutex> l(mut);
+            WeatherObservation o;
+            o.valid = true;
+            o.weather = w;
+            o.condition = "manual";
+            obs = o;
+        }
+        log_info_f(C_YELLOW "[HOURLY] " C_RESET "Weather set: " C_BOLD "%s" C_RESET " (manual)", weather_name(w));
+    }
+
+    // Fetch and replace the in-memory observation. Open-Meteo: the last completed
+    // 15 minutes (current). WeatherKit: the 15-minute block that follows `now`.
+    // On any failure the previous observation is kept and false is returned.
     bool refresh(const std::tm& now) {
         std::function<std::string(std::time_t)> f;
-        { std::lock_guard<std::mutex> l(mut); f = fetcher; }
+        WeatherSource src;
+        { std::lock_guard<std::mutex> l(mut); f = fetcher; src = source; }
         std::tm copy = now;
         copy.tm_isdst = -1;
         std::time_t now_t = std::mktime(&copy);
         std::string body = f ? f(now_t) : "";
-        std::time_t start = next_block_start(now);
         WeatherObservation o;
-        if (body.empty() || !parse_weatherkit_block(body, start, o)) {
+        bool ok = false;
+        std::time_t start = next_block_start(now);
+        if (!body.empty()) {
+            ok = (src == WeatherSource::OpenMeteo) ? parse_open_meteo_current(body, now_t, o)
+                                                   : parse_weatherkit_block(body, start, o);
+        }
+        if (!ok) {
             log_error("[HOURLY] Weather fetch failed; keeping previous observation");
             return false;
         }
         { std::lock_guard<std::mutex> l(mut); obs = o; }
-        std::tm lt{};
-        if (std::tm* p = std::localtime(&start)) lt = *p;
-        log_info_f(C_YELLOW "[HOURLY] " C_RESET "Weather fetched: " C_BOLD "%s" C_RESET
-                   " (block %02d:%02d-%02d:%02d: chance=%.0f%% intensity=%.2fmm/h condition=%s)",
-                   weather_name(o.weather), lt.tm_hour, lt.tm_min, lt.tm_hour + (lt.tm_min + 15) / 60, (lt.tm_min + 15) % 60,
-                   o.max_chance * 100.0, o.max_intensity, o.condition.empty() ? "?" : o.condition.c_str());
+        if (src == WeatherSource::OpenMeteo) {
+            log_info_f(C_YELLOW "[HOURLY] " C_RESET "Weather fetched: " C_BOLD "%s" C_RESET
+                       " (last 15 min ending %s: precip=%.2fmm rain=%.2fmm showers=%.2fmm snow=%.2fcm)",
+                       weather_name(o.weather), o.time.c_str(), o.precipitation_mm, o.rain_mm, o.showers_mm, o.snowfall_cm);
+        } else {
+            std::tm lt{};
+            if (std::tm* p = std::localtime(&start)) lt = *p;
+            log_info_f(C_YELLOW "[HOURLY] " C_RESET "Weather fetched: " C_BOLD "%s" C_RESET
+                       " (block %02d:%02d-%02d:%02d: chance=%.0f%% intensity=%.2fmm/h condition=%s)",
+                       weather_name(o.weather), lt.tm_hour, lt.tm_min, lt.tm_hour + (lt.tm_min + 15) / 60, (lt.tm_min + 15) % 60,
+                       o.max_chance * 100.0, o.max_intensity, o.condition.empty() ? "?" : o.condition.c_str());
+        }
         return true;
     }
 };
@@ -457,6 +564,7 @@ class HourlyPlayer {
     WeatherState& weather;
     PlayerOptions opt;
     std::atomic<bool> stop_sig{false};
+    std::atomic<bool> skip_sig{false};
     std::function<std::tm()> clock;     // injectable for tests
 
     static std::tm local_now() {
@@ -472,6 +580,10 @@ public:
 
     void set_clock(std::function<std::tm()> c) { clock = std::move(c); }
     void request_stop() { stop_sig.store(true); }
+    // Queue the next pick (dashboard 'r'): the playing track is not cut; its fade is
+    // armed for the next loop end, then the next track is picked from the current
+    // hour and weather.
+    void request_skip() { skip_sig.store(true); }
     bool stopping() const { return stop_sig.load(); }
 
     // Observable state for tests / TUI (the log buffer is not readable when stdout is not a TTY).
@@ -544,6 +656,7 @@ public:
             last_pick_weather = (int)w;
 
             // Frame 0, no delay, loop forever (fp = 0 disables the first-loop fade).
+            skip_sig.store(false);   // a skip queued before this pick is already satisfied
             auto tr = mixer.add(lb->ctx, VOL_DEFAULT, 0.0f, false, 0.0f, 0.0f);
             auto dec = tr->get_decoder();
             const int playing_hour = hour;
@@ -567,7 +680,8 @@ public:
                     bool hour_changed = hour_index(now) != playing_hour;
                     bool test_force = opt.test_loops_before_switch > 0 &&
                                       dec->loops_hit() >= (size_t)opt.test_loops_before_switch;
-                    if (hour_changed || weather_changed || test_force) {
+                    bool skip = skip_sig.exchange(false);
+                    if (hour_changed || weather_changed || skip || test_force) {
                         dec->arm_fade_at_next_loop(opt.fade_play_s, opt.fade_time_s);
                         armed = true;
                         arms++;
@@ -577,6 +691,7 @@ public:
                         if (hour_changed) std::snprintf(why, sizeof(why), "hour changed");
                         else if (weather_changed) std::snprintf(why, sizeof(why), "weather %s -> %s",
                                                                 weather_name(w), weather_name(weather.current()));
+                        else if (skip) std::snprintf(why, sizeof(why), "skip requested");
                         else std::snprintf(why, sizeof(why), "TEST HOOK");
                         log_info_f(C_YELLOW "[HOURLY] " C_RESET "Changeover %02d -> %02d: " C_CYAN "%s" C_RESET
                                    " fades at its next loop end (%s)",
