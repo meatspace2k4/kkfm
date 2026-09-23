@@ -1092,14 +1092,6 @@ while True:
                 return
             sonos_last_poll = time.time()
             try:
-                # New track on the service: re-hand the stream over with the new title so
-                # the Sonos shows the file now playing (a live URI's title is fixed at handoff).
-                new_title = _sonos_track_title()
-                if new_title != sonos_title:
-                    sonos_title = new_title
-                    sonos.set_uri_and_play(sonos_ip, _stream_url_for_sonos(sonos_ip), title=sonos_title)
-                    sonos_stopped_polls = 0
-                    return
                 sonos_transport = sonos.transport_state(sonos_ip)
                 if sonos_transport in ("STOPPED", "NO_MEDIA_PRESENT"):
                     sonos_stopped_polls += 1
