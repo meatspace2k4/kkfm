@@ -580,9 +580,8 @@ public:
 
     void set_clock(std::function<std::tm()> c) { clock = std::move(c); }
     void request_stop() { stop_sig.store(true); }
-    // Queue the next pick (dashboard 'r'): the playing track is not cut; its fade is
-    // armed for the next loop end, then the next track is picked from the current
-    // hour and weather.
+    // Next track (dashboard 'r'): the playing track fades out now with the radio's
+    // fade time, then the next track is picked from the current hour and weather.
     void request_skip() { skip_sig.store(true); }
     bool stopping() const { return stop_sig.load(); }
 
@@ -676,12 +675,24 @@ public:
                     weather_changed = weather.current() != w;
                 }
 
+                // 'r' fades out now, also over a loop-end changeover that has not started fading yet.
+                if (dec && skip_sig.exchange(false) && !dec->is_fading()) {
+                    {
+                        dec->fade_out_now(opt.fade_time_s);
+                        if (!armed) arms++;
+                        armed = true;
+                        last_arm_from = playing_hour;
+                        last_arm_to = hour_index(now);
+                        log_info_f(C_YELLOW "[HOURLY] " C_RESET "Changeover %02d -> %02d: " C_CYAN "%s" C_RESET
+                                   " fades now (next track requested)",
+                                   playing_hour, hour_index(now), lb->name.c_str());
+                    }
+                }
                 if (!armed && dec) {
                     bool hour_changed = hour_index(now) != playing_hour;
                     bool test_force = opt.test_loops_before_switch > 0 &&
                                       dec->loops_hit() >= (size_t)opt.test_loops_before_switch;
-                    bool skip = skip_sig.exchange(false);
-                    if (hour_changed || weather_changed || skip || test_force) {
+                    if (hour_changed || weather_changed || test_force) {
                         dec->arm_fade_at_next_loop(opt.fade_play_s, opt.fade_time_s);
                         armed = true;
                         arms++;
@@ -691,7 +702,6 @@ public:
                         if (hour_changed) std::snprintf(why, sizeof(why), "hour changed");
                         else if (weather_changed) std::snprintf(why, sizeof(why), "weather %s -> %s",
                                                                 weather_name(w), weather_name(weather.current()));
-                        else if (skip) std::snprintf(why, sizeof(why), "skip requested");
                         else std::snprintf(why, sizeof(why), "TEST HOOK");
                         log_info_f(C_YELLOW "[HOURLY] " C_RESET "Changeover %02d -> %02d: " C_CYAN "%s" C_RESET
                                    " fades at its next loop end (%s)",

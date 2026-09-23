@@ -724,8 +724,14 @@ static void test_player_skip_queues_next_track() {
     while (std::chrono::steady_clock::now() < deadline && p.arms.load() == 0)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     ASSERT_EQ(p.arms.load(), 1);
-    ASSERT_EQ(p.track_ends.load(), 0);            // armed, not cut
     ASSERT_EQ(p.last_arm_to.load(), 9);
+    // Fades out now: the track ends after the 7 s fade (40x realtime), not at its loop end.
+    auto armed_at = std::chrono::steady_clock::now();
+    deadline = armed_at + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline && p.track_ends.load() == 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_EQ(p.track_ends.load(), 1);
+    ASSERT(std::chrono::steady_clock::now() - armed_at < std::chrono::seconds(3));
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(40);
     while (std::chrono::steady_clock::now() < deadline && p.picks.load() < 2)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
