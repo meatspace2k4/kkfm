@@ -1035,13 +1035,14 @@ while True:
             return "KKFM Aircheck"
 
         def _start_sonos() -> None:
-            nonlocal sonos_state, sonos_room, sonos_ip, sonos_err, sonos_transport, sonos_last_poll, sonos_title
+            nonlocal sonos_state, sonos_room, sonos_ip, sonos_err, sonos_transport, sonos_last_poll, sonos_title, sonos_handoff_ts, sonos_stopped_polls
             sonos_err = None
             try:
                 coord = sonos.find_coordinator()
                 url = _stream_url_for_sonos(coord.ip)
                 sonos_title = _sonos_track_title()
                 sonos.set_uri_and_play(coord.ip, url, title=sonos_title)
+                sonos_handoff_ts = time.time()
                 sonos_room, sonos_ip = coord.room, coord.ip
                 sonos_state = "streaming"
                 sonos_transport = None
@@ -1064,6 +1065,12 @@ while True:
             sonos_transport = None
 
         sonos_stopped_polls: int = 0
+        sonos_resumes: int = 0
+        # The stream declares 0xFFFFFFFF bytes (WAV header + Content-Length): at 48 kHz
+        # stereo 16-bit that is 6 h 12 m 49 s, after which the Sonos treats it as ended.
+        # Hand it over again a little before that.
+        SONOS_REFRESH_S = 6 * 3600 + 10 * 60
+        sonos_handoff_ts: float = 0.0
 
         # Player controls over HTTP (hourly player: /control/weather/<w>, /control/skip).
         control_msg: dict[str, Any] = {"text": None}
@@ -1085,8 +1092,18 @@ while True:
             threading.Thread(target=_go, daemon=True).start()
 
         def _poll_sonos() -> None:
-            nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll, sonos_stopped_polls, sonos_title
+            nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll, sonos_stopped_polls, sonos_title, sonos_resumes, sonos_handoff_ts
             if sonos_state != "streaming" or not sonos_ip:
+                return
+            if sonos_handoff_ts and time.time() - sonos_handoff_ts >= SONOS_REFRESH_S:
+                try:
+                    sonos.set_uri_and_play(sonos_ip, _stream_url_for_sonos(sonos_ip), title=sonos_title or "KKFM Aircheck")
+                    sonos_handoff_ts = time.time()
+                    sonos_resumes += 1
+                    sonos_stopped_polls = 0
+                    sonos_last_poll = time.time() + 3.0
+                except sonos.SonosError as e:
+                    sonos_err = str(e)
                 return
             if time.time() - sonos_last_poll < 3.0:
                 return
@@ -1096,13 +1113,26 @@ while True:
                 if sonos_transport in ("STOPPED", "NO_MEDIA_PRESENT"):
                     sonos_stopped_polls += 1
                     if sonos_stopped_polls >= 2:
-                        sonos_err = f"Sonos {sonos_room}: transport {sonos_transport} (stream rejected or ended)"
-                        sonos_state = "idle"
+                        url = _stream_url_for_sonos(sonos_ip)
+                        cur = sonos.current_uri(sonos_ip)
+                        if cur not in (None, "", url):
+                            # Someone switched the Sonos to another source: hand it back to them.
+                            sonos_err = f"Sonos {sonos_room}: switched to another source; stream released"
+                            sonos_state = "idle"
+                        else:
+                            # The Sonos dropped our stream (it ends it on its own): put it straight
+                            # back, same as pressing play in the Sonos app.
+                            sonos.set_uri_and_play(sonos_ip, url, title=sonos_title or "KKFM Aircheck")
+                            sonos_handoff_ts = time.time()
+                            sonos_resumes += 1
+                            sonos_err = None
+                            sonos_stopped_polls = 0
+                            sonos_last_poll = time.time() + 3.0
                 else:
                     sonos_stopped_polls = 0
             except sonos.SonosError as e:
+                # Keep the intent and retry on the next poll; show the error meanwhile.
                 sonos_err = str(e)
-                sonos_state = "idle"
 
         def _stop_player() -> None:
             nonlocal player_state, player_err
@@ -1455,7 +1485,7 @@ while True:
                             stdscr.attroff(curses.color_pair(2))
                         elif streaming:
                             stdscr.attron(title_text_attr)
-                            stdscr.addnstr(y, hint_col, f"Sonos {sonos_room} ({sonos_ip})  {sonos_transport or 'starting'}", max(0, max_x - hint_col - 1))
+                            stdscr.addnstr(y, hint_col, f"Sonos {sonos_room} ({sonos_ip})  {sonos_transport or 'starting'}" + (f"  (auto-resumed {sonos_resumes}x)" if sonos_resumes else ""), max(0, max_x - hint_col - 1))
                             stdscr.attroff(title_text_attr)
                         else:
                             stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
