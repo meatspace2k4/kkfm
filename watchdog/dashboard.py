@@ -1071,6 +1071,29 @@ while True:
                 sonos_err = str(e)
                 sonos_state = "idle"
 
+        def _adopt_sonos() -> None:
+            """On startup: if a Sonos coordinator is already playing this stream
+            (radio or WAV URI for this host/port), take it over as STREAMING."""
+            nonlocal sonos_state, sonos_room, sonos_ip, sonos_transport, sonos_last_poll, sonos_handoff_ts, sonos_radio, sonos_title
+            try:
+                coord = sonos.find_coordinator()
+                cur = sonos.current_uri(coord.ip) or ""
+                radio = sonos.radio_uri(_stream_url_for_sonos(coord.ip, "/radio.mp3"))
+                wav = _stream_url_for_sonos(coord.ip)
+                if cur not in (radio, wav):
+                    return
+                if sonos_state != "idle":
+                    return   # 's' was pressed meanwhile
+                sonos_room, sonos_ip = coord.room, coord.ip
+                sonos_radio = cur == radio
+                sonos_title = _sonos_track_title()
+                sonos_transport = sonos.transport_state(coord.ip)
+                sonos_handoff_ts = time.time()
+                sonos_last_poll = time.time()
+                sonos_state = "streaming"
+            except Exception:
+                return
+
         def _stop_sonos() -> None:
             nonlocal sonos_state, sonos_err, sonos_transport
             if sonos_ip:
@@ -1232,6 +1255,8 @@ while True:
         last_health_check_mono = 0.0
         health_check_interval_s = 10.0  # Check every 10s
         watchdog_status_display: dict = {}
+
+        threading.Thread(target=_adopt_sonos, daemon=True).start()
 
         while True:
             try:
