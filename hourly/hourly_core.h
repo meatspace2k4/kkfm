@@ -583,6 +583,9 @@ public:
     // Next track (dashboard 'r'): the playing track fades out now with the radio's
     // fade time, then the next track is picked from the current hour and weather.
     void request_skip() { skip_sig.store(true); }
+    // Called with the file name (no extension) when a track is picked; the radio
+    // stream uses it as the ICY StreamTitle.
+    std::function<void(const std::string&)> on_track;
     bool stopping() const { return stop_sig.load(); }
 
     // Observable state for tests / TUI (the log buffer is not readable when stdout is not a TTY).
@@ -651,6 +654,7 @@ public:
             }
 
             picks++;
+            if (on_track) on_track(lb->name.substr(0, lb->name.rfind('.')));
             last_pick_hour = hour;
             last_pick_weather = (int)w;
 

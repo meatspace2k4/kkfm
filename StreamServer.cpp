@@ -168,7 +168,23 @@ void StreamServer::handle_client(int client_fd) {
         return p == "/stream" || p == "/stream.wav" || p == "/stream.pcm" || p == "/stream.raw";
     };
 
-    if (path == "/control" || path.rfind("/control/", 0) == 0) {
+    RouteHandler route;
+    {
+        std::lock_guard<std::mutex> lock(control_mutex);
+        if (!route_path.empty() && path == route_path) route = route_handler;
+    }
+    if (route) {
+        if (head_only) {
+            const std::string h = "HTTP/1.0 200 OK\r\nContent-Type: audio/mpeg\r\nConnection: close\r\n\r\n";
+            send_string(client_fd, h);
+            return;
+        }
+        log_info(C_BLUE "[WEB] " C_RESET "Radio client " C_GREEN "connected" C_RESET);
+        route(headers,
+              [&](const void* d, size_t n) { return send_all(client_fd, d, n); },
+              [&]() { return running.load(); });
+        log_info(C_BLUE "[WEB] " C_RESET "Radio client " C_YELLOW "disconnected" C_RESET);
+    } else if (path == "/control" || path.rfind("/control/", 0) == 0) {
         send_control(client_fd, path);
     } else if (path == "/" || path == "/index.html") {
         send_index(client_fd, head_only);

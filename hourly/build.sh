@@ -12,6 +12,16 @@ mkdir -p "$OUT"
 CXX="${CXX:-g++}"
 CXXFLAGS="-std=c++17 -O2 -I."
 LDLIBS="-pthread -ldl -lm"
+# libmp3lame for /radio.mp3 (prototypes are declared in hourly/radio_stream.h, so
+# only the shared library is needed; the Pi has libmp3lame.so.0 without -dev).
+if [ -e /opt/homebrew/lib/libmp3lame.dylib ]; then
+  LAME="-L/opt/homebrew/lib -lmp3lame"
+elif ls /usr/lib/*/libmp3lame.so >/dev/null 2>&1 || [ -e /usr/lib/libmp3lame.so ]; then
+  LAME="-lmp3lame"
+else
+  LAME="-l:libmp3lame.so.0"
+fi
+LDLIBS="$LDLIBS $LAME"
 
 build_player() {
   echo "== building hourly_bgm (files from HOURLY_SOUND_DIR)"
@@ -31,7 +41,7 @@ build_packed() {
   $NICE $CXX $CXXFLAGS -DHOURLY_USE_BLOB hourly/hourly_bgm.cpp StreamServer.cpp hourly_assets.S -o hourly_bgm $LDLIBS
   ls -la hourly_bgm
   echo "== packed-asset self-test"
-  $NICE $CXX $CXXFLAGS -DKKFM_TEST_MODE -DHOURLY_USE_BLOB hourly/tests_hourly.cpp StreamServer.cpp hourly_assets.S -o "$OUT/hourly_tests_packed" -pthread
+  $NICE $CXX $CXXFLAGS -DKKFM_TEST_MODE -DHOURLY_USE_BLOB hourly/tests_hourly.cpp StreamServer.cpp hourly_assets.S -o "$OUT/hourly_tests_packed" -pthread $LAME
   "$OUT/hourly_tests_packed" -v | grep -E "packed|run,|✗"
 }
 
@@ -45,7 +55,7 @@ $CXX $CXXFLAGS -DKKFM_TEST_MODE tests_cpp.cpp StreamServer.cpp -o "$OUT/tests_cp
 "$OUT/tests_cpp" -v
 
 echo "== hourly C++ suite"
-$CXX $CXXFLAGS -DKKFM_TEST_MODE hourly/tests_hourly.cpp StreamServer.cpp -o "$OUT/hourly_tests" -pthread
+$CXX $CXXFLAGS -DKKFM_TEST_MODE hourly/tests_hourly.cpp StreamServer.cpp -o "$OUT/hourly_tests" -pthread $LAME
 "$OUT/hourly_tests" -v
 
 echo "== python suite"

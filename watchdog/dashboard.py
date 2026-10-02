@@ -1019,11 +1019,24 @@ while True:
         sonos_transport: Optional[str] = None
         sonos_last_poll: float = 0.0
 
-        def _stream_url_for_sonos(coord_ip: str) -> str:
+        def _stream_url_for_sonos(coord_ip: str, path: str = "/stream") -> str:
             host = _stream_host(ssh_target)
             if host in ("127.0.0.1", "localhost", "::1"):
                 host = sonos.local_ip_towards(coord_ip)
-            return f"http://{host}:{stream_port}/stream"
+            return f"http://{host}:{stream_port}{path}"
+
+        # Players that serve /radio.mp3 (hourly) go to the Sonos as an internet-radio
+        # station: live ICY titles, no length cap. Others (the radio) use the WAV track.
+        sonos_radio: bool = False
+
+        def _hand_to_sonos(coord_ip: str) -> None:
+            nonlocal sonos_radio
+            radio_url = _stream_url_for_sonos(coord_ip, "/radio.mp3")
+            sonos_radio = sonos.serves_radio(radio_url)
+            if sonos_radio:
+                sonos.set_radio_and_play(coord_ip, radio_url, station="KKFM Hourly")
+            else:
+                sonos.set_uri_and_play(coord_ip, _stream_url_for_sonos(coord_ip), title=sonos_title or "KKFM Aircheck")
 
         sonos_title: Optional[str] = None
 
@@ -1041,7 +1054,7 @@ while True:
                 coord = sonos.find_coordinator()
                 url = _stream_url_for_sonos(coord.ip)
                 sonos_title = _sonos_track_title()
-                sonos.set_uri_and_play(coord.ip, url, title=sonos_title)
+                _hand_to_sonos(coord.ip)
                 sonos_handoff_ts = time.time()
                 sonos_room, sonos_ip = coord.room, coord.ip
                 sonos_state = "streaming"
@@ -1095,9 +1108,9 @@ while True:
             nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll, sonos_stopped_polls, sonos_title, sonos_resumes, sonos_handoff_ts
             if sonos_state != "streaming" or not sonos_ip:
                 return
-            if sonos_handoff_ts and time.time() - sonos_handoff_ts >= SONOS_REFRESH_S:
+            if not sonos_radio and sonos_handoff_ts and time.time() - sonos_handoff_ts >= SONOS_REFRESH_S:
                 try:
-                    sonos.set_uri_and_play(sonos_ip, _stream_url_for_sonos(sonos_ip), title=sonos_title or "KKFM Aircheck")
+                    _hand_to_sonos(sonos_ip)
                     sonos_handoff_ts = time.time()
                     sonos_resumes += 1
                     sonos_stopped_polls = 0
@@ -1114,15 +1127,16 @@ while True:
                     sonos_stopped_polls += 1
                     if sonos_stopped_polls >= 2:
                         url = _stream_url_for_sonos(sonos_ip)
+                        radio_url = sonos.radio_uri(_stream_url_for_sonos(sonos_ip, "/radio.mp3"))
                         cur = sonos.current_uri(sonos_ip)
-                        if cur not in (None, "", url):
+                        if cur not in (None, "", url, radio_url):
                             # Someone switched the Sonos to another source: hand it back to them.
                             sonos_err = f"Sonos {sonos_room}: switched to another source; stream released"
                             sonos_state = "idle"
                         else:
                             # The Sonos dropped our stream (it ends it on its own): put it straight
                             # back, same as pressing play in the Sonos app.
-                            sonos.set_uri_and_play(sonos_ip, url, title=sonos_title or "KKFM Aircheck")
+                            _hand_to_sonos(sonos_ip)
                             sonos_handoff_ts = time.time()
                             sonos_resumes += 1
                             sonos_err = None

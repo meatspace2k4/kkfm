@@ -67,6 +67,11 @@ inline ByteRangeRequest parse_range_header(const std::string& header) {
 }
 
 class StreamServer {
+public:
+    using RouteSend = std::function<bool(const void*, size_t)>;
+    using RouteHandler = std::function<void(const std::string& headers, const RouteSend& send,
+                                            const std::function<bool()>& alive)>;
+private:
     PCMBuffer& buffer;
     std::atomic<bool> running;
     std::thread accept_thread;
@@ -80,6 +85,8 @@ class StreamServer {
 
     std::mutex control_mutex;
     std::function<std::string(const std::string&)> control_handler;
+    std::string route_path;
+    RouteHandler route_handler;
     void send_control(int fd, const std::string& path);
 
 public:
@@ -96,6 +103,15 @@ public:
     void set_control_handler(std::function<std::string(const std::string&)> h) {
         std::lock_guard<std::mutex> lock(control_mutex);
         control_handler = std::move(h);
+    }
+
+    // Optional extra GET route served by the caller on the client socket (e.g. an
+    // MP3 radio stream). The handler writes the whole response with `send`, and
+    // keeps going while `alive()` is true. Unset: the path is a 404 as before.
+    void set_route(const std::string& path, RouteHandler h) {
+        std::lock_guard<std::mutex> lock(control_mutex);
+        route_path = path;
+        route_handler = std::move(h);
     }
 
 private:

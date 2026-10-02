@@ -15,6 +15,7 @@
  * test hooks HOURLY_TEST_LOOPS_BEFORE_SWITCH, HOURLY_TEST_MAX_TRACKS, HOURLY_WAV_DUMP.
  */
 #include "hourly_core.h"
+#include "radio_stream.h"
 
 // The engine links against a packed asset blob; the fork keeps audio on disk.
 const uint8_t assets_blob[16] = {0};
@@ -174,6 +175,22 @@ int main(int argc, char** argv) {
         return "error: unknown control\n";
     });
 
+    // Internet-radio output: MP3 (libmp3lame, in-process) with ICY StreamTitle at /radio.mp3.
+    hourly::RadioEncoder radio(buffer, 192);
+    if (radio.start((int)engine_sample_rate())) {
+        uint64_t pre_ms = 0;
+        if (const char* v = std::getenv("ACNH_STREAM_PREBUFFER_MS")) parse_u64(v, pre_ms);
+        server.set_route("/radio.mp3", [&radio, pre_ms](const std::string& headers, const StreamServer::RouteSend& send,
+                                                        const std::function<bool()>& alive) {
+            bool icy = get_header_value(headers, "Icy-MetaData") == "1";
+            hourly::serve_radio_client(radio.mp3(), radio.bitrate(), icy, pre_ms, "KKFM Hourly", send, alive);
+        });
+        player.on_track = [&radio](const std::string& title) { radio.set_title(title); };
+        log_info(C_BLUE "[WEB] " C_RESET "Radio stream (MP3 192k, ICY titles) at /radio.mp3");
+    } else {
+        log_error("[WEB] MP3 encoder failed to start; /radio.mp3 disabled");
+    }
+
     pump.start();
     if (!server.start(port, localhost_only)) {
         log_error("[WEB] Failed to start HTTP server on port " + std::to_string(port));
@@ -191,6 +208,7 @@ int main(int argc, char** argv) {
     player.run();
 
     server.stop();
+    radio.stop();
     pump.stop();
     dac.shutdown();
     mixer.close(engine_sample_rate());

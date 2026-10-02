@@ -13,6 +13,7 @@
 #define KKFM_TEST_MODE
 #endif
 #include "hourly_core.h"
+#include "radio_stream.h"
 
 const uint8_t assets_blob[16] = {0};
 
@@ -900,6 +901,64 @@ static void test_packed_assets_cover_all_hours_and_decode() {
 }
 #endif
 
+// /radio.mp3: in-process LAME output is a valid MPEG-1 Layer III stream at 48 kHz, and an
+// ICY client gets StreamTitle blocks every ICY_METAINT bytes with the title of the track playing.
+static void test_radio_mp3_and_icy_titles() {
+    ASSERT_EQ((int)icy_block("").size(), 1);
+    std::string b = icy_block("BGM_24Hour_20_Sunny");
+    ASSERT_EQ((int)b.size(), 1 + 16 * (int)(uint8_t)b[0]);
+    ASSERT(b.find("StreamTitle='BGM_24Hour_20_Sunny';") == 1);
+
+    PCMBuffer pcm;
+    RadioEncoder enc(pcm, 192, 30);
+    ASSERT(enc.start(48000));
+    enc.set_title("TrackA");
+    std::vector<int16_t> block(MIX_BLOCK_FRAMES * 2);
+    double ph = 0;
+    for (int k = 0; k < 48000 * 6 / MIX_BLOCK_FRAMES; ++k) {          // 6 s of a 440 Hz tone
+        for (int i = 0; i < MIX_BLOCK_FRAMES; ++i) {
+            int16_t v = (int16_t)(8000 * std::sin(ph)); ph += 2 * M_PI * 440 / 48000;
+            block[i * 2] = v; block[i * 2 + 1] = v;
+        }
+        pcm.write(block.data(), MIX_BLOCK_FRAMES);
+        if (k == 48000 * 3 / MIX_BLOCK_FRAMES) enc.set_title("TrackB");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    ASSERT(enc.mp3().position() > 192000 / 8 * 4);                  // ~4+ s of 192k MP3 encoded
+
+    // First frame header: sync 0xFFE, MPEG-1, Layer III, 192 kbps, 48 kHz.
+    uint64_t c = enc.mp3().start_cursor(1u << 30);
+    std::vector<uint8_t> head(4);
+    ASSERT_EQ((int)enc.mp3().read(c, head.data(), 4, 100), 4);
+    ASSERT(head[0] == 0xFF && (head[1] & 0xFE) == 0xFA);            // MPEG-1 Layer III
+    ASSERT_EQ((int)(head[2] >> 4), 11);                              // bitrate index 11 = 192 kbps
+    ASSERT_EQ((int)((head[2] >> 2) & 3), 1);                         // 48 kHz
+
+    // ICY client from the start: audio bytes, then a title block every ICY_METAINT bytes.
+    std::string got;
+    std::atomic<bool> live{true};
+    std::thread t([&] {
+        serve_radio_client(enc.mp3(), 192, true, 60000, "test",
+                           [&](const void* d, size_t n) { got.append((const char*)d, n); return got.size() < 200000; },
+                           [&] { return live.load(); });
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    live = false;
+    enc.stop();
+    t.join();
+    size_t body = got.find("\r\n\r\n");
+    ASSERT(body != std::string::npos);
+    ASSERT(got.find("icy-metaint: 16000") != std::string::npos);
+    size_t p = body + 4 + ICY_METAINT;
+    ASSERT(p < got.size());
+    int len = (uint8_t)got[p];
+    ASSERT(len > 0);
+    std::string meta = got.substr(p + 1, len * 16);
+    ASSERT(meta.find("StreamTitle='Track") == 0);
+    // A later block switches to TrackB (title follows the audio position).
+    ASSERT(got.find("StreamTitle='TrackB'") != std::string::npos);
+}
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "-v") g_verbose = true;
 #ifdef HOURLY_USE_BLOB
@@ -938,6 +997,7 @@ int main(int argc, char** argv) {
     run_test("player_skip_queues_next_track", test_player_skip_queues_next_track);
     run_test("stream_server_range_resume", test_stream_server_range_resume);
     run_test("stream_server_control_route", test_stream_server_control_route);
+    run_test("radio_mp3_and_icy_titles", test_radio_mp3_and_icy_titles);
 
     int failed = 0;
     for (const auto& r : g_results) if (!r.passed) failed++;
