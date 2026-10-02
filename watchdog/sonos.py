@@ -31,8 +31,9 @@ class Player:
     coordinator: bool
 
 
-def discover(timeout_s: float = 2.0) -> list[str]:
-    """IPs of Sonos players answering an SSDP M-SEARCH."""
+def discover(timeout_s: float = 2.0, first_only: bool = False) -> list[str]:
+    """IPs of Sonos players answering an SSDP M-SEARCH. With first_only, return as
+    soon as one answers (the topology call names every player and the coordinator)."""
     msg = (
         "M-SEARCH * HTTP/1.1\r\n"
         f"HOST: {SSDP_ADDR[0]}:{SSDP_ADDR[1]}\r\n"
@@ -52,6 +53,8 @@ def discover(timeout_s: float = 2.0) -> list[str]:
                 break
             if b"Sonos" in data and addr[0] not in ips:
                 ips.append(addr[0])
+                if first_only:
+                    break
     finally:
         s.close()
     return ips
@@ -108,7 +111,7 @@ def topology(any_ip: str) -> list[Player]:
 
 
 def find_coordinator(timeout_s: float = 2.0) -> Player:
-    ips = discover(timeout_s)
+    ips = discover(timeout_s, first_only=True)
     if not ips:
         raise SonosError("no Sonos players found on the network")
     players = topology(ips[0])
