@@ -132,6 +132,8 @@ class DashboardProfile:
     stream_port: int
     status_dir: Optional[str]    # remote dir holding log_status.json / tx_status.json (None: radio defaults)
     anomalies: Optional[str]     # remote anomalies.jsonl (None: radio defaults)
+    title: str = "KKFM AIRCHECK"  # header title
+    transmitter: bool = True      # has the Arduino/Si4713 TX telemetry (tx_status.json)
 
 
 PROFILES: dict[str, DashboardProfile] = {
@@ -153,6 +155,8 @@ PROFILES: dict[str, DashboardProfile] = {
         stream_port=8791,
         status_dir="/run/user/{uid}/kkfm-hourly",
         anomalies="/mnt/kkfm-usb/kkfm/hourly-build/watchdog/out/anomalies.jsonl",
+        title="HOURLY BGM",
+        transmitter=False,
     ),
 }
 
@@ -1344,7 +1348,7 @@ while True:
                 onair_flag = False
                 onair_flag = False
                 tx_snap = remote.get("tx") if isinstance(remote, dict) else None
-                if isinstance(tx_snap, dict):
+                if prof.transmitter and isinstance(tx_snap, dict):
                     now_ts = time.time()
                     try:
                         age_s = now_ts - float(tx_snap.get("ts", 0))
@@ -1396,7 +1400,8 @@ while True:
                                 level = max(level, 1)
 
                 if (
-                    ssh_target
+                    prof.transmitter
+                    and ssh_target
                     and remote_stream
                     and ssh_level == "ok"
                     and isinstance(remote, dict)
@@ -1415,9 +1420,9 @@ while True:
                 if ssh_status:
                     suffix = f" | {ssh_status} "
                 if max_x > 60:
-                    header = f" KKFM AIRCHECK DASHBOARD | {ts_str}{suffix}"
+                    header = f" {prof.title} DASHBOARD | {ts_str}{suffix}"
                 elif max_x > 30:
-                    header = f" KKFM DASHBOARD{suffix}"
+                    header = f" {prof.title.split()[0]} DASHBOARD{suffix}"
                 else:
                     header = " KKFM "
                 
