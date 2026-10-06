@@ -23,11 +23,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 from unittest.mock import MagicMock, patch
 
-from kkfm.watchdog.anomalies import Anomaly, AnomalyCode, Severity
-from kkfm.watchdog.detector import Detector
-from kkfm.watchdog.events import Event, EventType
-from kkfm.watchdog.log_parser import parse_event
-from kkfm.watchdog.reporting import Reporter
+from watchdog.anomalies import Anomaly, AnomalyCode, Severity
+from watchdog.detector import Detector
+from watchdog.events import Event, EventType
+from watchdog.log_parser import parse_event
+from watchdog.reporting import Reporter
 
 
 @dataclass

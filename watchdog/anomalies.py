@@ -29,6 +29,18 @@ class AnomalyCode(str, Enum):
     COMM_PICK_NO_START = "COMM_PICK_NO_START"
     COMM_START_NO_END = "COMM_START_NO_END"
 
+    # Hourly BGM (fork): hour/weather pick, changeover, fade-out, weather feed
+    BGM_FAILED_TO_LOAD = "BGM_FAILED_TO_LOAD"            # file missing / bad header
+    BGM_HOUR_MISMATCH = "BGM_HOUR_MISMATCH"              # picked hour != wall-clock hour of the pick
+    BGM_WEATHER_MISMATCH = "BGM_WEATHER_MISMATCH"        # picked variant != last fetched weather
+    BGM_PICK_WHILE_PLAYING = "BGM_PICK_WHILE_PLAYING"    # new pick before the previous track ended (track cut)
+    BGM_END_WITHOUT_CHANGEOVER = "BGM_END_WITHOUT_CHANGEOVER"  # track ended with no hour change armed
+    BGM_NAME_MISMATCH = "BGM_NAME_MISMATCH"              # changeover/end names a different file than picked
+    BGM_CHANGEOVER_NO_END = "BGM_CHANGEOVER_NO_END"      # fade armed but the track never ended
+    BGM_END_NO_PICK = "BGM_END_NO_PICK"                  # track ended but no next pick followed
+    WEATHER_FETCH_FAILED = "WEATHER_FETCH_FAILED"        # in-memory observation not refreshed
+    WEATHER_STALE = "WEATHER_STALE"                      # no successful fetch for too long
+
     # Playback pipeline
     DAC_RING_OVERFLOW = "DAC_RING_OVERFLOW"
     DAC_RING_THROTTLE = "DAC_RING_THROTTLE"

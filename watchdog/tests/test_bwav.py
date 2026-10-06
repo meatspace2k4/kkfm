@@ -1,6 +1,6 @@
 import unittest
 
-from kkfm.watchdog.bwav import BwavError, parse_bwav_header
+from watchdog.bwav import BwavError, parse_bwav_header
 
 
 class TestBwav(unittest.TestCase):

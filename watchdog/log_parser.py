@@ -20,6 +20,14 @@ COMM_FAIL_RE = re.compile(r"\[RADIO\]\s+Commercial failed to load:\s+(?P<name>.+
 
 NOW_PLAYING_RE = re.compile(r"Now Playing:\s+(?P<name>.+)$")
 
+# Hourly BGM fork lines (hourly/hourly_core.h)
+BGM_PICK_RE = re.compile(r"\[HOURLY\]\s+Hour\s+(?P<hour>\d{2})\s+->\s+picked\s+(?P<name>\S+)\s+\(weather=(?P<weather>\w+)\)")
+BGM_CHANGEOVER_RE = re.compile(r"\[HOURLY\]\s+Changeover\s+(?P<from>\d{2})\s+->\s+(?P<to>\d{2}):\s+(?P<name>\S+)\s+fades")
+BGM_END_RE = re.compile(r"\[HOURLY\]\s+Track end:\s+(?P<name>\S+)\s+\(loops=(?P<loops>\d+)\)")
+BGM_FAIL_RE = re.compile(r"\[HOURLY\]\s+BGM failed to load:\s+(?P<name>.+)$")
+WEATHER_OK_RE = re.compile(r"\[HOURLY\]\s+Weather fetched:\s+(?P<name>\w+)")
+WEATHER_FAIL_RE = re.compile(r"\[HOURLY\]\s+Weather fetch failed")
+
 # systemd lifecycle messages (included in `journalctl -u <unit>`) often look like:
 #   "Started <Description>."
 #   "Stopped <Description>."
@@ -137,6 +145,24 @@ def parse_event(line: str, default_ts: float) -> Optional[Event]:
     m = NOW_PLAYING_RE.search(s2)
     if m:
         return Event(EventType.NOW_PLAYING, ts=ts, raw=s, name=m.group("name").strip())
+
+    m = BGM_PICK_RE.search(s2)
+    if m:
+        return Event(EventType.BGM_PICKED, ts=ts, raw=s, name=m.group("name").strip())
+    m = BGM_CHANGEOVER_RE.search(s2)
+    if m:
+        return Event(EventType.BGM_CHANGEOVER, ts=ts, raw=s, name=m.group("name").strip())
+    m = BGM_END_RE.search(s2)
+    if m:
+        return Event(EventType.BGM_END, ts=ts, raw=s, name=m.group("name").strip())
+    m = BGM_FAIL_RE.search(s2)
+    if m:
+        return Event(EventType.BGM_FAILED, ts=ts, raw=s, name=m.group("name").strip())
+    m = WEATHER_OK_RE.search(s2)
+    if m:
+        return Event(EventType.WEATHER_FETCHED, ts=ts, raw=s, name=m.group("name").strip())
+    if WEATHER_FAIL_RE.search(s2):
+        return Event(EventType.WEATHER_FAILED, ts=ts, raw=s, name=None)
 
     if DAC_OVERFLOW_RE.search(s2):
         return Event(EventType.DAC_OVERFLOW, ts=ts, raw=s, name=None)

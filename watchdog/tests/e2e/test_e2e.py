@@ -14,11 +14,11 @@ import time
 import unittest
 from pathlib import Path
 
-from kkfm.watchdog.anomalies import AnomalyCode, Severity
-from kkfm.watchdog.detector import Detector
-from kkfm.watchdog.events import Event, EventType
-from kkfm.watchdog.tests.e2e.harness import E2ETestHarness, MockSerial, MockSystemctl
-from kkfm.watchdog.tests.e2e.injectors import (
+from watchdog.anomalies import AnomalyCode, Severity
+from watchdog.detector import Detector
+from watchdog.events import Event, EventType
+from watchdog.tests.e2e.harness import E2ETestHarness, MockSerial, MockSystemctl
+from watchdog.tests.e2e.injectors import (
     AnomalyTrigger,
     EventInjector,
     format_log_line,

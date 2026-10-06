@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 from .anomalies import Anomaly, AnomalyCode, Severity
@@ -22,6 +24,41 @@ class SegmentState:
         self.started_ts = None
 
 
+@dataclass
+class BgmState:
+    """Hourly BGM fork: one track per wall-clock hour.
+
+    Lifecycle observed in the log: PICK (hour, weather, file) -> [loops] ->
+    CHANGEOVER (hour changed, fade armed) -> END (fade finished) -> PICK ...
+    """
+
+    picked_name: Optional[str] = None
+    picked_ts: Optional[float] = None
+    picked_hour: Optional[int] = None
+    picked_weather: Optional[str] = None
+    changeover_ts: Optional[float] = None
+    changeover_to_hour: Optional[int] = None
+    ended_ts: Optional[float] = None
+    last_weather: Optional[str] = None
+    last_weather_ts: Optional[float] = None
+
+    def reset_track(self) -> None:
+        self.picked_name = None
+        self.picked_ts = None
+        self.picked_hour = None
+        self.picked_weather = None
+        self.changeover_ts = None
+        self.changeover_to_hour = None
+
+
+_BGM_NAME_RE = re.compile(r"BGM_24Hour_(?P<hour>\d{2})_(?P<weather>[A-Za-z]+)\.bwav$")
+_BGM_CHANGEOVER_RE = re.compile(r"Changeover\s+(?P<from>\d{2})\s+->\s+(?P<to>\d{2})")
+
+
+def _local_hour(ts: float) -> int:
+    return datetime.fromtimestamp(ts).hour
+
+
 class Detector:
     """Strict anomaly detector over the service event stream.
 
@@ -39,6 +76,9 @@ class Detector:
         orphan_end_grace_s: float = 10.0,
         underrun_startup_grace_s: float = 10.0,
         expected_start_after_stop_gap_s: float = 10.0,
+        bgm_changeover_timeout_s: float = 300.0,
+        bgm_pick_timeout_s: float = 30.0,
+        weather_stale_s: float = 3600.0,
     ) -> None:
         self.start_timeout_s = float(start_timeout_s)
         self.end_timeout_s = float(end_timeout_s)
@@ -46,6 +86,16 @@ class Detector:
         self.orphan_end_grace_s = max(0.0, float(orphan_end_grace_s))
         self.jingle = SegmentState(kind="jingle")
         self.comm = SegmentState(kind="commercial")
+
+        # Hourly BGM fork. After a changeover the track must finish within one loop
+        # length (longest BGM loop ~100 s) + the 17 s fade; after an end, the next
+        # pick must follow within the 1 s gap plus file load. Weather is refreshed
+        # every 15 min; an hour without a successful fetch means the pick uses stale data.
+        self.bgm = BgmState()
+        self.bgm_changeover_timeout_s = float(bgm_changeover_timeout_s)
+        self.bgm_pick_timeout_s = float(bgm_pick_timeout_s)
+        self.weather_stale_s = float(weather_stale_s)
+        self._weather_stale_emitted = False
         self.last_activity_ts: Optional[float] = None
 
         # Unit lifecycle tracking (from systemd journal lines).
@@ -102,6 +152,17 @@ class Detector:
             "end_timeout_s": self.end_timeout_s,
             "jingle": seg(self.jingle),
             "commercial": seg(self.comm),
+            "bgm": {
+                "picked_name": self.bgm.picked_name,
+                "picked_ts": self.bgm.picked_ts,
+                "picked_hour": self.bgm.picked_hour,
+                "picked_weather": self.bgm.picked_weather,
+                "changeover_ts": self.bgm.changeover_ts,
+                "changeover_to_hour": self.bgm.changeover_to_hour,
+                "ended_ts": self.bgm.ended_ts,
+                "last_weather": self.bgm.last_weather,
+                "last_weather_ts": self.bgm.last_weather_ts,
+            },
         }
 
     def _timeout_checks(self, now_ts: float) -> list[Anomaly]:
@@ -131,7 +192,181 @@ class Detector:
                         )
                     )
                     st.reset()
+
+        # Hourly BGM: a fade was armed but the track never reported its end.
+        b = self.bgm
+        if b.changeover_ts is not None and (now_ts - b.changeover_ts) > self.bgm_changeover_timeout_s:
+            out.append(
+                Anomaly(
+                    code=AnomalyCode.BGM_CHANGEOVER_NO_END,
+                    severity=Severity.ERROR,
+                    ts=now_ts,
+                    name=b.picked_name,
+                    message=f"BGM changeover armed but track never ended within {self.bgm_changeover_timeout_s:.0f}s",
+                )
+            )
+            b.changeover_ts = None
+        # Hourly BGM: the track ended but no next pick followed (dead air after fade).
+        if b.ended_ts is not None and (now_ts - b.ended_ts) > self.bgm_pick_timeout_s:
+            out.append(
+                Anomaly(
+                    code=AnomalyCode.BGM_END_NO_PICK,
+                    severity=Severity.ERROR,
+                    ts=now_ts,
+                    name=b.picked_name,
+                    message=f"BGM track ended but no next pick within {self.bgm_pick_timeout_s:.0f}s",
+                )
+            )
+            b.ended_ts = None
+        # Weather feed stale: picks are being made on old data.
+        if (
+            b.last_weather_ts is not None
+            and not self._weather_stale_emitted
+            and (now_ts - b.last_weather_ts) > self.weather_stale_s
+        ):
+            self._weather_stale_emitted = True
+            out.append(
+                Anomaly(
+                    code=AnomalyCode.WEATHER_STALE,
+                    severity=Severity.WARN,
+                    ts=now_ts,
+                    name=b.last_weather,
+                    message=f"weather observation not refreshed for {now_ts - b.last_weather_ts:.0f}s",
+                )
+            )
         return out
+
+    def _feed_bgm(self, ev: Event, anomalies: list[Anomaly]) -> bool:
+        """Hourly BGM fork events. Returns True if the event was consumed."""
+        b = self.bgm
+
+        if ev.etype == EventType.WEATHER_FETCHED:
+            b.last_weather = ev.name
+            b.last_weather_ts = ev.ts
+            self._weather_stale_emitted = False
+            return True
+
+        if ev.etype == EventType.WEATHER_FAILED:
+            anomalies.append(
+                Anomaly(
+                    code=AnomalyCode.WEATHER_FETCH_FAILED,
+                    severity=Severity.WARN,
+                    ts=ev.ts,
+                    raw=ev.raw,
+                    message="weather fetch failed; player keeps the previous observation",
+                )
+            )
+            return True
+
+        if ev.etype == EventType.BGM_FAILED:
+            anomalies.append(
+                Anomaly(
+                    code=AnomalyCode.BGM_FAILED_TO_LOAD,
+                    severity=Severity.ERROR,
+                    ts=ev.ts,
+                    name=ev.name,
+                    raw=ev.raw,
+                    message="BGM failed to load",
+                )
+            )
+            return True
+
+        if ev.etype == EventType.BGM_PICKED:
+            m = _BGM_NAME_RE.search(ev.name or "")
+            hour = int(m.group("hour")) if m else None
+            weather = m.group("weather") if m else None
+
+            # A pick while the previous track is still playing means it was cut,
+            # not faded out at its loop end.
+            if b.picked_ts is not None and b.ended_ts is None:
+                anomalies.append(
+                    Anomaly(
+                        code=AnomalyCode.BGM_PICK_WHILE_PLAYING,
+                        severity=Severity.ERROR,
+                        ts=ev.ts,
+                        name=ev.name,
+                        raw=ev.raw,
+                        message=f"BGM picked while {b.picked_name} had not ended (track cut)",
+                    )
+                )
+
+            if hour is not None and hour != _local_hour(ev.ts):
+                anomalies.append(
+                    Anomaly(
+                        code=AnomalyCode.BGM_HOUR_MISMATCH,
+                        severity=Severity.ERROR,
+                        ts=ev.ts,
+                        name=ev.name,
+                        raw=ev.raw,
+                        message=f"BGM hour mismatch: picked hour {hour:02d}, wall clock hour {_local_hour(ev.ts):02d}",
+                    )
+                )
+            if weather is not None and b.last_weather is not None and weather != b.last_weather:
+                anomalies.append(
+                    Anomaly(
+                        code=AnomalyCode.BGM_WEATHER_MISMATCH,
+                        severity=Severity.ERROR,
+                        ts=ev.ts,
+                        name=ev.name,
+                        raw=ev.raw,
+                        message=f"BGM weather mismatch: picked {weather}, last fetched {b.last_weather}",
+                    )
+                )
+
+            b.reset_track()
+            b.picked_name = ev.name
+            b.picked_ts = ev.ts
+            b.picked_hour = hour
+            b.picked_weather = weather
+            b.ended_ts = None
+            return True
+
+        if ev.etype == EventType.BGM_CHANGEOVER:
+            m = _BGM_CHANGEOVER_RE.search(ev.raw or "")
+            to_hour = int(m.group("to")) if m else None
+            if b.picked_name is not None and ev.name != b.picked_name:
+                anomalies.append(
+                    Anomaly(
+                        code=AnomalyCode.BGM_NAME_MISMATCH,
+                        severity=Severity.ERROR,
+                        ts=ev.ts,
+                        name=ev.name,
+                        raw=ev.raw,
+                        message=f"BGM name mismatch: picked={b.picked_name} changeover={ev.name}",
+                    )
+                )
+            b.changeover_ts = ev.ts
+            b.changeover_to_hour = to_hour
+            return True
+
+        if ev.etype == EventType.BGM_END:
+            if b.picked_name is not None and ev.name != b.picked_name:
+                anomalies.append(
+                    Anomaly(
+                        code=AnomalyCode.BGM_NAME_MISMATCH,
+                        severity=Severity.ERROR,
+                        ts=ev.ts,
+                        name=ev.name,
+                        raw=ev.raw,
+                        message=f"BGM name mismatch: picked={b.picked_name} end={ev.name}",
+                    )
+                )
+            if b.picked_ts is not None and b.changeover_ts is None:
+                anomalies.append(
+                    Anomaly(
+                        code=AnomalyCode.BGM_END_WITHOUT_CHANGEOVER,
+                        severity=Severity.ERROR,
+                        ts=ev.ts,
+                        name=ev.name,
+                        raw=ev.raw,
+                        message="BGM track ended without an hour changeover (unexpected exhaustion)",
+                    )
+                )
+            b.changeover_ts = None
+            b.ended_ts = ev.ts
+            return True
+
+        return False
 
     def feed(self, ev: Event) -> list[Anomaly]:
         """Feed one event; returns any anomalies triggered by this event."""
@@ -265,6 +500,10 @@ class Detector:
 
         # Any other event counts as "real" activity.
         self._had_non_lifecycle_activity = True
+
+        # Hourly BGM fork state machine
+        if self._feed_bgm(ev, anomalies):
+            return anomalies
 
         # Jingle state machine
         if ev.etype == EventType.JINGLE_PICKED:

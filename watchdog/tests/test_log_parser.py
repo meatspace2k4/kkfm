@@ -1,7 +1,7 @@
 import unittest
 
-from kkfm.watchdog.events import EventType
-from kkfm.watchdog.log_parser import parse_event
+from watchdog.events import EventType
+from watchdog.log_parser import parse_event
 
 
 class TestLogParser(unittest.TestCase):
