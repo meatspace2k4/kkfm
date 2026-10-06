@@ -41,12 +41,22 @@ STREAMS = {
     "kkfm": ("KKFM", lambda ip: f"http://{ip}:{AUDIO_PORT}/kkfm.mp3"),
     "hourly": ("Hourly BGM", lambda ip: f"http://{ip}:{AUDIO_PORT}/hourly.mp3"),
 }
+# Player journals, followed live for titles. The watchdog snapshots below lag the
+# journal by up to ~5 s, so they are only a fallback until the journal yields a title.
+JOURNAL_MATCH = {
+    "kkfm": "_SYSTEMD_UNIT=acnh-aircheck.service",
+    "hourly": "_SYSTEMD_USER_UNIT=acnh-hourly.service",
+}
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+NOW_PLAYING_RE = re.compile(r"Now Playing:\s*(.+)$")
+BREAK_RE = re.compile(r"\[RADIO\]\s*(Commercial|Jingle) (start|end):")
+_journal_title = {}
 # Watchdog snapshots (same data the TUI dashboard shows).
 STATUS_FILES = {
     "kkfm": os.environ.get("SMAPI_KKFM_STATUS", "/run/kkfm-watchdog/log_status.json"),
     "hourly": os.environ.get("SMAPI_HOURLY_STATUS", "/run/user/1000/kkfm-hourly/log_status.json"),
 }
-ICY_METAINT = 16000
+ICY_METAINT = 8192
 _last_title = {}
 ALIASES = {"aircheck": "hourly"}
 # Changes on every restart so Sonos re-fetches the catalog after a deploy.
@@ -116,10 +126,42 @@ def stream_url(sid):
     return STREAMS[sid][1](lan_ip())
 
 
+def title_for_line(sid, line):
+    """Title implied by one player log line, or None if the line doesn't change it."""
+    line = ANSI_RE.sub("", line).strip()
+    m = NOW_PLAYING_RE.search(line)
+    if m:
+        return m.group(1).strip()
+    m = BREAK_RE.search(line)
+    if m:
+        kind, edge = m.groups()
+        return "Commercial break" if (kind, edge) == ("Commercial", "start") else STREAMS[sid][0]
+    return None
+
+
+def follow_journal(sid):
+    """Keep _journal_title[sid] current from the player's journal; restarts journalctl if it exits."""
+    while True:
+        proc = subprocess.Popen(["journalctl", "-f", "-n", "200", "-o", "cat", JOURNAL_MATCH[sid]],
+                                stdout=subprocess.PIPE, text=True, errors="replace")
+        for line in proc.stdout:
+            title = title_for_line(sid, line)
+            if title:
+                _journal_title[sid] = title
+        proc.wait()
+        time.sleep(5)
+
+
 def now_playing(sid):
-    """Title for the watchdog's latest event: the song while it is on air, "Commercial break"
-    during ads, the station name for jingles and the gap after a break. Events that don't
-    change what is on air (DAC/unit) keep the previous title."""
+    if _journal_title.get(sid):
+        return _journal_title[sid]
+    return snapshot_title(sid)
+
+
+def snapshot_title(sid):
+    """Fallback title from the watchdog's latest event: the song while it is on air,
+    "Commercial break" during ads, the station name for jingles and the gap after a break.
+    Events that don't change what is on air (DAC/unit) keep the previous title."""
     try:
         with open(STATUS_FILES[sid]) as f:
             st = json.load(f)
@@ -377,6 +419,7 @@ class AudioHandler(BaseHTTPRequestHandler):
                             meta += b"\0" * (-len(meta) % 16)
                             self.wfile.write(bytes([len(meta) // 16]) + meta)
                             sent_title = title
+                            print(f"[audio] {sid} title -> {title}", flush=True)
                         else:
                             self.wfile.write(b"\0")
                         until_meta = ICY_METAINT
@@ -395,6 +438,8 @@ class AudioHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    for sid in STREAMS:
+        threading.Thread(target=follow_journal, args=(sid,), daemon=True).start()
     audio = ThreadingHTTPServer((AUDIO_BIND, AUDIO_PORT), AudioHandler)
     audio.daemon_threads = True
     threading.Thread(target=audio.serve_forever, daemon=True).start()
