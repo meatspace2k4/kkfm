@@ -4,7 +4,7 @@
 Browsing returns two "stream" items: KKFM (the :9000 aircheck player) and
 Hourly BGM (hourly_bgm's existing /radio.mp3 on :8791). Both are served to players
 from this process's LAN audio port with ICY StreamTitle set from the watchdogs'
-now-playing state. Sonos radio mode will not play WAV, so KKFM is re-encoded to MP3
+now-playing state; players expose it to the app as streamInfo, which updates live. Sonos radio mode will not play WAV, so KKFM is re-encoded to MP3
 by ffmpeg on demand, only while a player is connected; Hourly is passed through.
 getMediaURI hands back LAN URLs, so audio never leaves the network.
 """
@@ -134,13 +134,13 @@ def now_playing(sid):
 
 
 def media_metadata(sid):
+    # No currentShow: the player stores it once per play and the app shows it in place of the
+    # live ICY title (streamInfo), so any song name here goes stale at the next song.
     title = STREAMS[sid][0]
-    show = now_playing(sid) or title
-    art = f"<albumArtURI>{escape(ART_URL)}</albumArtURI>" if ART_URL else ""
+    art = f"<logo>{escape(ART_URL)}</logo>" if ART_URL else ""
     return (f"<id>{sid}</id><itemType>stream</itemType>"
             f"<title>{escape(title)}</title><mimeType>audio/mpeg</mimeType>"
-            f"<streamMetadata><currentShow>{escape(show)}</currentShow>"
-            f"<isEphemeral>true</isEphemeral>{art}</streamMetadata>")
+            f"<streamMetadata>{art}</streamMetadata>")
 
 
 def envelope(body):
