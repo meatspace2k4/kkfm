@@ -117,17 +117,22 @@ def stream_url(sid):
 
 
 def now_playing(sid):
-    """Current title from the watchdog snapshot; sticky across non-title events."""
+    """Title for the watchdog's latest event: the song while it is on air, "Commercial break"
+    during ads, the station name for jingles and the gap after a break. Events that don't
+    change what is on air (DAC/unit) keep the previous title."""
     try:
         with open(STATUS_FILES[sid]) as f:
             st = json.load(f)
     except (OSError, ValueError):
         return _last_title.get(sid, "")
     ev = st.get("last_event") or {}
-    if ev.get("etype") == "now_playing" and ev.get("name"):
+    etype = ev.get("etype", "")
+    if etype == "now_playing" and ev.get("name"):
         _last_title[sid] = ev["name"]
-    elif ev.get("etype") == "commercial_start":
-        return "Commercial break"
+    elif etype in ("commercial_picked", "commercial_start"):
+        _last_title[sid] = "Commercial break"
+    elif etype.startswith(("jingle_", "commercial_")):
+        _last_title[sid] = STREAMS[sid][0]
     elif sid not in _last_title and (st.get("last_bwav") or {}).get("name"):
         _last_title[sid] = re.sub(r"\.bwav$", "", st["last_bwav"]["name"]).replace("_", " ")
     return _last_title.get(sid, "")
