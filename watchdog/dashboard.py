@@ -45,6 +45,7 @@ def _restore_terminal() -> None:
         pass
     try:
         # Ensure cursor is visible and terminal is in normal mode
+        sys.stdout.write("\033[?1004l")  # Disable focus reporting
         sys.stdout.write("\033[?25h")  # Show cursor
         sys.stdout.write("\033[?1049l")  # Exit alternate screen buffer
         sys.stdout.write("\033[0m")  # Reset attributes
@@ -938,7 +939,23 @@ while True:
         curses.init_pair(7, orange, -1)
         curses.init_pair(13, curses.COLOR_MAGENTA, -1)  # Purple for CRITICAL
         curses.curs_set(0)
-        stdscr.nodelay(True)
+        stdscr.timeout(max(100, int(refresh_s * 1000)))
+
+        # Enable terminal focus reporting so we get ESC[I / ESC[O on
+        # tab focus-in / focus-out.  This lets us force a full repaint the
+        # instant the user switches back to this tab.
+        try:
+            sys.stdout.write("\033[?1004h")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+        # Also handle SIGCONT for terminals that send it on resume.
+        _need_full_repaint = False
+        def _on_sigcont(signum: int, frame: Any) -> None:
+            nonlocal _need_full_repaint
+            _need_full_repaint = True
+        signal.signal(signal.SIGCONT, _on_sigcont)
 
         last_tx_label: str = "WAIT"
         last_tx_color = curses.color_pair(3)
@@ -1122,11 +1139,10 @@ while True:
         health_check_interval_s = 10.0  # Check every 10s
         watchdog_status_display: dict = {}
 
+        ch = -1
         while True:
-            try:
-                ch = stdscr.getch()
-            except curses.error:
-                ch = -1
+            # ch was read at the bottom of the previous pass (getch waits up to the
+            # refresh interval there and also catches focus-in reports).
             if ch in (ord("q"), ord("Q")):
                 return
             if ch in (ord("r"), ord("R")) and player_state == "locked":
@@ -1185,8 +1201,12 @@ while True:
                             tail = ""
                         tail = tail.splitlines()[-1] if tail else ""
                     player_err = tail if tail else f"player exited (code {rc})"
+            ch = -1
 
             try:
+                if _need_full_repaint:
+                    _need_full_repaint = False
+                    curses.wrefresh(curses.curscr)
                 stdscr.erase()
                 max_y, max_x = stdscr.getmaxyx()
 
@@ -2035,11 +2055,37 @@ while True:
                         y += 1
 
                 stdscr.refresh()
-                time.sleep(max(0.1, float(refresh_s)))
+
+                # Read input; getch blocks up to timeout ms.
+                # Detect focus-in sequence ESC [ I (27, 91, 73).
+                try:
+                    ch = stdscr.getch()
+                except curses.error:
+                    ch = -1
+                if ch in (ord("q"), ord("Q")):
+                    return
+                if ch == 27:  # ESC - might be focus report
+                    stdscr.nodelay(True)
+                    try:
+                        c2 = stdscr.getch()
+                        c3 = stdscr.getch()
+                    except curses.error:
+                        c2 = c3 = -1
+                    stdscr.timeout(max(100, int(refresh_s * 1000)))
+                    if c2 == ord("[") and c3 == ord("I"):
+                        # Focus-in: force full repaint on next iteration
+                        _need_full_repaint = True
 
             except curses.error:
-                time.sleep(0.05)
+                curses.napms(50)
                 continue
+
+        # Disable focus reporting on exit
+        try:
+            sys.stdout.write("\033[?1004l")
+            sys.stdout.flush()
+        except Exception:
+            pass
 
     try:
         curses.wrapper(draw)
