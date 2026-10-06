@@ -1,0 +1,17 @@
+[Unit]
+Description=KKFM Sonos Music API (SMAPI) endpoint
+After=network-online.target acnh-aircheck.service
+Wants=network-online.target
+
+[Service]
+User=jpark
+WorkingDirectory=/home/jpark/sonos-smapi
+ExecStart=/usr/bin/python3 /home/jpark/sonos-smapi/smapi_server.py
+Environment=SMAPI_BIND=127.0.0.1
+Environment=SMAPI_PORT=8776
+Restart=on-failure
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
