@@ -1,22 +1,25 @@
-# User unit (no sudo needed): ~/.config/systemd/user/acnh-hourly.service
-# Hourly BGM player, packed build, stream-only (the radio owns the DAC / FM chip).
+# /etc/systemd/system/acnh-hourly.service
 [Unit]
 Description=KKFM hourly BGM (stream only, port 8791)
 After=network-online.target
 Wants=network-online.target
-
+RequiresMountsFor=/mnt/kkfm-usb
 [Service]
 Type=simple
+User=svc-kkfm
+Group=svc-kkfm
+SupplementaryGroups=svc-home
 WorkingDirectory=/mnt/kkfm-usb/kkfm/hourly-build
 ExecStart=/mnt/kkfm-usb/kkfm/hourly-build/hourly_bgm
 Environment=ACNH_STREAM_PORT=8791
-Environment=ACNH_LOCALHOST_ONLY=0
+Environment=ACNH_LOCALHOST_ONLY=1
 Environment=ACNH_DISABLE_DAC=1
 Environment=ACNH_STREAM_PREBUFFER_MS=4000
 Restart=on-failure
 RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
 StandardOutput=journal
 StandardError=journal
-
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

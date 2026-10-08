@@ -1,22 +1,23 @@
-# User unit: ~/.config/systemd/user/acnh-hourly-watchdog.service
-# Follows the hourly player's journal and runs the watchdog log monitor on it
-# (stdin mode: 1 s tick, BGM_* / WEATHER_* anomalies, RADIO_OFFLINE on stream close).
-# Status/flags go to $XDG_RUNTIME_DIR/kkfm-hourly (tmpfs); anomalies to the USB.
+# /etc/systemd/system/acnh-hourly-watchdog.service
 [Unit]
 Description=KKFM hourly BGM log watchdog
 After=acnh-hourly.service
 Wants=acnh-hourly.service
-
+RequiresMountsFor=/mnt/kkfm-usb
 [Service]
 Type=simple
+User=svc-kkfm
+Group=svc-kkfm
+SupplementaryGroups=systemd-journal svc-home
 WorkingDirectory=/mnt/kkfm-usb/kkfm/hourly-build
 RuntimeDirectory=kkfm-hourly
 RuntimeDirectoryMode=0755
-ExecStart=/bin/sh -c 'journalctl --user -u acnh-hourly.service -f -n 0 -o cat | /usr/bin/env python3 /mnt/kkfm-usb/kkfm/hourly-build/watchdog_run.py monitor-logs --stdin --unit acnh-hourly.service --out-dir /mnt/kkfm-usb/kkfm/hourly-build/watchdog/out'
+ExecStart=/bin/sh -c 'journalctl -u acnh-hourly.service -f -n 0 -o cat | /usr/bin/env python3 /mnt/kkfm-usb/kkfm/hourly-build/watchdog_run.py monitor-logs --stdin --unit acnh-hourly.service --out-dir /mnt/kkfm-usb/kkfm/hourly-build/watchdog/out'
 Restart=always
 RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
 StandardOutput=journal
 StandardError=inherit
-
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
