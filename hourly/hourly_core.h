@@ -341,6 +341,14 @@ inline std::string weatherkit_jwt(const WeatherKitCreds& c, std::time_t now) {
 inline int weather_refresh_slot(const std::tm& t) {
     return (t.tm_hour * 60 + t.tm_min + 1) / 15;
 }
+// 15-minute block of the day (:00 :15 :30 :45). WEATHER_CHANGES_PER_BLOCK weather changeovers
+// are permitted per block.
+constexpr int WEATHER_CHANGES_PER_BLOCK = 2;
+
+inline int weather_block(const std::tm& t) {
+    return t.tm_yday * 96 + t.tm_hour * 4 + t.tm_min / 15;
+}
+
 inline bool weather_refresh_due(const std::tm& now, int last_slot) {
     return weather_refresh_slot(now) != last_slot;
 }
@@ -643,6 +651,8 @@ public:
 
         // Startup: fill the in-memory weather before the first pick.
         int last_slot = weather_refresh_slot(clock());
+        int weather_block_id = -1;     // block the count below belongs to
+        int weather_block_changes = 0; // weather changeovers armed in that block
         if (!weather.overridden()) weather.refresh(clock());
 
         int tracks_done = 0;
@@ -688,12 +698,19 @@ public:
                     last_slot = weather_refresh_slot(now);
                     if (!weather.overridden()) weather.refresh(now);
                 }
-                bool weather_changed = weather.current() != w;
+                // Weather changeovers are limited per 15-minute block: once the block's allowance is
+                // used, a change waits for the next block, like the hour change.
+                if (weather_block(now) != weather_block_id) {
+                    weather_block_id = weather_block(now);
+                    weather_block_changes = 0;
+                }
+                bool weather_differs = weather.current() != w;
+                bool weather_changed = weather_differs && weather_block_changes < WEATHER_CHANGES_PER_BLOCK;
                 bool hour_changed = hour_index(now) != playing_hour;
 
                 // A loop-point changeover only happens if the track it would switch to differs from
                 // the playing one; until the fade starts, it follows the current hour and weather.
-                if (loop_armed && !hour_changed && !weather_changed && dec && dec->is_fade_armed() &&
+                if (loop_armed && !hour_changed && !weather_differs && dec && dec->is_fade_armed() &&
                     !dec->is_fading()) {
                     dec->disarm_fade();
                     armed = false;
@@ -723,6 +740,7 @@ public:
                         dec->arm_fade_at_next_loop(opt.fade_play_s, opt.fade_time_s);
                         armed = true;
                         loop_armed = !test_force;
+                        if (weather_changed && !hour_changed) weather_block_changes++;
                         arms++;
                         last_arm_from = playing_hour;
                         last_arm_to = hour_index(now);
