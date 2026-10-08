@@ -361,12 +361,16 @@ inline std::string http_get_via_curl(const std::string& url, int timeout_s = 15,
 }
 
 // In-memory weather for the upcoming 15-minute block (Apple WeatherKit). The pick reads current(); it never fetches.
-enum class WeatherSource { OpenMeteo, WeatherKit };
+enum class WeatherSource { OpenMeteo, WeatherKit, None };
 
-// HOURLY_WEATHER_SOURCE=weatherkit selects Apple WeatherKit; anything else (default) Open-Meteo.
+// HOURLY_WEATHER_SOURCE=weatherkit selects Apple WeatherKit; none disables fetching (the weather
+// only changes through /control/weather, e.g. pushed by the dashboard's weather source);
+// anything else (default) Open-Meteo.
 inline WeatherSource weather_source_from_env() {
     const char* v = std::getenv("HOURLY_WEATHER_SOURCE");
-    if (v && to_lower_copy(trim(v)) == "weatherkit") return WeatherSource::WeatherKit;
+    std::string s = v ? to_lower_copy(trim(v)) : "";
+    if (s == "weatherkit") return WeatherSource::WeatherKit;
+    if (s == "none") return WeatherSource::None;
     return WeatherSource::OpenMeteo;
 }
 
@@ -380,6 +384,10 @@ class WeatherState {
     std::function<std::string(std::time_t)> fetcher;
 
     void install_fetcher() {
+        if (source == WeatherSource::None) {
+            fetcher = nullptr;
+            return;
+        }
         if (source == WeatherSource::OpenMeteo) {
             fetcher = [](std::time_t) { return http_get_via_curl(open_meteo_url()); };
             return;
@@ -436,6 +444,7 @@ public:
         std::function<std::string(std::time_t)> f;
         WeatherSource src;
         { std::lock_guard<std::mutex> l(mut); f = fetcher; src = source; }
+        if (src == WeatherSource::None) return false;   // no fetching: the scheduled refresh is a no-op
         std::tm copy = now;
         copy.tm_isdst = -1;
         std::time_t now_t = std::mktime(&copy);

@@ -24,6 +24,7 @@ import errno
 from .paths import get_runtime_status_dir
 from .health_check import WatchdogHealthMonitor, read_status_file
 from . import sonos
+from .weather import make_source
 
 
 # Track whether terminal needs restoration (for signal handlers)
@@ -461,6 +462,7 @@ def run_dashboard(
     ssh_target: Optional[str] = None,
     stream_port: Optional[int] = None,
     profile: str = "radio",
+    weather_source: Optional[str] = None,
 ) -> int:
     global _terminal_active, _original_terminal_settings
 
@@ -485,6 +487,7 @@ def run_dashboard(
             ssh_target=ssh_target,
             stream_port=stream_port,
             profile=profile,
+            weather_source=weather_source,
         )
     finally:
         _restore_terminal()
@@ -495,9 +498,11 @@ def run_dashboard(
 
 def _run_dashboard_impl(
     *, out_dir: str, refresh_s: float, ssh_target: Optional[str], stream_port: Optional[int] = None,
-    profile: str = "radio",
+    profile: str = "radio", weather_source: Optional[str] = None,
 ) -> int:
     prof = PROFILES[profile]
+    # Hourly: the weather source picks the player's weather (Clear/Rain/Snow) when it changes.
+    weather_src = make_source(weather_source) if prof.name == "hourly" else None
     if stream_port is None:
         stream_port = prof.stream_port
     out_path = Path(out_dir)
@@ -1185,6 +1190,18 @@ while True:
 
             threading.Thread(target=_go, daemon=True).start()
 
+        weather_state: dict[str, Any] = {"reading": None, "sent": None}
+
+        def _poll_weather() -> None:
+            # changed() is a cheap stamp check; the source is only read when its data moved.
+            if weather_src is None or not weather_src.changed():
+                return
+            r = weather_src.read()
+            weather_state["reading"] = r
+            if r is not None and r.hourly and r.hourly != weather_state["sent"]:
+                weather_state["sent"] = r.hourly
+                _send_control(f"/control/weather/{r.hourly}", f"{r.source} {r.condition}")
+
         def _poll_sonos() -> None:
             nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll, sonos_stopped_polls, sonos_title, sonos_resumes, sonos_handoff_ts
             if sonos_state != "streaming" or not sonos_ip:
@@ -1337,6 +1354,7 @@ while True:
                 else:
                     _stop_sonos()
             _poll_sonos()
+            _poll_weather()
 
             if player_lock_holder["locked"] and player_state != "locked":
                 # The relay thread's integrity gate tripped: kill playback
@@ -1563,6 +1581,10 @@ while True:
                 y = 4
                 if y < max_y:
                     ctl = "1 Sunny  2 Rainy  3 Snowy  r next track"
+                    if weather_src is not None:
+                        r = weather_state["reading"]
+                        ctl += f"   |  {weather_src.name}: " + (
+                            f"{r.condition} ({time.strftime('%H:%M', time.localtime(r.as_of))})" if r else "no data")
                     if control_msg["text"]:
                         ctl += "   |  " + str(control_msg["text"])
                     stdscr.attron(curses.color_pair(3))

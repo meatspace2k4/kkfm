@@ -574,6 +574,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             ssh_target=ssh_target,
             stream_port=getattr(args, "stream_port", None),
             profile=str(getattr(args, "profile", "radio")),
+            weather_source=getattr(args, "weather_source", None),
         )
     )
 
@@ -721,6 +722,12 @@ def main() -> int:
         choices=["radio", "hourly"],
         default="radio",
         help="Service set to watch: radio (acnh-aircheck*, port 9000) or hourly (acnh-hourly* system units, port 8791)",
+    )
+    p.add_argument(
+        "--weather-source",
+        default="weather-app",
+        help="Hourly profile: where the player's weather comes from (weather-app: the macOS Weather "
+             "app via hourly/mac/WeatherWatch; none: only the 1/2/3 keys)",
     )
     p.set_defaults(func=cmd_dashboard)
 

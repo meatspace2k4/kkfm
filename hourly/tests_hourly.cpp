@@ -237,6 +237,22 @@ static void test_weather_state_open_meteo_and_manual() {
     ASSERT(ws.current() == Weather::Sunny);
 }
 
+static void test_weather_source_none_never_fetches() {
+    setenv("HOURLY_WEATHER_SOURCE", "none", 1);
+    ASSERT(weather_source_from_env() == WeatherSource::None);
+    unsetenv("HOURLY_WEATHER_SOURCE");
+    WeatherState ws(WeatherSource::None);
+    int calls = 0;
+    ws.set_fetcher([&calls](std::time_t) { calls++; return om_json("2026-09-20T12:00", 900, 0.3, 0.3, 0, 0); });
+    ASSERT(!ws.refresh(make_tm(12, 14)));                   // scheduled refresh is a no-op
+    ASSERT_EQ(calls, 0);
+    ASSERT(ws.current() == Weather::Sunny);
+    ws.set_manual(Weather::Rainy);                          // pushed via /control/weather
+    ASSERT(!ws.refresh(make_tm(12, 29)));
+    ASSERT(ws.current() == Weather::Rainy);                 // survives the next refresh slot
+    ASSERT_EQ(calls, 0);
+}
+
 static void test_base64url_and_der_to_raw() {
     ASSERT_STREQ(base64url("f"), "Zg");
     ASSERT_STREQ(base64url("fo"), "Zm8");
@@ -974,6 +990,7 @@ int main(int argc, char** argv) {
     run_test("filename_all_hours_and_weathers", test_filename_all_hours_and_weathers);
     run_test("hour_index_is_zero_based_local_hour", test_hour_index_is_zero_based_local_hour);
     run_test("hour_title", test_hour_title);
+    run_test("weather_source_none_never_fetches", test_weather_source_none_never_fetches);
     run_test("next_block_start", test_next_block_start);
     run_test("weatherkit_next_block_not_current", test_weatherkit_next_block_not_current);
     run_test("weatherkit_snow_from_summary", test_weatherkit_snow_from_summary);
