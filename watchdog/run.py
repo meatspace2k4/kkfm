@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+import tempfile
 import sys
 import time
 import json
@@ -99,6 +100,12 @@ def _maybe_redirect_status_path(p: Path) -> Path:
     s = str(p)
     if s.startswith("/run/") or s.startswith("/dev/shm/") or s.startswith("/tmp/"):
         return p
+    # The OS temp dir (macOS: /var/folders/...) is not the SD card either.
+    try:
+        if Path(tempfile.gettempdir()).resolve() in p.resolve().parents:
+            return p
+    except Exception:
+        pass
 
     # Otherwise, push to runtime tmpfs.
     return get_runtime_status_dir() / p.name
@@ -567,8 +574,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         clear_args = argparse.Namespace(
             ssh=ssh_target, out_dir=args.out_dir, profile=str(getattr(args, "profile", "radio"))
         )
-        if cmd_clear_anomalies(clear_args) != 0:
-            return 1
+        # A failed clear is reported and the dashboard starts anyway.
+        cmd_clear_anomalies(clear_args)
     
     return int(
         run_dashboard(
@@ -602,7 +609,6 @@ for p in paths:
         rc = 1
 if not found:
     print("no anomalies.jsonl at " + ", ".join(str(p) for p in paths))
-    rc = 1
 sys.exit(rc)
 '''
 
@@ -662,8 +668,7 @@ def cmd_clear_anomalies(args: argparse.Namespace) -> int:
             print(f"failed {p}: {e}", file=sys.stderr)
             rc = 1
     if not found:
-        print("no anomalies.jsonl found to clear", file=sys.stderr)
-        rc = 1
+        print("no anomalies.jsonl found to clear")
     return rc
 
 

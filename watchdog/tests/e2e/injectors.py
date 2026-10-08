@@ -239,9 +239,10 @@ class EventInjector:
         )
 
     def _trigger_dac_ring_underrun(self) -> TriggerResult:
-        """Trigger DAC_RING_UNDERRUN anomaly."""
+        """Trigger DAC_RING_UNDERRUN anomaly (the detector needs 3 underruns within 10 s)."""
         events = [
-            Event(EventType.DAC_UNDERRUN, ts=self._next_ts(), raw="[DAC] Ring buffer underrun; outputting silence", name=None),
+            Event(EventType.DAC_UNDERRUN, ts=self._next_ts(), raw="[DAC] Ring buffer underrun; outputting silence", name=None)
+            for _ in range(3)
         ]
         return TriggerResult(
             trigger=AnomalyTrigger.DAC_RING_UNDERRUN,

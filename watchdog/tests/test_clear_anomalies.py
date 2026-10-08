@@ -30,11 +30,11 @@ class TestClearAnomalies(unittest.TestCase):
             self.assertTrue(p.exists())
             self.assertEqual(p.read_text(), "")
 
-    def test_local_missing_file_fails(self) -> None:
+    def test_local_missing_file_is_not_an_error(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(run, "_anomalies_targets", return_value=[str(Path(d) / "none.jsonl")]):
                 rc = run.cmd_clear_anomalies(argparse.Namespace(ssh="", out_dir=d, profile="radio"))
-            self.assertEqual(rc, 1)
+            self.assertEqual(rc, 0)
 
     def test_remote_script_truncates_and_reports(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -46,7 +46,7 @@ class TestClearAnomalies(unittest.TestCase):
             self.assertEqual(p.read_text(), "")
             r = subprocess.run([sys.executable, "-", str(Path(d) / "absent.jsonl")],
                                input=run._CLEAR_REMOTE_SCRIPT, capture_output=True, text=True)
-            self.assertEqual(r.returncode, 1)
+            self.assertEqual(r.returncode, 0)
 
     def test_remote_ssh_failure_is_nonzero(self) -> None:
         done = subprocess.CompletedProcess([], 255, stdout="", stderr="ssh: connect failed")
@@ -56,6 +56,14 @@ class TestClearAnomalies(unittest.TestCase):
         cmd = m.call_args.args[0]
         self.assertIn("pi@host", cmd)
         self.assertEqual(cmd[-1], "/home/jpark/Aircheck/kkfm/watchdog/out-hourly/anomalies.jsonl")
+
+    def test_dashboard_starts_when_clear_fails(self) -> None:
+        args = argparse.Namespace(ssh="pi@host", out_dir="/x", profile="hourly", clear_anomalies=True,
+                                  refresh=1.0, stream_port=None, weather_source=None)
+        with mock.patch.object(run, "cmd_clear_anomalies", return_value=1), \
+             mock.patch.object(run, "run_dashboard", return_value=0) as dash:
+            self.assertEqual(run.cmd_dashboard(args), 0)
+        dash.assert_called_once()
 
 
 if __name__ == "__main__":

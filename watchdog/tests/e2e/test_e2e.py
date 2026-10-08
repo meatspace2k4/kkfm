@@ -39,6 +39,8 @@ class TestE2EAnomalyDetection(unittest.TestCase):
             AnomalyTrigger.TX_SKETCH_RESTART,
             AnomalyTrigger.TX_RECOVERY,
             AnomalyTrigger.TX_SERIAL_ERROR,
+            # The detector no longer emits unexpected-restart anomalies.
+            AnomalyTrigger.UNIT_RESTART_UNEXPECTED,
         }
 
         with E2ETestHarness() as harness:
@@ -290,8 +292,8 @@ class TestE2ETimeoutAnomalies(unittest.TestCase):
 
             self.assertTrue(harness.has_anomaly(AnomalyCode.JINGLE_START_NO_END))
 
-    def test_unit_restart_unexpected(self) -> None:
-        """Verify unexpected unit restart is detected."""
+    def test_unit_restart_not_reported(self) -> None:
+        """A restart without a safe shutdown is not reported (operator and recovery restarts look the same)."""
         with E2ETestHarness() as harness:
             ts = time.time()
 
@@ -299,9 +301,9 @@ class TestE2ETimeoutAnomalies(unittest.TestCase):
             anomalies1 = harness.inject_event(Event(EventType.UNIT_STARTED, ts=ts, raw="Started"))
             self.assertFalse(any(a.code == AnomalyCode.AIRCHECK_UNIT_STARTED_UNEXPECTED for a in anomalies1))
 
-            # Second start without safe shutdown is unexpected
+            # Second start without safe shutdown
             anomalies2 = harness.inject_event(Event(EventType.UNIT_STARTED, ts=ts + 1, raw="Started"))
-            self.assertTrue(any(a.code == AnomalyCode.AIRCHECK_UNIT_STARTED_UNEXPECTED for a in anomalies2))
+            self.assertFalse(any(a.code == AnomalyCode.AIRCHECK_UNIT_STARTED_UNEXPECTED for a in anomalies2))
 
     def test_safe_shutdown_allows_restart(self) -> None:
         """Verify safe shutdown prevents restart anomaly."""
