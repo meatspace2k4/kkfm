@@ -73,11 +73,9 @@ class TestDetector(unittest.TestCase):
         out3 = d.feed(Event(EventType.DAC_UNDERRUN, ts=3.0, raw="[DAC] underrun", name=None))
         self.assertFalse(any(a.code == AnomalyCode.DAC_RING_UNDERRUN for a in (out1 + out2 + out3)))
 
-        # After grace period, normal debounce should apply.
+        # After the grace period a single underrun is reported.
         a1 = d.feed(Event(EventType.DAC_UNDERRUN, ts=12.0, raw="[DAC] underrun", name=None))
-        a2 = d.feed(Event(EventType.DAC_UNDERRUN, ts=13.0, raw="[DAC] underrun", name=None))
-        a3 = d.feed(Event(EventType.DAC_UNDERRUN, ts=14.0, raw="[DAC] underrun", name=None))
-        self.assertTrue(any(a.code == AnomalyCode.DAC_RING_UNDERRUN for a in (a1 + a2 + a3)))
+        self.assertTrue(any(a.code == AnomalyCode.DAC_RING_UNDERRUN for a in a1))
 
     def test_dead_air_recovered_emits_info(self):
         d = Detector(dead_air_timeout_s=5.0)

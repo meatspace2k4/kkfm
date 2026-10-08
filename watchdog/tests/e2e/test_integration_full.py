@@ -122,11 +122,10 @@ class TestFullIntegration(unittest.TestCase):
                 EventType.JINGLE_START, ts=ts + 10.1, raw="start", name="JingleB"
             ))
 
-            # 4. DAC underruns (the detector needs 3 within 10 s)
-            for dt in (15, 15.5, 16):
-                harness.inject_event(Event(
-                    EventType.DAC_UNDERRUN, ts=ts + dt, raw="[DAC] underrun"
-                ))
+            # 4. DAC underrun
+            harness.inject_event(Event(
+                EventType.DAC_UNDERRUN, ts=ts + 15, raw="[DAC] underrun"
+            ))
 
             # Should have exactly 3 anomalies
             self.assertEqual(len(harness.captured_anomalies), 3)

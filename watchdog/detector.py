@@ -134,7 +134,7 @@ class Detector:
         
         # Debounce DAC underruns: only emit anomaly after N underruns in a window.
         self._underrun_timestamps: list[float] = []
-        self.underrun_debounce_count: int = 3  # require this many underruns
+        self.underrun_debounce_count: int = 1  # a single underrun is reported
         self.underrun_debounce_window_s: float = 10.0  # within this time window
 
     def snapshot(self) -> dict:
