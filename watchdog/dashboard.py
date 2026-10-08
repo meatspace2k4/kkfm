@@ -1403,7 +1403,7 @@ while True:
             try:
                 if _need_full_repaint:
                     _need_full_repaint = False
-                    curses.wrefresh(curses.curscr)
+                    stdscr.clearok(True)   # repaint the whole screen on the next refresh
                 stdscr.erase()
                 max_y, max_x = stdscr.getmaxyx()
 
