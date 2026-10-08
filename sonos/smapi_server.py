@@ -480,8 +480,8 @@ def open_hls_source(sid):
 # ID3v2.4 tag carrying the MPEG-TS timestamp (PRIV), the title (TIT2) and the artwork
 # (WXXX "artworkURL_<w>x"). Segments are cut on ADTS frame boundaries; a producer runs only
 # while a player keeps polling.
-HLS_SEGMENT_S = float(os.environ.get("SMAPI_HLS_SEGMENT_S", "2"))
-HLS_WINDOW = 8
+HLS_SEGMENT_S = float(os.environ.get("SMAPI_HLS_SEGMENT_S", "6"))   # long segments: the player keeps ~18 s buffered
+HLS_WINDOW = 10
 ART_SIZES = (640, 1280)
 HLS_IDLE_S = 60
 _AAC_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
@@ -582,7 +582,7 @@ class HlsStream:
     def playlist(self):
         self.touch()
         with self.cond:
-            self.cond.wait_for(lambda: len(self.segments) >= 3, timeout=15)
+            self.cond.wait_for(lambda: len(self.segments) >= 1, timeout=10)
             segs = list(self.segments)
         if not segs:
             return None
