@@ -96,6 +96,7 @@ Thumbs.db
 # Runtime Outputs & Logs
 # -----------------------------------------------------------------------------
 watchdog/out/
+watchdog/out-hourly/
 watchdog/out_scan_check/
 *.jsonl
 *.log

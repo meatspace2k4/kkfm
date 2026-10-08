@@ -9,7 +9,7 @@ are untouched. This process only reads what already exists:
                     (last 200 lines, then follow). The client parses these
                     lines itself, exactly as the watchdog's log_parser does.
   GET /status.json  one JSON snapshot: systemd unit states + tx_status.json
-                    + anomalies.jsonl tail from /run/kkfm-watchdog. Same
+                    + anomalies.jsonl tail (watchdog/out, or /run/kkfm-watchdog). Same
                     shape as the ssh dashboard's remote snapshot.
   GET /dash/        the 3D dashboard page itself, embedded on the public
                     hostname. Any /dash-prefixed path is served as if the
@@ -95,6 +95,16 @@ def _read_json(p):
         return None
 
 
+def _anomalies_path(status_dir):
+    """The watchdog writes anomalies to its --out-dir (watchdog/out next to this
+    checkout), not the runtime status dir; take the first that exists."""
+    for p in (HERE.parent / "watchdog" / "out" / "anomalies.jsonl",
+              status_dir / "anomalies.jsonl"):
+        if p.exists():
+            return p
+    return status_dir / "anomalies.jsonl"
+
+
 def _tail_jsonl(p, n=50):
     try:
         lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -162,7 +172,7 @@ class Handler(BaseHTTPRequestHandler):
             "services": {u: _systemctl_state(u) for u in UNITS},
             "tx": tx,
             "log": _read_json(d / "log_status.json"),
-            "anomalies": _tail_jsonl(d / "anomalies.jsonl", 50),
+            "anomalies": _tail_jsonl(_anomalies_path(d), 50),
         }
         body = json.dumps(snap, ensure_ascii=False).encode()
         self._hdr(200, "application/json", [("Content-Length", str(len(body)))])

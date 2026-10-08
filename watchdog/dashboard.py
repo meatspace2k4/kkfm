@@ -155,7 +155,9 @@ PROFILES: dict[str, DashboardProfile] = {
         user_units=False,
         stream_port=8791,
         status_dir="/run/kkfm-hourly",
-        anomalies="/mnt/kkfm-usb/kkfm/hourly-build/watchdog/out/anomalies.jsonl",
+        # The hourly watchdog writes here (drop-in --out-dir) so jpark can read it;
+        # /mnt/kkfm-usb is svc-home only.
+        anomalies="/home/jpark/Aircheck/kkfm/watchdog/out-hourly/anomalies.jsonl",
         title="HOURLY BGM",
         transmitter=False,
     ),
