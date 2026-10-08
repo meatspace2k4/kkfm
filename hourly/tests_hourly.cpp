@@ -759,6 +759,51 @@ static void test_player_changeover_on_pushed_weather() {
     ASSERT_EQ(p.last_pick_weather.load(), (int)Weather::Rainy);
 }
 
+// A loop-point changeover is dropped when, before the fade starts, the hour and weather point
+// back at the playing track: it keeps looping instead of fading out and restarting itself.
+static void test_player_changeover_dropped_when_track_unchanged() {
+    Mixer mixer;
+    WeatherState ws(WeatherSource::None);
+    PlayerOptions o;
+    o.sound_dir = sound_dir();
+    o.heartbeat_s = 0;
+    o.gap_s = 0.05f;
+    o.test_max_tracks = 2;
+    HourlyPlayer p(mixer, ws, o);
+    p.set_clock([]() { return make_tm(9, 5); });
+
+    std::atomic<bool> pumping{true};
+    std::vector<int16_t> block(MIX_BLOCK_FRAMES * 2, 0);
+    std::thread pump([&]() {
+        auto next = std::chrono::steady_clock::now();
+        while (pumping) {
+            mixer.mix_block(block.data(), MIX_BLOCK_FRAMES);
+            next += std::chrono::microseconds((int64_t)MIX_BLOCK_FRAMES * 1000000 / 48000 / 40);
+            std::this_thread::sleep_until(next);
+        }
+    });
+    std::thread runner([&]() { p.run(); });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline && p.picks.load() == 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ws.set_manual(Weather::Snowy);
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline && p.arms.load() == 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_EQ(p.arms.load(), 1);
+    ws.set_manual(Weather::Sunny);                         // the playing track's weather again
+
+    std::this_thread::sleep_for(std::chrono::seconds(8));  // several loops at 40x
+    ASSERT_EQ(p.track_ends.load(), 0);
+    ASSERT_EQ(p.picks.load(), 1);
+
+    p.request_stop();
+    runner.join();
+    pumping = false;
+    pump.join();
+}
+
 static std::string http_fetch_path(uint16_t port, const std::string& path, size_t want_bytes);
 
 // Skip ('r'): the hour and weather stay, the playing track is not cut; its fade is armed
@@ -1067,6 +1112,7 @@ int main(int argc, char** argv) {
     run_test("player_changeover_only_on_hour", test_player_changeover_only_on_hour);
     run_test("player_changeover_on_weather_change", test_player_changeover_on_weather_change);
     run_test("player_changeover_on_pushed_weather", test_player_changeover_on_pushed_weather);
+    run_test("player_changeover_dropped_when_track_unchanged", test_player_changeover_dropped_when_track_unchanged);
     run_test("player_skip_queues_next_track", test_player_skip_queues_next_track);
     run_test("stream_server_range_resume", test_stream_server_range_resume);
     run_test("stream_server_control_route", test_stream_server_control_route);

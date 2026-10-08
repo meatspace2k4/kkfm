@@ -1016,6 +1016,8 @@ public:
         fade_armed = true;
     }
     bool is_fade_armed() const { return fade_armed; }
+    // Drop an armed fade that has not started; the next loop hit loops as usual.
+    void disarm_fade() { fade_armed = false; }
     // Start the radio fade immediately from the current position (no play-on).
     void fade_out_now(float fade_time_s) {
         size_t n = (size_t)(fade_time_s * ctx->rate);

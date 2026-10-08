@@ -673,6 +673,7 @@ public:
             auto dec = tr->get_decoder();
             const int playing_hour = hour;
             bool armed = false;
+            bool loop_armed = false;   // armed for the next loop point by an hour/weather change
             auto last_heartbeat = std::chrono::steady_clock::now();
 
             while (!tr->done() && !stop_sig) {
@@ -688,6 +689,18 @@ public:
                     if (!weather.overridden()) weather.refresh(now);
                 }
                 bool weather_changed = weather.current() != w;
+                bool hour_changed = hour_index(now) != playing_hour;
+
+                // A loop-point changeover only happens if the track it would switch to differs from
+                // the playing one; until the fade starts, it follows the current hour and weather.
+                if (loop_armed && !hour_changed && !weather_changed && dec && dec->is_fade_armed() &&
+                    !dec->is_fading()) {
+                    dec->disarm_fade();
+                    armed = false;
+                    loop_armed = false;
+                    log_info_f(C_YELLOW "[HOURLY] " C_RESET "Changeover dropped: " C_CYAN "%s" C_RESET
+                               " is still the track for this hour and weather", lb->name.c_str());
+                }
 
                 // 'r' fades out now, also over a loop-end changeover that has not started fading yet.
                 if (dec && skip_sig.exchange(false) && !dec->is_fading()) {
@@ -695,6 +708,7 @@ public:
                         dec->fade_out_now(opt.fade_time_s);
                         if (!armed) arms++;
                         armed = true;
+                        loop_armed = false;
                         last_arm_from = playing_hour;
                         last_arm_to = hour_index(now);
                         log_info_f(C_YELLOW "[HOURLY] " C_RESET "Changeover %02d -> %02d: " C_CYAN "%s" C_RESET
@@ -703,12 +717,12 @@ public:
                     }
                 }
                 if (!armed && dec) {
-                    bool hour_changed = hour_index(now) != playing_hour;
                     bool test_force = opt.test_loops_before_switch > 0 &&
                                       dec->loops_hit() >= (size_t)opt.test_loops_before_switch;
                     if (hour_changed || weather_changed || test_force) {
                         dec->arm_fade_at_next_loop(opt.fade_play_s, opt.fade_time_s);
                         armed = true;
+                        loop_armed = !test_force;
                         arms++;
                         last_arm_from = playing_hour;
                         last_arm_to = hour_index(now);
