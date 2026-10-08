@@ -564,8 +564,11 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     
     # Clear anomalies first if requested
     if getattr(args, "clear_anomalies", False):
-        clear_args = argparse.Namespace(ssh=ssh_target, out_dir=args.out_dir)
-        cmd_clear_anomalies(clear_args)
+        clear_args = argparse.Namespace(
+            ssh=ssh_target, out_dir=args.out_dir, profile=str(getattr(args, "profile", "radio"))
+        )
+        if cmd_clear_anomalies(clear_args) != 0:
+            return 1
     
     return int(
         run_dashboard(
@@ -579,61 +582,89 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     )
 
 
+_CLEAR_REMOTE_SCRIPT = r'''
+import os, sys
+from pathlib import Path
+uid = os.getuid()
+paths = [Path(a.format(uid=uid)).expanduser() for a in sys.argv[1:]]
+rc = 0
+found = False
+for p in paths:
+    if not p.exists():
+        continue
+    found = True
+    try:
+        with open(p, "r+") as f:
+            f.truncate(0)
+        print(f"cleared {p}")
+    except Exception as e:
+        print(f"failed {p}: {e}")
+        rc = 1
+if not found:
+    print("no anomalies.jsonl at " + ", ".join(str(p) for p in paths))
+    rc = 1
+sys.exit(rc)
+'''
+
+
+def _anomalies_targets(profile: str, *, remote: bool, out_dir: str) -> list[str]:
+    """Every anomalies.jsonl the dashboard may read for `profile`, so a clear empties the file it shows."""
+    from .dashboard import PROFILES
+
+    prof = PROFILES.get(profile) or PROFILES["radio"]
+    if prof.anomalies:
+        return [prof.anomalies]
+    return [
+        "/run/kkfm-watchdog/anomalies.jsonl",
+        "/run/user/{uid}/kkfm-watchdog/anomalies.jsonl",
+        "/dev/shm/kkfm-watchdog-{uid}/anomalies.jsonl",
+        # The radio watchdog's --out-dir on the Pi.
+        *(["~/Aircheck/kkfm/watchdog/out/anomalies.jsonl"] if remote else []),
+        str(Path(out_dir) / "anomalies.jsonl"),
+    ]
+
+
 def cmd_clear_anomalies(args: argparse.Namespace) -> int:
-    """Clear the anomalies.jsonl log file (local or remote via SSH)."""
+    """Truncate the anomalies.jsonl log the watchdog writes (local, or on the Pi via ssh)."""
     ssh_target = getattr(args, "ssh", None) or None
-    
+    profile = str(getattr(args, "profile", "radio") or "radio")
+    targets = _anomalies_targets(profile, remote=bool(ssh_target), out_dir=str(args.out_dir))
+
     if ssh_target:
-        # Remote clear via SSH - truncate the known location
-        cmd = ["ssh", "-o", "ConnectTimeout=5", ssh_target, 
-               "truncate", "-s", "0", "/run/kkfm-watchdog/anomalies.jsonl"]
+        cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh_target,
+               "--", "python3", "-", *targets]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
-                print(f"Cleared anomalies on {ssh_target}")
-            else:
-                print(f"Note: {result.stderr.strip() or 'file may not exist'}")
-            return 0
+            result = subprocess.run(cmd, input=_CLEAR_REMOTE_SCRIPT, capture_output=True, text=True, timeout=15)
         except subprocess.TimeoutExpired:
-            print("SSH command timed out", file=sys.stderr)
+            print(f"clear-anomalies: ssh to {ssh_target} timed out", file=sys.stderr)
             return 1
         except Exception as e:
-            print(f"SSH error: {e}", file=sys.stderr)
+            print(f"clear-anomalies: ssh error: {e}", file=sys.stderr)
             return 1
-    else:
-        # Local clear
-        from .paths import get_runtime_status_dir
-        
-        uid = os.getuid()
-        candidates = [
-            Path("/run/kkfm-watchdog") / "anomalies.jsonl",
-            Path(f"/run/user/{uid}/kkfm-watchdog") / "anomalies.jsonl",
-            Path(f"/dev/shm/kkfm-watchdog-{uid}") / "anomalies.jsonl",
-            Path(args.out_dir) / "anomalies.jsonl",
-        ]
-        
-        # Also check runtime dir
+        out = (result.stdout + result.stderr).strip()
+        if out:
+            print(f"{ssh_target}: {out}", file=sys.stdout if result.returncode == 0 else sys.stderr)
+        return 0 if result.returncode == 0 else 1
+
+    uid = os.getuid()
+    rc = 0
+    found = False
+    for t in targets:
+        p = Path(t.format(uid=uid)).expanduser()
+        if not p.exists():
+            continue
+        found = True
         try:
-            runtime_dir = get_runtime_status_dir()
-            candidates.insert(0, runtime_dir / "anomalies.jsonl")
-        except Exception:
-            pass
-        
-        cleared = []
-        for p in candidates:
-            try:
-                if p.exists():
-                    p.write_text("")
-                    cleared.append(str(p))
-            except Exception as e:
-                print(f"Failed to clear {p}: {e}", file=sys.stderr)
-        
-        if cleared:
-            print(f"Cleared: {', '.join(cleared)}")
-        else:
-            print("No anomalies.jsonl files found to clear")
-        
-        return 0
+            with open(p, "r+") as f:
+                f.truncate(0)
+            print(f"cleared {p}")
+        except Exception as e:
+            print(f"failed {p}: {e}", file=sys.stderr)
+            rc = 1
+    if not found:
+        print("no anomalies.jsonl found to clear", file=sys.stderr)
+        rc = 1
+    return rc
 
 
 def main() -> int:
@@ -706,10 +737,10 @@ def main() -> int:
         help="Run dashboard locally but read Pi data via ssh (e.g. pi@raspberrypi)",
     )
     p.add_argument(
-        "--clear-anomalies", "-c",
+        "--clear", "--clear-anomalies", "-c",
         action="store_true",
         dest="clear_anomalies",
-        help="Clear the anomalies log before starting the dashboard",
+        help="Truncate the anomalies log (on the --ssh host when given) before starting the dashboard",
     )
     p.add_argument(
         "--stream-port",
@@ -738,6 +769,7 @@ def main() -> int:
         default="",
         help="Clear anomalies on remote host via ssh (e.g. pi@raspberrypi)",
     )
+    p.add_argument("--profile", choices=["radio", "hourly"], default="radio")
     p.set_defaults(func=cmd_clear_anomalies)
 
     args = ap.parse_args()
