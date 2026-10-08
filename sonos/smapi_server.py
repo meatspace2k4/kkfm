@@ -447,7 +447,7 @@ def open_source(sid):
     if sid == "kkfm":
         # -seekable 0: the :9000 server answers Range requests with only the WAV header.
         proc = subprocess.Popen(
-            ["nice", "-n", "10", "ffmpeg", "-nostdin", "-loglevel", "error", "-seekable", "0",
+            ["nice", "-n", "19", "ffmpeg", "-nostdin", "-loglevel", "error", "-threads", "1", "-seekable", "0",
              "-i", f"http://{UPSTREAM_HOST}:{KKFM_PORT}/stream.wav",
              "-c:a", "libmp3lame", "-b:a", MP3_BITRATE, "-f", "mp3", "-"],
             stdout=subprocess.PIPE)
@@ -465,7 +465,7 @@ def open_hls_source(sid):
     src = (f"http://{UPSTREAM_HOST}:{KKFM_PORT}/stream.wav" if sid == "kkfm"
            else f"http://{UPSTREAM_HOST}:{RADIO_PORT}/radio.mp3")
     proc = subprocess.Popen(
-        ["nice", "-n", "10", "ffmpeg", "-nostdin", "-loglevel", "error", "-seekable", "0", "-i", src,
+        ["nice", "-n", "19", "ffmpeg", "-nostdin", "-loglevel", "error", "-threads", "1", "-seekable", "0", "-i", src,
          "-c:a", "aac", "-b:a", AAC_BITRATE, "-f", "adts", "-"],
         stdout=subprocess.PIPE)
 
