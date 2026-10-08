@@ -978,6 +978,9 @@ class Decoder {
     size_t armed_play_lim;
     size_t armed_fade_lim;
     size_t loops_hit_count;
+    // Fade starting right now (hourly fork 'next track'): fade length in samples,
+    // posted from the control thread and applied by the decoding thread.
+    std::atomic<size_t> fade_now_req{0};
 
 public:
    Decoder(std::shared_ptr<AudioCtx> c, bool oneshot, float fade_play_s, float fade_time_s)
@@ -1013,6 +1016,11 @@ public:
         fade_armed = true;
     }
     bool is_fade_armed() const { return fade_armed; }
+    // Start the radio fade immediately from the current position (no play-on).
+    void fade_out_now(float fade_time_s) {
+        size_t n = (size_t)(fade_time_s * ctx->rate);
+        fade_now_req.store(n > 0 ? n : 1);
+    }
     size_t loops_hit() const { return loops_hit_count; }
     bool is_fading() const { return fading_enabled && looped; }
 
@@ -1030,6 +1038,14 @@ public:
    // Decode one 14-sample ADPCM block for every channel stream in lockstep.
    // out_r may be null; for a mono ctx it receives a copy of the left channel.
    int decode_block(int16_t* out_14, int16_t* out_14_r) {
+       if (size_t n = fade_now_req.exchange(0)) {
+           fade_armed = false;
+           fading_enabled = true;
+           play_lim = 0;
+           fade_lim = n;
+           looped = true;
+           post_loop_pos = 0;
+       }
        bool is_loopable = !oneshot_forced && (ctx->loop_end > 0) && (ctx->loop_start != 0xFFFFFFFF);
        bool hit_loop = is_loopable && (sample_pos >= ctx->loop_end);
 

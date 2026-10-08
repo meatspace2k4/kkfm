@@ -10,10 +10,12 @@
  * Same env as the radio: ACNH_STREAM_PORT, ACNH_LOCALHOST_ONLY, ACNH_AUDIO_DEVICE,
  * ACNH_AUDIO_DEVICE_INDEX, ACNH_DISABLE_DAC, ACNH_DEBUG.
  * Fork env: HOURLY_SOUND_DIR (default hourly/Stream), HOURLY_HEARTBEAT_S,
- * HOURLY_WEATHER_OVERRIDE=Sunny|Rainy|Snowy, HOURLY_WEATHER_URL,
+ * HOURLY_WEATHER_OVERRIDE=Sunny|Rainy|Snowy,
+ * WeatherKit: HOURLY_WK_KEY_FILE, HOURLY_WK_KEY_ID, HOURLY_WK_TEAM_ID, HOURLY_WK_SERVICE_ID,
  * test hooks HOURLY_TEST_LOOPS_BEFORE_SWITCH, HOURLY_TEST_MAX_TRACKS, HOURLY_WAV_DUMP.
  */
 #include "hourly_core.h"
+#include "radio_stream.h"
 
 // The engine links against a packed asset blob; the fork keeps audio on disk.
 const uint8_t assets_blob[16] = {0};
@@ -72,6 +74,23 @@ void handle_shutdown_signal(int) {
 
 // Engine sample rate from a BGM header (the radio reads it from its blob).
 void init_engine_sample_rate_from_dir(const std::string& dir) {
+#ifdef HOURLY_USE_BLOB
+    (void)dir;
+    for (size_t i = 0; i < hourly_assets_count; ++i) {
+        const HourlyAsset& a = hourly_assets[i];
+        const uint8_t* head = hourly_assets_blob + a.offset;
+        if (a.size < 96 || std::memcmp(head, "BWAV", 4) != 0) continue;
+        uint16_t chans = read_u16(head + 14);
+        if (chans != 1 && chans != 2) continue;
+        uint32_t rate = read_u32(head + 16 + 4);
+        if (rate < 8000 || rate > 192000) continue;
+        g_engine_sample_rate.store(rate);
+        log_info_f(C_BLUE "[AUDIO] " C_RESET "Engine sample rate from packed BWAV header: %uHz (%u ch, %zu assets)", rate, (unsigned)chans, hourly_assets_count);
+        return;
+    }
+    log_error("[AUDIO] No BGM header in the packed assets; using default sample rate");
+    return;
+#endif
     for (int hour = 0; hour < 24; ++hour) {
         for (hourly::Weather w : {hourly::Weather::Sunny, hourly::Weather::Rainy, hourly::Weather::Snowy}) {
             std::ifstream f(dir + "/" + hourly::bgm_filename(hour, w), std::ios::binary);
@@ -111,7 +130,6 @@ int main(int argc, char** argv) {
     bool localhost_only = env_truthy(std::getenv("ACNH_LOCALHOST_ONLY"));
 
     hourly::WeatherState weather;
-    if (const char* u = std::getenv("HOURLY_WEATHER_URL")) if (*u) weather.set_url(u);
     if (const char* ov = std::getenv("HOURLY_WEATHER_OVERRIDE")) {
         hourly::Weather w;
         if (hourly::weather_from_name(ov, w)) {
@@ -140,6 +158,39 @@ int main(int argc, char** argv) {
     hourly::HourlyPlayer player(mixer, weather, opt);
     g_player = &player;
 
+    // Dashboard controls: /control/weather/{sunny|rainy|snowy}, /control/skip
+    server.set_control_handler([&](const std::string& path) -> std::string {
+        const std::string wpre = "/control/weather/";
+        if (path.rfind(wpre, 0) == 0) {
+            hourly::Weather w;
+            if (!hourly::weather_from_name(path.substr(wpre.size()), w)) return "error: unknown weather\n";
+            weather.set_manual(w);
+            return std::string("ok: weather ") + hourly::weather_name(w) + "\n";
+        }
+        if (path == "/control/skip") {
+            player.request_skip();
+            log_info(C_YELLOW "[HOURLY] " C_RESET "Skip requested: next track queued after this one fades");
+            return "ok: next track queued\n";
+        }
+        return "error: unknown control\n";
+    });
+
+    // Internet-radio output: MP3 (libmp3lame, in-process) with ICY StreamTitle at /radio.mp3.
+    hourly::RadioEncoder radio(buffer, 192);
+    if (radio.start((int)engine_sample_rate())) {
+        uint64_t pre_ms = 0;
+        if (const char* v = std::getenv("ACNH_STREAM_PREBUFFER_MS")) parse_u64(v, pre_ms);
+        server.set_route("/radio.mp3", [&radio, pre_ms](const std::string& headers, const StreamServer::RouteSend& send,
+                                                        const std::function<bool()>& alive) {
+            bool icy = get_header_value(headers, "Icy-MetaData") == "1";
+            hourly::serve_radio_client(radio.mp3(), radio.bitrate(), icy, pre_ms, "KKFM Hourly", send, alive);
+        });
+        player.on_track = [&radio](const std::string& title) { radio.set_title(title); };
+        log_info(C_BLUE "[WEB] " C_RESET "Radio stream (MP3 192k, ICY titles) at /radio.mp3");
+    } else {
+        log_error("[WEB] MP3 encoder failed to start; /radio.mp3 disabled");
+    }
+
     pump.start();
     if (!server.start(port, localhost_only)) {
         log_error("[WEB] Failed to start HTTP server on port " + std::to_string(port));
@@ -157,6 +208,7 @@ int main(int argc, char** argv) {
     player.run();
 
     server.stop();
+    radio.stop();
     pump.stop();
     dac.shutdown();
     mixer.close(engine_sample_rate());

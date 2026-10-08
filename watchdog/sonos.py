@@ -31,8 +31,9 @@ class Player:
     coordinator: bool
 
 
-def discover(timeout_s: float = 2.0) -> list[str]:
-    """IPs of Sonos players answering an SSDP M-SEARCH."""
+def discover(timeout_s: float = 2.0, first_only: bool = False) -> list[str]:
+    """IPs of Sonos players answering an SSDP M-SEARCH. With first_only, return as
+    soon as one answers (the topology call names every player and the coordinator)."""
     msg = (
         "M-SEARCH * HTTP/1.1\r\n"
         f"HOST: {SSDP_ADDR[0]}:{SSDP_ADDR[1]}\r\n"
@@ -52,6 +53,8 @@ def discover(timeout_s: float = 2.0) -> list[str]:
                 break
             if b"Sonos" in data and addr[0] not in ips:
                 ips.append(addr[0])
+                if first_only:
+                    break
     finally:
         s.close()
     return ips
@@ -108,7 +111,7 @@ def topology(any_ip: str) -> list[Player]:
 
 
 def find_coordinator(timeout_s: float = 2.0) -> Player:
-    ips = discover(timeout_s)
+    ips = discover(timeout_s, first_only=True)
     if not ips:
         raise SonosError("no Sonos players found on the network")
     players = topology(ips[0])
@@ -163,6 +166,49 @@ def set_uri_and_play(coordinator_ip: str, url: str, title: str = "KKFM") -> None
         pass
     soap(coordinator_ip, "AVTransport", "/MediaRenderer/AVTransport/Control", "SetAVTransportURI", body)
     soap(coordinator_ip, "AVTransport", "/MediaRenderer/AVTransport/Control", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+
+def radio_uri(http_url: str) -> str:
+    """Sonos addresses an internet-radio stream (MP3/AAC with ICY metadata) with
+    the x-rincon-mp3radio scheme: no length, live StreamTitle."""
+    if http_url.startswith("http://"):
+        return "x-rincon-mp3radio://" + http_url[len("http://"):]
+    return http_url
+
+
+def set_radio_and_play(coordinator_ip: str, http_url: str, station: str = "KKFM") -> None:
+    meta = (
+        '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+        'xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/">'
+        '<item id="R:0/0/0" parentID="R:0/0" restricted="true">'
+        f"<dc:title>{html.escape(station)}</dc:title>"
+        "<upnp:class>object.item.audioItem.audioBroadcast</upnp:class>"
+        '<desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">SA_RINCON65031_</desc>'
+        "</item></DIDL-Lite>"
+    )
+    uri = radio_uri(http_url)
+    body = (
+        "<InstanceID>0</InstanceID>"
+        f"<CurrentURI>{html.escape(uri)}</CurrentURI>"
+        f"<CurrentURIMetaData>{html.escape(meta)}</CurrentURIMetaData>"
+    )
+    try:
+        stop(coordinator_ip)
+    except SonosError:
+        pass
+    soap(coordinator_ip, "AVTransport", "/MediaRenderer/AVTransport/Control", "SetAVTransportURI", body)
+    soap(coordinator_ip, "AVTransport", "/MediaRenderer/AVTransport/Control", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+
+def serves_radio(http_url: str, timeout_s: float = 3.0) -> bool:
+    """True if `http_url` (the player's /radio.mp3) answers as an MP3 stream."""
+    req = urllib.request.Request(http_url, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return resp.status == 200 and "audio/mpeg" in (resp.headers.get("Content-Type") or "")
+    except Exception:
+        return False
 
 
 def stop(coordinator_ip: str) -> None:

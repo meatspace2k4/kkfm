@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <fstream>
+#include <functional>
 
 extern void log_error(const std::string& msg);
 extern void log_info(const std::string& msg);
@@ -66,6 +67,11 @@ inline ByteRangeRequest parse_range_header(const std::string& header) {
 }
 
 class StreamServer {
+public:
+    using RouteSend = std::function<bool(const void*, size_t)>;
+    using RouteHandler = std::function<void(const std::string& headers, const RouteSend& send,
+                                            const std::function<bool()>& alive)>;
+private:
     PCMBuffer& buffer;
     std::atomic<bool> running;
     std::thread accept_thread;
@@ -77,6 +83,12 @@ class StreamServer {
     std::set<int> active_client_fds;
     std::atomic<int> active_client_count{0};
 
+    std::mutex control_mutex;
+    std::function<std::string(const std::string&)> control_handler;
+    std::string route_path;
+    RouteHandler route_handler;
+    void send_control(int fd, const std::string& path);
+
 public:
     explicit StreamServer(PCMBuffer& buf)
         : buffer(buf), running(false), listen_fd(-1), port(DEFAULT_STREAM_PORT) {}
@@ -85,6 +97,22 @@ public:
 
     bool start(uint16_t listen_port, bool localhost_only = false);
     void stop();
+
+    // Optional GET /control/... handler (set by a player that accepts commands).
+    // Receives the request path; returns the plain-text reply. Unset: 404.
+    void set_control_handler(std::function<std::string(const std::string&)> h) {
+        std::lock_guard<std::mutex> lock(control_mutex);
+        control_handler = std::move(h);
+    }
+
+    // Optional extra GET route served by the caller on the client socket (e.g. an
+    // MP3 radio stream). The handler writes the whole response with `send`, and
+    // keeps going while `alive()` is true. Unset: the path is a 404 as before.
+    void set_route(const std::string& path, RouteHandler h) {
+        std::lock_guard<std::mutex> lock(control_mutex);
+        route_path = path;
+        route_handler = std::move(h);
+    }
 
 private:
     void accept_loop();

@@ -1,4 +1,5 @@
 #include "StreamServer.h"
+#include <cstdlib>
 
 bool StreamServer::start(uint16_t listen_port, bool localhost_only) {
     port = listen_port;
@@ -167,7 +168,25 @@ void StreamServer::handle_client(int client_fd) {
         return p == "/stream" || p == "/stream.wav" || p == "/stream.pcm" || p == "/stream.raw";
     };
 
-    if (path == "/" || path == "/index.html") {
+    RouteHandler route;
+    {
+        std::lock_guard<std::mutex> lock(control_mutex);
+        if (!route_path.empty() && path == route_path) route = route_handler;
+    }
+    if (route) {
+        if (head_only) {
+            const std::string h = "HTTP/1.0 200 OK\r\nContent-Type: audio/mpeg\r\nConnection: close\r\n\r\n";
+            send_string(client_fd, h);
+            return;
+        }
+        log_info(C_BLUE "[WEB] " C_RESET "Radio client " C_GREEN "connected" C_RESET);
+        route(headers,
+              [&](const void* d, size_t n) { return send_all(client_fd, d, n); },
+              [&]() { return running.load(); });
+        log_info(C_BLUE "[WEB] " C_RESET "Radio client " C_YELLOW "disconnected" C_RESET);
+    } else if (path == "/control" || path.rfind("/control/", 0) == 0) {
+        send_control(client_fd, path);
+    } else if (path == "/" || path == "/index.html") {
         send_index(client_fd, head_only);
     } else if (is_stream_path(path)) {
         if (!range_value.empty() && handle_range_probe(client_fd, range_req)) {
@@ -264,6 +283,27 @@ void StreamServer::send_index(int fd, bool head_only) {
     }
 }
 
+void StreamServer::send_control(int fd, const std::string& path) {
+    std::function<std::string(const std::string&)> h;
+    {
+        std::lock_guard<std::mutex> lock(control_mutex);
+        h = control_handler;
+    }
+    if (!h) {
+        send_not_found(fd);
+        return;
+    }
+    std::string payload = h(path);
+    std::ostringstream hdr;
+    hdr << "HTTP/1.1 200 OK\r\n"
+        << "Content-Type: text/plain; charset=utf-8\r\n"
+        << "Content-Length: " << payload.size() << "\r\n"
+        << "Cache-Control: no-store\r\n"
+        << "Connection: close\r\n\r\n";
+    send_string(fd, hdr.str());
+    send_string(fd, payload);
+}
+
 void StreamServer::send_not_found(int fd) {
     const std::string payload = "Not Found";
     std::ostringstream hdr;
@@ -302,7 +342,19 @@ void StreamServer::stream_audio(int fd, bool head_only, uint64_t resume_from) {
     }
 
     std::vector<int16_t> chunk(STREAM_CHUNK_FRAMES * CHANNELS, 0);
+    // Start each client a few seconds back in the ring so it receives a burst and
+    // keeps a cushion; starting exactly at "now" leaves players (Sonos, ffplay)
+    // with an empty buffer that runs dry on any network hiccup or clock drift.
+    // ACNH_STREAM_PREBUFFER_MS (default 0 = start at now), capped by the ring size.
     uint64_t cursor = buffer.latest_cursor();
+    {
+        uint64_t pre_ms = 0;
+        if (const char* v = std::getenv("ACNH_STREAM_PREBUFFER_MS")) parse_u64(v, pre_ms);
+        uint64_t pre = pre_ms * (uint64_t)SAMPLE_RATE / 1000;
+        uint64_t cap = (uint64_t)PCM_RING_FRAMES - (uint64_t)SAMPLE_RATE;   // keep 1 s clear of the writer
+        if (pre > cap) pre = cap;
+        cursor = (cursor > pre) ? cursor - pre : 0;
+    }
 
     while (running.load() && !buffer.is_closed()) {
         size_t frames = buffer.read(cursor, chunk.data(), STREAM_CHUNK_FRAMES, PCM_READ_TIMEOUT_MS);
