@@ -136,6 +136,8 @@ class DashboardProfile:
     anomalies: Optional[str]     # remote anomalies.jsonl (None: radio defaults)
     title: str = "KKFM AIRCHECK"  # header title
     transmitter: bool = True      # has the Arduino/Si4713 TX telemetry (tx_status.json)
+    breaks: bool = True           # plays jingles/commercials (JING/COMM lines)
+    weather_controls: bool = False  # 1/2/3 weather keys and the weather source
 
 
 PROFILES: dict[str, DashboardProfile] = {
@@ -161,6 +163,8 @@ PROFILES: dict[str, DashboardProfile] = {
         anomalies="/home/jpark/Aircheck/kkfm/watchdog/out-hourly/anomalies.jsonl",
         title="HOURLY BGM",
         transmitter=False,
+        breaks=False,
+        weather_controls=True,
     ),
 }
 
@@ -502,7 +506,7 @@ def _run_dashboard_impl(
 ) -> int:
     prof = PROFILES[profile]
     # Hourly: the weather source picks the player's weather (Clear/Rain/Snow) when it changes.
-    weather_src = make_source(weather_source) if prof.name == "hourly" else None
+    weather_src = make_source(weather_source) if prof.weather_controls else None
     if stream_port is None:
         stream_port = prof.stream_port
     out_path = Path(out_dir)
@@ -1341,7 +1345,7 @@ while True:
                     _reset_player_lock()
                 else:
                     _send_control("/control/skip", "next track")
-            if ch in (ord("1"), ord("2"), ord("3")):
+            if prof.weather_controls and ch in (ord("1"), ord("2"), ord("3")):
                 w = {ord("1"): "sunny", ord("2"): "rainy", ord("3"): "snowy"}[ch]
                 weather_state["sent"] = w   # the weather source holds from what the keys set
                 _send_control(f"/control/weather/{w}", f"weather {w}")
@@ -1582,7 +1586,7 @@ while True:
                 # CONTROLS: 1/2/3 set the player's weather, 'r' queues the next track.
                 y = 4
                 if y < max_y:
-                    ctl = "1 Sunny  2 Rainy  3 Snowy  r next track"
+                    ctl = ("1 Sunny  2 Rainy  3 Snowy  " if prof.weather_controls else "") + "r next track"
                     if weather_src is not None:
                         r = weather_state["reading"]
                         ctl += f"   |  {weather_src.name}: " + (
@@ -1665,8 +1669,9 @@ while True:
                     stdscr.attroff(color | curses.A_BOLD)
                     y += 1
 
-                y += 1
-                if y < max_y:
+                if prof.transmitter:
+                    y += 1
+                if prof.transmitter and y < max_y:
                     stdscr.attron(section_title_attr)
                     stdscr.addnstr(y, 2, "TRANSMITTER (Arduino/Si4713)", max(0, max_x - 3))
                     stdscr.attroff(section_title_attr)
@@ -2087,7 +2092,7 @@ while True:
                                     stdscr.addnstr(y, status_col, "IDLE", max(0, max_x - status_col - 1))
                             y += 1
                         
-                        for kind, data in [("JING", jing), ("COMM", com)]:
+                        for kind, data in ([("JING", jing), ("COMM", com)] if prof.breaks else []):
                             if y >= max_y: break
                             # Fixed column positions for alignment
                             label_col = 4
