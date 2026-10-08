@@ -9,6 +9,7 @@ from watchdog.weather import (
     WeatherAppSource,
     hourly_weather,
     make_source,
+    next_hourly,
     wk2_current_condition,
 )
 
@@ -52,6 +53,19 @@ class TestWeather(unittest.TestCase):
         self.assertEqual(hourly_weather("Snow"), "snowy")
         for other in ("MostlyCloudy", "MostlyClear", "Drizzle", "HeavyRain", "Flurries", "Windy"):
             self.assertIsNone(hourly_weather(other), other)
+
+    def test_rainy_and_snowy_hold_until_clear(self):
+        # From Sunny (or unknown at startup) Rain/Snow switch; Clear while sunny is no change.
+        self.assertEqual(next_hourly("sunny", "Rain"), "rainy")
+        self.assertEqual(next_hourly("sunny", "Snow"), "snowy")
+        self.assertEqual(next_hourly(None, "Rain"), "rainy")
+        self.assertEqual(next_hourly(None, "Clear"), "sunny")
+        self.assertIsNone(next_hourly("sunny", "Clear"))
+        self.assertIsNone(next_hourly("sunny", "MostlyCloudy"))
+        for held in ("rainy", "snowy"):
+            for cond in ("Cloudy", "MostlyCloudy", "MostlyClear", "Drizzle", "Flurries", "Rain", "Snow"):
+                self.assertIsNone(next_hourly(held, cond), (held, cond))
+            self.assertEqual(next_hourly(held, "Clear"), "sunny")
 
     def test_wk2_enum_values_checked_against_the_app(self):
         self.assertEqual(WK2_CONDITIONS[0], "Clear")

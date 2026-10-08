@@ -1198,9 +1198,10 @@ while True:
                 return
             r = weather_src.read()
             weather_state["reading"] = r
-            if r is not None and r.hourly and r.hourly != weather_state["sent"]:
-                weather_state["sent"] = r.hourly
-                _send_control(f"/control/weather/{r.hourly}", f"{r.source} {r.condition}")
+            nxt = r.next_hourly(weather_state["sent"]) if r is not None else None
+            if nxt:
+                weather_state["sent"] = nxt
+                _send_control(f"/control/weather/{nxt}", f"{r.source} {r.condition}")
 
         def _poll_sonos() -> None:
             nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll, sonos_stopped_polls, sonos_title, sonos_resumes, sonos_handoff_ts
@@ -1342,6 +1343,7 @@ while True:
                     _send_control("/control/skip", "next track")
             if ch in (ord("1"), ord("2"), ord("3")):
                 w = {ord("1"): "sunny", ord("2"): "rainy", ord("3"): "snowy"}[ch]
+                weather_state["sent"] = w   # the weather source holds from what the keys set
                 _send_control(f"/control/weather/{w}", f"weather {w}")
             if ch in (ord("p"), ord("P")) and player_state != "locked":
                 if player_state == "idle":

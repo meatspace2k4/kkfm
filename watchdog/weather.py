@@ -1,9 +1,9 @@
 """Weather sources for the hourly profile: what the sky is doing, as an Apple condition.
 
 A WeatherSource reports the current condition as an Apple WeatherKit conditionCode name
-("Rain", "MostlyCloudy", ...). The dashboard maps Clear/Rain/Snow to the hourly player's
-Sunny/Rainy/Snowy track sets with `hourly_weather()` and sends it to the player when it
-changes; other conditions leave the player alone. A source only says what the condition is.
+("Rain", "MostlyCloudy", ...). The dashboard picks the hourly player's track set with
+`next_hourly()`: from Sunny, Rain and Snow switch to Rainy/Snowy; Rainy and Snowy hold through
+everything until Clear switches back to Sunny. A source only says what the condition is.
 
   WeatherAppSource  the macOS Weather app's own data: its cached WeatherKit responses,
                     mirrored by hourly/mac/WeatherWatch.swift (the only process with Full
@@ -35,6 +35,17 @@ def hourly_weather(condition: str) -> Optional[str]:
     return HOURLY_BY_CONDITION.get(condition)
 
 
+def next_hourly(current: Optional[str], condition: str) -> Optional[str]:
+    """The track set to switch to, or None to keep `current`. Rainy and Snowy hold until the
+    sky is Clear (then Sunny); only from Sunny (or unknown) do Rain/Snow switch."""
+    target = hourly_weather(condition)
+    if target is None or target == current:
+        return None
+    if current in ("rainy", "snowy") and target != "sunny":
+        return None
+    return target
+
+
 @dataclass(frozen=True)
 class WeatherReading:
     condition: str      # Apple conditionCode name, e.g. "MostlyCloudy"
@@ -44,6 +55,9 @@ class WeatherReading:
     @property
     def hourly(self) -> Optional[str]:
         return hourly_weather(self.condition)
+
+    def next_hourly(self, current: Optional[str]) -> Optional[str]:
+        return next_hourly(current, self.condition)
 
 
 class WeatherSource(ABC):
