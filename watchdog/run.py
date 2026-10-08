@@ -186,6 +186,36 @@ def _clear_all_runtime_state_for_uid(*, clear_status: bool, clear_anomalies: boo
         )
 
 
+def _unit_journal_since_start(unit: str, *, max_lines: int = 20000) -> list[tuple[str, float | None]]:
+    """(message, ts) for every journal line of `unit` since it last became active.
+
+    Empty when systemd/journalctl is unavailable or the unit is not active.
+    """
+    try:
+        out = subprocess.run(
+            ["systemctl", "show", "-p", "ActiveEnterTimestamp", "--timestamp=unix", "--value", unit],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except Exception:
+        return []
+    if not out.startswith("@"):
+        return []
+    try:
+        res = subprocess.run(
+            ["journalctl", "--no-pager", "-u", unit, "--since", out, "-n", str(int(max_lines)),
+             "-o", "json", "--output-fields=MESSAGE,__REALTIME_TIMESTAMP"],
+            capture_output=True, timeout=30,
+        )
+    except Exception:
+        return []
+    lines: list[tuple[str, float | None]] = []
+    for raw in res.stdout.decode("utf-8", errors="replace").splitlines():
+        msg, ts = _journal_json_to_message_and_ts(raw)
+        if msg is not None:
+            lines.append((msg, ts))
+    return lines
+
+
 def _journal_json_to_message_and_ts(raw: str) -> tuple[str | None, float | None]:
     """Parse a single `journalctl -o json` line.
 
@@ -330,6 +360,20 @@ def cmd_monitor_logs(args: argparse.Namespace) -> int:
         tmp.write_text(json.dumps(snap, ensure_ascii=False) + "\n", encoding="utf-8")
         tmp.replace(status_p)
 
+    def seed_from_journal() -> None:
+        """Rebuild the detector and status from the unit's current run, so a watchdog
+        restart shows what is playing now. Anomalies from the replay are not re-reported."""
+        nonlocal last_ev
+        for msg, ts in _unit_journal_since_start(str(args.unit)):
+            t = ts if ts is not None else time.time()
+            maybe_note_bwav(msg, t)
+            ev = parse_event(msg, default_ts=t)
+            if not ev:
+                continue
+            last_ev = ev
+            det.feed(ev)
+        maybe_write_status(time.time(), force=True)
+
     if args.input_file:
         src = Path(args.input_file).read_text(errors="ignore").splitlines()
         base_ts = time.time()
@@ -357,6 +401,7 @@ def cmd_monitor_logs(args: argparse.Namespace) -> int:
         # detector's timeout checks (dead air, BGM changeover/pick timeouts, weather
         # staleness) run and the status file stays fresh even when the player is quiet
         # for minutes (the hourly BGM fork logs only on the hour plus a heartbeat).
+        seed_from_journal()
         sfd = sys.stdin.fileno()
         os.set_blocking(sfd, False)
         buf = b""
@@ -413,6 +458,9 @@ def cmd_monitor_logs(args: argparse.Namespace) -> int:
                     rep.emit(action)
             maybe_write_status(now)
         return 0
+
+    if str(args.since) == "now":
+        seed_from_journal()
 
     # Live journalctl
     # Use JSON output so we never get hard-wrapped lines and we can use the
