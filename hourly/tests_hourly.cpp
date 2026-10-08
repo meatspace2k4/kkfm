@@ -704,6 +704,61 @@ static void test_player_changeover_on_weather_change() {
     ASSERT_EQ(p.last_pick_weather.load(), (int)Weather::Rainy);
 }
 
+// Weather pushed through /control/weather between refresh slots (HOURLY_WEATHER_SOURCE=none):
+// the fade is armed right away for the next loop point, not at the next :14/:29/:44/:59.
+static void test_player_changeover_on_pushed_weather() {
+    Mixer mixer;
+    WeatherState ws(WeatherSource::None);
+    PlayerOptions o;
+    o.sound_dir = sound_dir();
+    o.heartbeat_s = 0;
+    o.gap_s = 0.05f;
+    o.test_max_tracks = 2;
+    HourlyPlayer p(mixer, ws, o);
+    p.set_clock([]() { return make_tm(9, 5); });   // no hour change, no refresh slot
+
+    std::atomic<bool> pumping{true};
+    std::vector<int16_t> block(MIX_BLOCK_FRAMES * 2, 0);
+    std::thread pump([&]() {
+        auto next = std::chrono::steady_clock::now();
+        while (pumping) {
+            mixer.mix_block(block.data(), MIX_BLOCK_FRAMES);
+            next += std::chrono::microseconds((int64_t)MIX_BLOCK_FRAMES * 1000000 / 48000 / 40);
+            std::this_thread::sleep_until(next);
+        }
+    });
+    std::thread runner([&]() { p.run(); });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline && p.picks.load() == 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_EQ(p.last_pick_weather.load(), (int)Weather::Sunny);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    ASSERT_EQ(p.arms.load(), 0);
+
+    ws.set_manual(Weather::Rainy);                         // /control/weather/rainy
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline && p.arms.load() == 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_EQ(p.arms.load(), 1);                           // armed at once, same hour
+    ASSERT_EQ(p.track_ends.load(), 0);                     // not cut
+    ASSERT_EQ(p.last_arm_from.load(), 9);
+    ASSERT_EQ(p.last_arm_to.load(), 9);
+
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(40);
+    while (std::chrono::steady_clock::now() < deadline && p.picks.load() < 2)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    p.request_stop();
+    runner.join();
+    pumping = false;
+    pump.join();
+
+    ASSERT_EQ(p.track_ends.load(), 1);
+    ASSERT_EQ(p.picks.load(), 2);
+    ASSERT_EQ(p.last_pick_hour.load(), 9);
+    ASSERT_EQ(p.last_pick_weather.load(), (int)Weather::Rainy);
+}
+
 static std::string http_fetch_path(uint16_t port, const std::string& path, size_t want_bytes);
 
 // Skip ('r'): the hour and weather stay, the playing track is not cut; its fade is armed
@@ -1011,6 +1066,7 @@ int main(int argc, char** argv) {
     run_test("mono_ctx_mixes_l_equals_r", test_mono_ctx_mixes_l_equals_r);
     run_test("player_changeover_only_on_hour", test_player_changeover_only_on_hour);
     run_test("player_changeover_on_weather_change", test_player_changeover_on_weather_change);
+    run_test("player_changeover_on_pushed_weather", test_player_changeover_on_pushed_weather);
     run_test("player_skip_queues_next_track", test_player_skip_queues_next_track);
     run_test("stream_server_range_resume", test_stream_server_range_resume);
     run_test("stream_server_control_route", test_stream_server_control_route);

@@ -678,15 +678,16 @@ public:
             while (!tr->done() && !stop_sig) {
                 now = clock();
 
-                // Every 15 minutes (:14 :29 :44 :59) the next block's weather is fetched.
-                // If it differs from the playing track's weather, that is a changeover
-                // like the hour change: the track is not cut, the fade is armed.
-                bool weather_changed = false;
+                // Every 15 minutes (:14 :29 :44 :59) the next block's weather is fetched (a no-op
+                // with HOURLY_WEATHER_SOURCE=none). Whenever the in-memory weather differs from the
+                // playing track's (a fetch, or /control/weather from the dashboard), that is a
+                // changeover like the hour change: the track is not cut, the fade is armed for its
+                // next loop point and the new weather's track is queued.
                 if (weather_refresh_due(now, last_slot)) {
                     last_slot = weather_refresh_slot(now);
                     if (!weather.overridden()) weather.refresh(now);
-                    weather_changed = weather.current() != w;
                 }
+                bool weather_changed = weather.current() != w;
 
                 // 'r' fades out now, also over a loop-end changeover that has not started fading yet.
                 if (dec && skip_sig.exchange(false) && !dec->is_fading()) {
