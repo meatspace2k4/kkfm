@@ -146,14 +146,14 @@ PROFILES: dict[str, DashboardProfile] = {
         status_dir=None,
         anomalies=None,
     ),
-    # Hourly BGM on the Pi: user units from hourly/deploy/, packed build on the USB.
+    # Hourly BGM on the Pi: system units running as svc-kkfm, packed build on the USB.
     "hourly": DashboardProfile(
         name="hourly",
         units=("acnh-hourly.service", "acnh-hourly-watchdog.service"),
         watchdog_unit="acnh-hourly-watchdog.service",
-        user_units=True,
+        user_units=False,
         stream_port=8791,
-        status_dir="/run/user/{uid}/kkfm-hourly",
+        status_dir="/run/kkfm-hourly",
         anomalies="/mnt/kkfm-usb/kkfm/hourly-build/watchdog/out/anomalies.jsonl",
         title="HOURLY BGM",
         transmitter=False,
@@ -293,6 +293,45 @@ def _stream_host(ssh_target: Optional[str]) -> str:
     if ssh_target and "@" in ssh_target:
         return ssh_target.split("@", 1)[1]
     return ssh_target or "127.0.0.1"
+
+
+# The players bind loopback only (ACNH_LOCALHOST_ONLY=1), so a remote dashboard reaches
+# their HTTP port through an SSH local forward instead of the LAN.
+class _SshTunnel:
+    def __init__(self, ssh_target: str, remote_port: int) -> None:
+        import socket
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.local_port = sock.getsockname()[1]
+        self.proc = subprocess.Popen(
+            ["ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-o", "BatchMode=yes",
+             "-L", f"127.0.0.1:{self.local_port}:localhost:{remote_port}", ssh_target],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 8.0
+        while time.time() < deadline and self.proc.poll() is None:
+            try:
+                socket.create_connection(("127.0.0.1", self.local_port), timeout=0.5).close()
+                break
+            except OSError:
+                time.sleep(0.2)
+
+    @property
+    def base(self) -> str:
+        return f"http://127.0.0.1:{self.local_port}"
+
+    def close(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2.0)
+            except Exception:
+                self.proc.kill()
+
+
+# Sonos can't reach the loopback-only players either; it plays the LAN MP3 relay that the
+# Sonos SMAPI service (sonos/smapi_server.py) runs on the Pi, which carries live ICY titles.
+SONOS_RELAY_PORT = 8777
+SONOS_RELAY_PATH = {"radio": "/kkfm.mp3", "hourly": "/hourly.mp3"}
 
 
 # SAFETY - HARD LOCK, matching the jukebox's BwavPlayer (jukebox-web/lib/
@@ -459,7 +498,9 @@ def _run_dashboard_impl(
     if stream_port is None:
         stream_port = prof.stream_port
     out_path = Path(out_dir)
-    stream_url = f"http://{_stream_host(ssh_target)}:{stream_port}/stream"
+    tunnel = _SshTunnel(ssh_target, stream_port) if ssh_target else None
+    player_base = tunnel.base if tunnel else f"http://127.0.0.1:{stream_port}"
+    stream_url = f"{player_base}/stream"
     player_bin = shutil.which("ffplay") or shutil.which("mpv")
     player_proc_holder: dict[str, Any] = {"proc": None, "stop_flag": None}
     # Set by _stream_relay's integrity gate; a background thread writes this,
@@ -1023,24 +1064,19 @@ while True:
         sonos_transport: Optional[str] = None
         sonos_last_poll: float = 0.0
 
-        def _stream_url_for_sonos(coord_ip: str, path: str = "/stream") -> str:
+        def _stream_url_for_sonos(coord_ip: str) -> str:
             host = _stream_host(ssh_target)
             if host in ("127.0.0.1", "localhost", "::1"):
                 host = sonos.local_ip_towards(coord_ip)
-            return f"http://{host}:{stream_port}{path}"
+            return f"http://{host}:{SONOS_RELAY_PORT}{SONOS_RELAY_PATH[prof.name]}"
 
-        # Players that serve /radio.mp3 (hourly) go to the Sonos as an internet-radio
-        # station: live ICY titles, no length cap. Others (the radio) use the WAV track.
-        sonos_radio: bool = False
+        # Both players go to the Sonos as an internet-radio station through the relay:
+        # live ICY titles, no length cap.
+        sonos_radio: bool = True
 
         def _hand_to_sonos(coord_ip: str) -> None:
-            nonlocal sonos_radio
-            radio_url = _stream_url_for_sonos(coord_ip, "/radio.mp3")
-            sonos_radio = sonos.serves_radio(radio_url)
-            if sonos_radio:
-                sonos.set_radio_and_play(coord_ip, radio_url, station="KKFM Hourly")
-            else:
-                sonos.set_uri_and_play(coord_ip, _stream_url_for_sonos(coord_ip), title=sonos_title or "KKFM Aircheck")
+            station = "Hourly BGM" if prof.name == "hourly" else "KKFM"
+            sonos.set_radio_and_play(coord_ip, _stream_url_for_sonos(coord_ip), station=station)
 
         sonos_title: Optional[str] = None
 
@@ -1078,14 +1114,13 @@ while True:
             try:
                 coord = sonos.find_coordinator()
                 cur = sonos.current_uri(coord.ip) or ""
-                radio = sonos.radio_uri(_stream_url_for_sonos(coord.ip, "/radio.mp3"))
-                wav = _stream_url_for_sonos(coord.ip)
-                if cur not in (radio, wav):
+                radio = sonos.radio_uri(_stream_url_for_sonos(coord.ip))
+                if cur != radio:
                     return
                 if sonos_state != "idle":
                     return   # 's' was pressed meanwhile
                 sonos_room, sonos_ip = coord.room, coord.ip
-                sonos_radio = cur == radio
+                sonos_radio = True
                 sonos_title = _sonos_track_title()
                 sonos_transport = sonos.transport_state(coord.ip)
                 sonos_handoff_ts = time.time()
@@ -1116,7 +1151,7 @@ while True:
         control_msg: dict[str, Any] = {"text": None}
 
         def _send_control(path: str, label: str) -> None:
-            url = f"http://{_stream_host(ssh_target)}:{stream_port}{path}"
+            url = f"{player_base}{path}"
             control_msg["text"] = f"{label}: sending..."
 
             def _go() -> None:
@@ -1154,7 +1189,7 @@ while True:
                     sonos_stopped_polls += 1
                     if sonos_stopped_polls >= 2:
                         url = _stream_url_for_sonos(sonos_ip)
-                        radio_url = sonos.radio_uri(_stream_url_for_sonos(sonos_ip, "/radio.mp3"))
+                        radio_url = sonos.radio_uri(url)
                         cur = sonos.current_uri(sonos_ip)
                         if cur not in (None, "", url, radio_url):
                             # Someone switched the Sonos to another source: hand it back to them.
@@ -2197,6 +2232,8 @@ while True:
     try:
         curses.wrapper(draw)
     finally:
+        if tunnel is not None:
+            tunnel.close()
         proc = player_proc_holder["proc"]
         if proc is not None:
             try:

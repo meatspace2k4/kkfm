@@ -720,7 +720,7 @@ def main() -> int:
         "--profile",
         choices=["radio", "hourly"],
         default="radio",
-        help="Service set to watch: radio (acnh-aircheck*, port 9000) or hourly (acnh-hourly* user units, port 8791)",
+        help="Service set to watch: radio (acnh-aircheck*, port 9000) or hourly (acnh-hourly* system units, port 8791)",
     )
     p.set_defaults(func=cmd_dashboard)
 
