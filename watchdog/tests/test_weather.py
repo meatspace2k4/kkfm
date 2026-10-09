@@ -5,6 +5,9 @@ import tempfile
 import unittest
 
 from watchdog.weather import (
+    RAINY,
+    SNOWY,
+    SUNNY,
     WK2_CONDITIONS,
     WeatherAppSource,
     WeatherFollower,
@@ -12,18 +15,15 @@ from watchdog.weather import (
     hourly_weather,
     make_source,
     wk2_current_condition,
-    wk2_current_weather,
 )
 
 
-def wk2_weather(code=None, as_of=1791447660, precip=None):
-    """A minimal WK2.Weather FlatBuffer: root field 1 -> CurrentWeatherData with asOf (field 1),
-    unless None conditionCode (field 6) and precipitationIntensity (field 22)."""
+def wk2_weather(code=None, as_of=1791447660):
+    """A minimal WK2.Weather FlatBuffer: root field 1 -> CurrentWeatherData with asOf (field 1)
+    and, unless None, conditionCode (field 6)."""
     cur_fields = {1: struct.pack("<I", as_of)}
     if code is not None:
         cur_fields[6] = struct.pack("<B", code) + b"\0\0\0"
-    if precip is not None:
-        cur_fields[22] = struct.pack("<f", precip)
     buf = bytearray(4)                                # root offset, patched below
     # root vtable + table
     root_vt = len(buf)
@@ -33,7 +33,7 @@ def wk2_weather(code=None, as_of=1791447660, precip=None):
     ref_pos = len(buf)
     buf += b"\0\0\0\0"                                # uoffset to CurrentWeatherData
     cur_vt = len(buf)
-    slots = [0] * 23
+    slots = [0] * 7
     layout, off = [], 4
     for idx in sorted(cur_fields):
         slots[idx] = off
@@ -50,32 +50,31 @@ def wk2_weather(code=None, as_of=1791447660, precip=None):
 
 
 class TestWeather(unittest.TestCase):
-    def test_reported_precipitation_decides(self):
-        # Nothing falling is sunny whatever the condition; something falling is rain or snow.
-        self.assertEqual(WeatherReading("IsolatedThunderstorms", 0.0, 0, "t").hourly, "sunny")
-        self.assertEqual(WeatherReading("Cloudy", 0.0, 0, "t").hourly, "sunny")
-        self.assertEqual(WeatherReading("Thunderstorms", 3.1, 0, "t").hourly, "rainy")
-        self.assertEqual(WeatherReading("Rain", 2.066, 0, "t").hourly, "rainy")
-        self.assertEqual(WeatherReading("Cloudy", 0.017, 0, "t").hourly, "rainy")
-        self.assertEqual(WeatherReading("Snow", 0.8, 0, "t").hourly, "snowy")
+    def test_state_engine(self):
+        self.assertEqual(hourly_weather("Rain"), RAINY)
+        self.assertEqual(hourly_weather("Thunderstorms"), RAINY)
+        self.assertEqual(hourly_weather("Snow"), SNOWY)
+        self.assertEqual(hourly_weather("IsolatedThunderstorms"), SUNNY)
+        self.assertEqual(hourly_weather("Cloudy"), SUNNY)
+        self.assertEqual(hourly_weather("Clear"), SUNNY)
 
-    def test_no_hold_from_previous_weather(self):
-        # The 16:00 case: rain, then IsolatedThunderstorms with nothing falling, picks sunny.
-        readings = [("Rain", 2.0), ("IsolatedThunderstorms", 0.0), ("Cloudy", 0.0), ("Rain", 0.5)]
-        self.assertEqual([WeatherReading(c, p, 0, "t").hourly for c, p in readings],
-                         ["rainy", "sunny", "sunny", "rainy"])
+    def test_no_hold_from_previous_state(self):
+        # The 16:00 case: rain, then IsolatedThunderstorms, picks sunny.
+        readings = ["Rain", "IsolatedThunderstorms", "Cloudy", "Thunderstorms", "Snow", "Clear"]
+        self.assertEqual([WeatherReading(c, 0, "t").hourly for c in readings],
+                         [RAINY, SUNNY, SUNNY, RAINY, SNOWY, SUNNY])
 
     def test_follower_skips_identical_weather(self):
-        # Playing clear: IsolatedThunderstorms then Cloudy, both dry, push nothing more.
+        # Playing clear: IsolatedThunderstorms then Cloudy keep it sunny, so nothing is pushed.
         f = WeatherFollower()
-        f.on_reading(WeatherReading("Clear", 0.0, 0, "t").hourly)
-        self.assertEqual(f.due(0), "sunny"); f.started(); f.finished("sunny", True, 0)
-        f.on_reading(WeatherReading("IsolatedThunderstorms", 0.0, 0, "t").hourly)
+        f.on_reading(WeatherReading("Clear", 0, "t").hourly)
+        self.assertEqual(f.due(0), SUNNY); f.started(); f.finished(SUNNY, True, 0)
+        f.on_reading(WeatherReading("IsolatedThunderstorms", 0, "t").hourly)
         self.assertIsNone(f.due(100))
-        f.on_reading(WeatherReading("Cloudy", 0.0, 0, "t").hourly)
+        f.on_reading(WeatherReading("Cloudy", 0, "t").hourly)
         self.assertIsNone(f.due(100))
-        f.on_reading(WeatherReading("Rain", 1.2, 0, "t").hourly)
-        self.assertEqual(f.due(100), "rainy")
+        f.on_reading(WeatherReading("Rain", 0, "t").hourly)
+        self.assertEqual(f.due(100), RAINY)
 
     def test_follower_retries_until_acknowledged(self):
         f = WeatherFollower(retry_s=5)
@@ -98,10 +97,6 @@ class TestWeather(unittest.TestCase):
         f.started(); f.finished("snowy", True, 0)         # the key's push
         f.on_reading("rainy")
         self.assertEqual(f.due(10), "rainy")
-
-    def test_decode_precipitation_intensity(self):
-        self.assertEqual(wk2_current_weather(wk2_weather(22, precip=2.0)), ("Rain", 2.0, 1791447660.0))
-        self.assertEqual(wk2_current_weather(wk2_weather(18))[1], 0.0)   # absent field: nothing falling
 
     def test_wk2_enum_values_checked_against_the_app(self):
         self.assertEqual(WK2_CONDITIONS[0], "Clear")
@@ -139,7 +134,7 @@ class TestWeather(unittest.TestCase):
             db.commit()
             db.close()
             with open(os.path.join(cache, "fsCachedData", "AA-BB"), "wb") as f:
-                f.write(wk2_weather(22, precip=2.0))
+                f.write(wk2_weather(22))
             src = WeatherAppSource(mirror=mirror, latlon="40.782/-111.872")
             self.assertTrue(src.changed())
             self.assertFalse(src.changed())
