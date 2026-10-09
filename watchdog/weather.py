@@ -1,19 +1,24 @@
-"""Weather sources for the hourly profile: what the sky is doing, as an Apple condition.
+"""Weather sources for the hourly profile: what the sky is doing, as the Weather app reports it.
 
-A WeatherSource reports the current condition as an Apple WeatherKit conditionCode name
-("Rain", "MostlyCloudy", ...). The dashboard picks the hourly player's track set from it with
-`hourly_weather()`: the precipitation the condition reports decides, every time. Rain-type
-precipitation is Rainy, snow-type is Snowy, and a condition that reports no precipitation is
-Sunny. Every condition in WK2_CONDITIONS is classified in PRECIPITATION_BY_CONDITION; a code the
-table does not know carries no information and changes nothing.
+A WeatherSource reports the current Apple WeatherKit conditionCode name ("Rain", "Cloudy", ...)
+and the current precipitation intensity (mm/h). The dashboard picks the hourly player's track set
+from the reading with `hourly_weather()`:
+
+  no precipitation reported (intensity 0)  -> sunny
+  precipitation, snow-type condition       -> snowy
+  precipitation, any other condition       -> rainy
+
+The precipitation the app reports decides; the condition only says which kind is falling. So
+IsolatedThunderstorms or Cloudy with nothing falling is sunny, and rain picks rainy whatever
+was playing before.
 
   WeatherAppSource  the macOS Weather app's own data: its cached WeatherKit responses,
                     mirrored by hourly/mac/WeatherWatch.swift (the only process with Full
                     Disk Access) whenever the app writes them. No WeatherKit license needed.
 
-A WeatherKit REST source drops in by subclassing WeatherSource: currentWeather.conditionCode
-in the REST JSON already uses these names, so `read()` returns it as-is and register it in
-SOURCES.
+A WeatherKit REST source drops in by subclassing WeatherSource: currentWeather.conditionCode and
+currentWeather.precipitationIntensity in the REST JSON are the same two values, so `read()`
+returns them as-is and register it in SOURCES.
 """
 from __future__ import annotations
 
@@ -27,41 +32,18 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 
-RAIN = "rain"
-SNOW = "snow"
-NO_PRECIPITATION = "none"
-
-# What each Apple condition reports falling. IsolatedThunderstorms is storms nearby, not
-# precipitation here, so it reports none.
-PRECIPITATION_BY_CONDITION = {
-    # rain
-    "Drizzle": RAIN, "FreezingDrizzle": RAIN, "Rain": RAIN, "HeavyRain": RAIN, "FreezingRain": RAIN,
-    "SunShowers": RAIN, "Hail": RAIN, "Thunderstorms": RAIN, "ScatteredThunderstorms": RAIN,
-    "StrongStorms": RAIN, "TropicalStorm": RAIN, "Hurricane": RAIN,
-    # snow
-    "Flurries": SNOW, "SunFlurries": SNOW, "Snow": SNOW, "HeavySnow": SNOW, "Blizzard": SNOW,
-    "BlowingSnow": SNOW, "Sleet": SNOW, "WintryMix": SNOW,
-    # nothing falling
-    "Clear": NO_PRECIPITATION, "MostlyClear": NO_PRECIPITATION, "PartlyCloudy": NO_PRECIPITATION,
-    "MostlyCloudy": NO_PRECIPITATION, "Cloudy": NO_PRECIPITATION, "Foggy": NO_PRECIPITATION,
-    "Haze": NO_PRECIPITATION, "Smoky": NO_PRECIPITATION, "BlowingDust": NO_PRECIPITATION,
-    "Breezy": NO_PRECIPITATION, "Windy": NO_PRECIPITATION, "Frigid": NO_PRECIPITATION,
-    "Hot": NO_PRECIPITATION, "IsolatedThunderstorms": NO_PRECIPITATION,
-}
-
-HOURLY_BY_PRECIPITATION = {RAIN: "rainy", SNOW: "snowy", NO_PRECIPITATION: "sunny"}
+# Apple's conditions whose precipitation is snow or ice. Only consulted while precipitation is
+# reported, to tell snow from rain; it never decides whether anything is falling.
+SNOW_CONDITIONS = frozenset({
+    "Flurries", "SunFlurries", "Snow", "HeavySnow", "Blizzard", "BlowingSnow", "Sleet", "WintryMix",
+})
 
 
-def precipitation(condition: str) -> Optional[str]:
-    """RAIN | SNOW | NO_PRECIPITATION for a known condition; None for a code the table lacks."""
-    return PRECIPITATION_BY_CONDITION.get(condition)
-
-
-def hourly_weather(condition: str) -> Optional[str]:
-    """'rainy' | 'snowy' | 'sunny' from the precipitation the condition reports; None only for a
-    condition code the table does not know."""
-    p = precipitation(condition)
-    return HOURLY_BY_PRECIPITATION[p] if p is not None else None
+def hourly_weather(condition: str, precipitation_mm_h: float) -> str:
+    """'sunny' | 'snowy' | 'rainy' from the reported precipitation intensity and its kind."""
+    if precipitation_mm_h <= 0.0:
+        return "sunny"
+    return "snowy" if condition in SNOW_CONDITIONS else "rainy"
 
 
 class WeatherFollower:
@@ -106,13 +88,14 @@ class WeatherFollower:
 
 @dataclass(frozen=True)
 class WeatherReading:
-    condition: str      # Apple conditionCode name, e.g. "MostlyCloudy"
-    as_of: float        # epoch seconds the data describes
-    source: str         # WeatherSource.name
+    condition: str              # Apple conditionCode name, e.g. "MostlyCloudy"
+    precipitation_mm_h: float   # currentWeather.precipitationIntensity
+    as_of: float                # epoch seconds the data describes
+    source: str                 # WeatherSource.name
 
     @property
-    def hourly(self) -> Optional[str]:
-        return hourly_weather(self.condition)
+    def hourly(self) -> str:
+        return hourly_weather(self.condition, self.precipitation_mm_h)
 
 
 class WeatherSource(ABC):
@@ -141,12 +124,22 @@ WK2_CONDITIONS = [
 ]
 
 
-def wk2_current_condition(b: bytes) -> Optional[tuple[str, float]]:
-    """(condition name, asOf) from a WK2.Weather FlatBuffer (Weather.currentWeather is root
-    field 1; CurrentWeatherData.asOf is field 1, conditionCode field 6, default Clear)."""
+# CurrentWeatherData fields used here: asOf (1), conditionCode (6), precipitationIntensity (22,
+# float mm/h, absent when 0). Field 22 checked against the app's cache: present only while
+# something falls (Rain 2.066, a drizzling Cloudy 0.017) and absent for Clear, Cloudy, PartlyCloudy
+# and IsolatedThunderstorms with nothing falling; it sits just before pressure (23).
+WK2_AS_OF = 1
+WK2_CONDITION_CODE = 6
+WK2_PRECIPITATION_INTENSITY = 22
+
+
+def wk2_current_weather(b: bytes) -> Optional[tuple[str, float, float]]:
+    """(condition name, precipitation mm/h, asOf) from a WK2.Weather FlatBuffer (Weather.
+    currentWeather is root field 1). Absent fields hold the schema defaults: Clear, 0, 0."""
     u32 = lambda o: struct.unpack_from("<I", b, o)[0]
     i32 = lambda o: struct.unpack_from("<i", b, o)[0]
     u16 = lambda o: struct.unpack_from("<H", b, o)[0]
+    f32 = lambda o: struct.unpack_from("<f", b, o)[0]
 
     def fields(t: int) -> dict[int, int]:
         vt = t - i32(t)
@@ -158,12 +151,19 @@ def wk2_current_condition(b: bytes) -> Optional[tuple[str, float]]:
         if 1 not in root:
             return None
         cur = fields(root[1] + u32(root[1]))
-        code = b[cur[6]] if 6 in cur else 0
-        as_of = float(u32(cur[1])) if 1 in cur else 0.0
+        code = b[cur[WK2_CONDITION_CODE]] if WK2_CONDITION_CODE in cur else 0
+        as_of = float(u32(cur[WK2_AS_OF])) if WK2_AS_OF in cur else 0.0
+        precip = float(f32(cur[WK2_PRECIPITATION_INTENSITY])) if WK2_PRECIPITATION_INTENSITY in cur else 0.0
     except (struct.error, IndexError):
         return None
     name = WK2_CONDITIONS[code] if code < len(WK2_CONDITIONS) else f"Code{code}"
-    return name, as_of
+    return name, precip, as_of
+
+
+def wk2_current_condition(b: bytes) -> Optional[tuple[str, float]]:
+    """(condition name, asOf); see wk2_current_weather."""
+    cw = wk2_current_weather(b)
+    return (cw[0], cw[2]) if cw else None
 
 
 class WeatherAppSource(WeatherSource):
@@ -224,10 +224,10 @@ class WeatherAppSource(WeatherSource):
 
     def read(self) -> Optional[WeatherReading]:
         body = self._latest_body()
-        cc = wk2_current_condition(body) if body else None
-        if not cc:
+        cw = wk2_current_weather(body) if body else None
+        if not cw:
             return None
-        return WeatherReading(condition=cc[0], as_of=cc[1], source=self.name)
+        return WeatherReading(condition=cw[0], precipitation_mm_h=cw[1], as_of=cw[2], source=self.name)
 
 
 SOURCES: dict[str, type[WeatherSource]] = {
