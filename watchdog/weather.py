@@ -4,9 +4,10 @@ A WeatherSource reports the current condition as an Apple WeatherKit conditionCo
 ("Rain", "MostlyCloudy", ...). The hourly player's weather is a three-state engine driven by
 that condition alone:
 
-  Rain or Thunderstorms  -> RAINY
-  Snow                   -> SNOWY
-  any other condition    -> SUNNY   (the app reports no rain or snow falling)
+  rain-type precipitation (RAINING)  -> RAINY
+  snow-type precipitation (SNOWING)  -> SNOWY
+  any other condition                -> SUNNY   (the app reports nothing falling; this includes
+                                                 IsolatedThunderstorms and ScatteredThunderstorms)
 
 Every reading moves the engine to the state its condition belongs to; no state is held over
 from the previous reading. The dashboard only pushes a state the player is not already in.
@@ -35,13 +36,18 @@ SUNNY = "sunny"
 RAINY = "rainy"
 SNOWY = "snowy"
 
-RAINING = frozenset({"Rain", "Thunderstorms"})
-SNOWING = frozenset({"Snow"})
+# Conditions that report precipitation falling here. Scattered and isolated thunderstorms are
+# storms in the area, not precipitation at the location, so they are in neither set.
+RAINING = frozenset({
+    "Drizzle", "FreezingDrizzle", "Rain", "HeavyRain", "FreezingRain", "SunShowers", "Hail",
+    "Sleet", "WintryMix", "Thunderstorms", "StrongStorms", "TropicalStorm", "Hurricane",
+})
+SNOWING = frozenset({"Flurries", "SunFlurries", "Snow", "HeavySnow", "Blizzard"})
 
 
 def hourly_weather(condition: str) -> str:
-    """The state a condition puts the engine in: RAINY while it rains, SNOWY while it snows,
-    SUNNY while neither is reported."""
+    """The state a condition puts the engine in: RAINY while rain-type precipitation is reported,
+    SNOWY while snow is, SUNNY while nothing is falling."""
     if condition in RAINING:
         return RAINY
     if condition in SNOWING:

@@ -5,7 +5,9 @@ import tempfile
 import unittest
 
 from watchdog.weather import (
+    RAINING,
     RAINY,
+    SNOWING,
     SNOWY,
     SUNNY,
     WK2_CONDITIONS,
@@ -52,11 +54,19 @@ def wk2_weather(code=None, as_of=1791447660):
 class TestWeather(unittest.TestCase):
     def test_state_engine(self):
         self.assertEqual(hourly_weather("Rain"), RAINY)
+        self.assertEqual(hourly_weather("HeavyRain"), RAINY)
+        self.assertEqual(hourly_weather("Drizzle"), RAINY)
         self.assertEqual(hourly_weather("Thunderstorms"), RAINY)
         self.assertEqual(hourly_weather("Snow"), SNOWY)
         self.assertEqual(hourly_weather("IsolatedThunderstorms"), SUNNY)
+        self.assertEqual(hourly_weather("ScatteredThunderstorms"), SUNNY)
         self.assertEqual(hourly_weather("Cloudy"), SUNNY)
         self.assertEqual(hourly_weather("Clear"), SUNNY)
+
+    def test_rain_and_snow_sets_are_apple_conditions(self):
+        self.assertTrue(RAINING <= set(WK2_CONDITIONS))
+        self.assertTrue(SNOWING <= set(WK2_CONDITIONS))
+        self.assertFalse(RAINING & SNOWING)
 
     def test_no_hold_from_previous_state(self):
         # The 16:00 case: rain, then IsolatedThunderstorms, picks sunny.
