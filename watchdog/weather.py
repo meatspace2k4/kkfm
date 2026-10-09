@@ -1,9 +1,11 @@
 """Weather sources for the hourly profile: what the sky is doing, as an Apple condition.
 
 A WeatherSource reports the current condition as an Apple WeatherKit conditionCode name
-("Rain", "MostlyCloudy", ...). The dashboard picks the hourly player's track set with
-`next_hourly()`: from Sunny, Rain, Thunderstorms or IsolatedThunderstorms and Snow switch to Rainy/Snowy; Rainy and Snowy hold through
-everything until Clear switches back to Sunny. A source only says what the condition is.
+("Rain", "MostlyCloudy", ...). The dashboard picks the hourly player's track set from it with
+`hourly_weather()`: the precipitation the condition reports decides, every time. Rain-type
+precipitation is Rainy, snow-type is Snowy, and a condition that reports no precipitation is
+Sunny. Every condition in WK2_CONDITIONS is classified in PRECIPITATION_BY_CONDITION; a code the
+table does not know carries no information and changes nothing.
 
   WeatherAppSource  the macOS Weather app's own data: its cached WeatherKit responses,
                     mirrored by hourly/mac/WeatherWatch.swift (the only process with Full
@@ -25,30 +27,81 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 
-# The only conditions that pick a track set. Every other condition (MostlyCloudy, Drizzle,
-# Flurries, ...) leaves the player's weather as it is.
-HOURLY_BY_CONDITION = {
-    "Clear": "sunny",
-    "Rain": "rainy", "Thunderstorms": "rainy", "IsolatedThunderstorms": "rainy",
-    "Snow": "snowy",
+RAIN = "rain"
+SNOW = "snow"
+NO_PRECIPITATION = "none"
+
+# What each Apple condition reports falling. IsolatedThunderstorms is storms nearby, not
+# precipitation here, so it reports none.
+PRECIPITATION_BY_CONDITION = {
+    # rain
+    "Drizzle": RAIN, "FreezingDrizzle": RAIN, "Rain": RAIN, "HeavyRain": RAIN, "FreezingRain": RAIN,
+    "SunShowers": RAIN, "Hail": RAIN, "Thunderstorms": RAIN, "ScatteredThunderstorms": RAIN,
+    "StrongStorms": RAIN, "TropicalStorm": RAIN, "Hurricane": RAIN,
+    # snow
+    "Flurries": SNOW, "SunFlurries": SNOW, "Snow": SNOW, "HeavySnow": SNOW, "Blizzard": SNOW,
+    "BlowingSnow": SNOW, "Sleet": SNOW, "WintryMix": SNOW,
+    # nothing falling
+    "Clear": NO_PRECIPITATION, "MostlyClear": NO_PRECIPITATION, "PartlyCloudy": NO_PRECIPITATION,
+    "MostlyCloudy": NO_PRECIPITATION, "Cloudy": NO_PRECIPITATION, "Foggy": NO_PRECIPITATION,
+    "Haze": NO_PRECIPITATION, "Smoky": NO_PRECIPITATION, "BlowingDust": NO_PRECIPITATION,
+    "Breezy": NO_PRECIPITATION, "Windy": NO_PRECIPITATION, "Frigid": NO_PRECIPITATION,
+    "Hot": NO_PRECIPITATION, "IsolatedThunderstorms": NO_PRECIPITATION,
 }
+
+HOURLY_BY_PRECIPITATION = {RAIN: "rainy", SNOW: "snowy", NO_PRECIPITATION: "sunny"}
+
+
+def precipitation(condition: str) -> Optional[str]:
+    """RAIN | SNOW | NO_PRECIPITATION for a known condition; None for a code the table lacks."""
+    return PRECIPITATION_BY_CONDITION.get(condition)
 
 
 def hourly_weather(condition: str) -> Optional[str]:
-    """'sunny' | 'rainy' | 'snowy' for Clear / Rain, Thunderstorms or IsolatedThunderstorms / Snow;
-    None for anything else."""
-    return HOURLY_BY_CONDITION.get(condition)
+    """'rainy' | 'snowy' | 'sunny' from the precipitation the condition reports; None only for a
+    condition code the table does not know."""
+    p = precipitation(condition)
+    return HOURLY_BY_PRECIPITATION[p] if p is not None else None
 
 
-def next_hourly(current: Optional[str], condition: str) -> Optional[str]:
-    """The track set to switch to, or None to keep `current`. Rainy and Snowy hold until the
-    sky is Clear (then Sunny); only from Sunny (or unknown) do Rain/Snow switch."""
-    target = hourly_weather(condition)
-    if target is None or target == current:
-        return None
-    if current in ("rainy", "snowy") and target != "sunny":
-        return None
-    return target
+class WeatherFollower:
+    """Which weather to push to the player, and when. A reading whose weather equals the weather
+    the player last acknowledged is skipped, so the track already playing is not faded and
+    replayed. Only an acknowledged push counts as applied: a failed push stays pending and is
+    retried after `retry_s`."""
+
+    def __init__(self, retry_s: float = 5.0) -> None:
+        self.retry_s = retry_s
+        self.acked: Optional[str] = None     # last weather the player answered "ok" to
+        self.pending: Optional[str] = None   # weather still to be applied
+        self.inflight = False
+        self.next_try = 0.0
+
+    def on_reading(self, weather: Optional[str]) -> None:
+        if weather is None:
+            return
+        self.pending = weather if weather != self.acked else None
+        self.next_try = 0.0
+
+    def on_manual(self) -> None:
+        """A hand-set weather replaces whatever reading was still pending."""
+        self.pending = None
+
+    def due(self, now: float) -> Optional[str]:
+        if self.pending is None or self.inflight or now < self.next_try:
+            return None
+        return self.pending
+
+    def started(self) -> None:
+        self.inflight = True
+
+    def finished(self, weather: str, ok: bool, now: float) -> None:
+        if ok:
+            self.acked = weather
+            if self.pending == weather:
+                self.pending = None
+        self.next_try = now + self.retry_s
+        self.inflight = False
 
 
 @dataclass(frozen=True)
@@ -60,9 +113,6 @@ class WeatherReading:
     @property
     def hourly(self) -> Optional[str]:
         return hourly_weather(self.condition)
-
-    def next_hourly(self, current: Optional[str]) -> Optional[str]:
-        return next_hourly(current, self.condition)
 
 
 class WeatherSource(ABC):

@@ -24,7 +24,7 @@ import errno
 from .paths import get_runtime_status_dir
 from .health_check import WatchdogHealthMonitor, read_status_file
 from . import sonos
-from .weather import make_source
+from .weather import WeatherFollower, make_source
 
 
 # Track whether terminal needs restoration (for signal handlers)
@@ -1194,18 +1194,37 @@ while True:
 
             threading.Thread(target=_go, daemon=True).start()
 
-        weather_state: dict[str, Any] = {"reading": None, "sent": None}
+        # The player's weather follows the source; see WeatherFollower for the skip/retry rules.
+        weather_state: dict[str, Any] = {"reading": None}
+        follower = WeatherFollower()
+
+        def _push_weather(w: str, label: str) -> None:
+            follower.started()
+            url = f"{player_base}/control/weather/{w}"
+
+            def _go() -> None:
+                ok = False
+                try:
+                    with urllib.request.urlopen(url, timeout=4) as resp:
+                        body = resp.read().decode("utf-8", errors="replace").strip()
+                    ok = body.startswith("ok")
+                    control_msg["text"] = f"{label}: {body}"
+                except Exception as e:
+                    control_msg["text"] = f"{label}: failed ({e}); retrying"
+                follower.finished(w, ok, time.time())
+
+            threading.Thread(target=_go, daemon=True).start()
 
         def _poll_weather() -> None:
             # changed() is a cheap stamp check; the source is only read when its data moved.
-            if weather_src is None or not weather_src.changed():
-                return
-            r = weather_src.read()
-            weather_state["reading"] = r
-            nxt = r.next_hourly(weather_state["sent"]) if r is not None else None
-            if nxt:
-                weather_state["sent"] = nxt
-                _send_control(f"/control/weather/{nxt}", f"{r.source} {r.condition}")
+            if weather_src is not None and weather_src.changed():
+                r = weather_src.read()
+                weather_state["reading"] = r
+                follower.on_reading(r.hourly if r is not None else None)
+            w = follower.due(time.time())
+            if w is not None:
+                r = weather_state["reading"]
+                _push_weather(w, f"{r.source} {r.condition}" if r is not None else f"weather {w}")
 
         def _poll_sonos() -> None:
             nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll, sonos_stopped_polls, sonos_title, sonos_resumes, sonos_handoff_ts
@@ -1347,8 +1366,8 @@ while True:
                     _send_control("/control/skip", "next track")
             if prof.weather_controls and ch in (ord("1"), ord("2"), ord("3")):
                 w = {ord("1"): "sunny", ord("2"): "rainy", ord("3"): "snowy"}[ch]
-                weather_state["sent"] = w   # the weather source holds from what the keys set
-                _send_control(f"/control/weather/{w}", f"weather {w}")
+                follower.on_manual()
+                _push_weather(w, f"weather {w}")
             if ch in (ord("p"), ord("P")) and player_state != "locked":
                 if player_state == "idle":
                     _start_player()

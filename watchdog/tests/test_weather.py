@@ -5,11 +5,16 @@ import tempfile
 import unittest
 
 from watchdog.weather import (
+    NO_PRECIPITATION,
+    PRECIPITATION_BY_CONDITION,
+    RAIN,
+    SNOW,
     WK2_CONDITIONS,
     WeatherAppSource,
+    WeatherFollower,
+    WeatherReading,
     hourly_weather,
     make_source,
-    next_hourly,
     wk2_current_condition,
 )
 
@@ -47,31 +52,65 @@ def wk2_weather(code=None, as_of=1791447660):
 
 
 class TestWeather(unittest.TestCase):
-    def test_only_clear_rain_snow_pick_a_track_set(self):
-        self.assertEqual(hourly_weather("Clear"), "sunny")
-        self.assertEqual(hourly_weather("Rain"), "rainy")
-        self.assertEqual(hourly_weather("Thunderstorms"), "rainy")
-        self.assertEqual(hourly_weather("IsolatedThunderstorms"), "rainy")
-        self.assertEqual(hourly_weather("Snow"), "snowy")
-        for other in ("MostlyCloudy", "MostlyClear", "Drizzle", "HeavyRain", "Flurries", "Windy"):
-            self.assertIsNone(hourly_weather(other), other)
+    def test_every_condition_is_classified(self):
+        # No condition reaches a default: the table covers the whole enum, and nothing else.
+        self.assertEqual(set(PRECIPITATION_BY_CONDITION), set(WK2_CONDITIONS))
+        self.assertTrue(set(PRECIPITATION_BY_CONDITION.values()) <= {RAIN, SNOW, NO_PRECIPITATION})
 
-    def test_rainy_and_snowy_hold_until_clear(self):
-        # From Sunny (or unknown at startup) Rain/Snow switch; Clear while sunny is no change.
-        self.assertEqual(next_hourly("sunny", "Rain"), "rainy")
-        self.assertEqual(next_hourly("sunny", "Snow"), "snowy")
-        self.assertEqual(next_hourly(None, "Rain"), "rainy")
-        self.assertEqual(next_hourly("sunny", "Thunderstorms"), "rainy")
-        self.assertEqual(next_hourly(None, "Thunderstorms"), "rainy")
-        self.assertEqual(next_hourly("sunny", "IsolatedThunderstorms"), "rainy")
-        self.assertEqual(next_hourly(None, "IsolatedThunderstorms"), "rainy")
-        self.assertEqual(next_hourly(None, "Clear"), "sunny")
-        self.assertIsNone(next_hourly("sunny", "Clear"))
-        self.assertIsNone(next_hourly("sunny", "MostlyCloudy"))
-        for held in ("rainy", "snowy"):
-            for cond in ("Cloudy", "MostlyCloudy", "MostlyClear", "Drizzle", "Flurries", "Rain", "Thunderstorms", "IsolatedThunderstorms", "Snow"):
-                self.assertIsNone(next_hourly(held, cond), (held, cond))
-            self.assertEqual(next_hourly(held, "Clear"), "sunny")
+    def test_precipitation_decides_the_track_set(self):
+        for cond in ("Rain", "Thunderstorms", "HeavyRain", "Drizzle", "ScatteredThunderstorms"):
+            self.assertEqual(hourly_weather(cond), "rainy", cond)
+        for cond in ("Snow", "HeavySnow", "Flurries", "Blizzard"):
+            self.assertEqual(hourly_weather(cond), "snowy", cond)
+        for cond in ("Clear", "MostlyClear", "PartlyCloudy", "MostlyCloudy", "Cloudy", "Foggy", "Windy",
+                     "IsolatedThunderstorms"):
+            self.assertEqual(hourly_weather(cond), "sunny", cond)
+
+    def test_isolated_thunderstorms_is_not_rain(self):
+        self.assertEqual(PRECIPITATION_BY_CONDITION["IsolatedThunderstorms"], NO_PRECIPITATION)
+        self.assertEqual(WeatherReading("IsolatedThunderstorms", 0.0, "t").hourly, "sunny")
+
+    def test_no_hold_from_previous_weather(self):
+        # The reading alone decides; there is no state carried from what was playing before.
+        sequence = ["Rain", "IsolatedThunderstorms", "Thunderstorms", "Cloudy", "Snow", "PartlyCloudy"]
+        self.assertEqual([WeatherReading(c, 0.0, "t").hourly for c in sequence],
+                         ["rainy", "sunny", "rainy", "sunny", "snowy", "sunny"])
+
+    def test_unknown_code_carries_no_weather(self):
+        self.assertIsNone(hourly_weather("Code99"))
+
+    def test_follower_skips_identical_weather(self):
+        # Playing clear: IsolatedThunderstorms then Clear are both Sunny, so nothing is pushed.
+        f = WeatherFollower()
+        f.on_reading(WeatherReading("Clear", 0, "t").hourly)
+        self.assertEqual(f.due(0), "sunny"); f.started(); f.finished("sunny", True, 0)
+        for cond in ("IsolatedThunderstorms", "Clear", "MostlyCloudy"):
+            f.on_reading(WeatherReading(cond, 0, "t").hourly)
+            self.assertIsNone(f.due(100), cond)
+        f.on_reading(WeatherReading("Thunderstorms", 0, "t").hourly)
+        self.assertEqual(f.due(100), "rainy")
+
+    def test_follower_retries_until_acknowledged(self):
+        f = WeatherFollower(retry_s=5)
+        f.on_reading("sunny")
+        self.assertEqual(f.due(0), "sunny"); f.started()
+        self.assertIsNone(f.due(0))                       # one push at a time
+        f.finished("sunny", False, 10)                    # failed: not applied
+        self.assertIsNone(f.due(12))
+        self.assertEqual(f.due(15), "sunny")              # retried
+        f.started(); f.finished("sunny", True, 15)
+        self.assertIsNone(f.due(100))
+        f.on_reading("sunny")                             # identical to the acknowledged weather
+        self.assertIsNone(f.due(100))
+
+    def test_follower_manual_key_replaces_pending(self):
+        f = WeatherFollower()
+        f.on_reading("rainy")
+        f.on_manual()
+        self.assertIsNone(f.due(0))
+        f.started(); f.finished("snowy", True, 0)         # the key's push
+        f.on_reading("rainy")
+        self.assertEqual(f.due(10), "rainy")
 
     def test_wk2_enum_values_checked_against_the_app(self):
         self.assertEqual(WK2_CONDITIONS[0], "Clear")
