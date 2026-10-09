@@ -50,6 +50,7 @@ class TestWeather(unittest.TestCase):
     def test_only_clear_rain_snow_pick_a_track_set(self):
         self.assertEqual(hourly_weather("Clear"), "sunny")
         self.assertEqual(hourly_weather("Rain"), "rainy")
+        self.assertEqual(hourly_weather("Thunderstorms"), "rainy")
         self.assertEqual(hourly_weather("Snow"), "snowy")
         for other in ("MostlyCloudy", "MostlyClear", "Drizzle", "HeavyRain", "Flurries", "Windy"):
             self.assertIsNone(hourly_weather(other), other)
@@ -59,11 +60,13 @@ class TestWeather(unittest.TestCase):
         self.assertEqual(next_hourly("sunny", "Rain"), "rainy")
         self.assertEqual(next_hourly("sunny", "Snow"), "snowy")
         self.assertEqual(next_hourly(None, "Rain"), "rainy")
+        self.assertEqual(next_hourly("sunny", "Thunderstorms"), "rainy")
+        self.assertEqual(next_hourly(None, "Thunderstorms"), "rainy")
         self.assertEqual(next_hourly(None, "Clear"), "sunny")
         self.assertIsNone(next_hourly("sunny", "Clear"))
         self.assertIsNone(next_hourly("sunny", "MostlyCloudy"))
         for held in ("rainy", "snowy"):
-            for cond in ("Cloudy", "MostlyCloudy", "MostlyClear", "Drizzle", "Flurries", "Rain", "Snow"):
+            for cond in ("Cloudy", "MostlyCloudy", "MostlyClear", "Drizzle", "Flurries", "Rain", "Thunderstorms", "Snow"):
                 self.assertIsNone(next_hourly(held, cond), (held, cond))
             self.assertEqual(next_hourly(held, "Clear"), "sunny")
 

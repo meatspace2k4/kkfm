@@ -2,7 +2,7 @@
 
 A WeatherSource reports the current condition as an Apple WeatherKit conditionCode name
 ("Rain", "MostlyCloudy", ...). The dashboard picks the hourly player's track set with
-`next_hourly()`: from Sunny, Rain and Snow switch to Rainy/Snowy; Rainy and Snowy hold through
+`next_hourly()`: from Sunny, Rain or Thunderstorms and Snow switch to Rainy/Snowy; Rainy and Snowy hold through
 everything until Clear switches back to Sunny. A source only says what the condition is.
 
   WeatherAppSource  the macOS Weather app's own data: its cached WeatherKit responses,
@@ -27,11 +27,11 @@ from typing import Optional
 
 # The only conditions that pick a track set. Every other condition (MostlyCloudy, Drizzle,
 # Flurries, ...) leaves the player's weather as it is.
-HOURLY_BY_CONDITION = {"Clear": "sunny", "Rain": "rainy", "Snow": "snowy"}
+HOURLY_BY_CONDITION = {"Clear": "sunny", "Rain": "rainy", "Thunderstorms": "rainy", "Snow": "snowy"}
 
 
 def hourly_weather(condition: str) -> Optional[str]:
-    """'sunny' | 'rainy' | 'snowy' for Clear / Rain / Snow; None for anything else."""
+    """'sunny' | 'rainy' | 'snowy' for Clear / Rain or Thunderstorms / Snow; None for anything else."""
     return HOURLY_BY_CONDITION.get(condition)
 
 
