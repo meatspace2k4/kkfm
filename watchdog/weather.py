@@ -42,7 +42,7 @@ RAINING = frozenset({
     "Drizzle", "FreezingDrizzle", "Rain", "HeavyRain", "FreezingRain", "SunShowers", "Hail",
     "Sleet", "WintryMix", "Thunderstorms", "StrongStorms", "TropicalStorm", "Hurricane",
 })
-SNOWING = frozenset({"Flurries", "SunFlurries", "Snow", "HeavySnow", "Blizzard"})
+SNOWING = frozenset({"Flurries", "SunFlurries", "Snow", "HeavySnow", "Blizzard", "BlowingSnow"})
 
 
 def hourly_weather(condition: str) -> str:

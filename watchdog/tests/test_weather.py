@@ -58,6 +58,7 @@ class TestWeather(unittest.TestCase):
         self.assertEqual(hourly_weather("Drizzle"), RAINY)
         self.assertEqual(hourly_weather("Thunderstorms"), RAINY)
         self.assertEqual(hourly_weather("Snow"), SNOWY)
+        self.assertEqual(hourly_weather("BlowingSnow"), SNOWY)
         self.assertEqual(hourly_weather("IsolatedThunderstorms"), SUNNY)
         self.assertEqual(hourly_weather("ScatteredThunderstorms"), SUNNY)
         self.assertEqual(hourly_weather("Cloudy"), SUNNY)
