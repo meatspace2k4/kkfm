@@ -225,41 +225,6 @@ static void test_open_meteo_rejects_hourly_and_stale() {
     ASSERT(open_meteo_url().find("current=precipitation,rain,showers,snowfall") != std::string::npos);
 }
 
-// /control/weather/next/<w>: held for the named hour, not current until the clock reaches it;
-// the hour before is untouched, a later set replaces it, a different hour never takes it.
-static void test_weather_state_next_hour_is_held_until_that_hour() {
-    WeatherState ws(WeatherSource::None);
-    ws.set_manual(Weather::Sunny);
-    int h = -1; Weather w = Weather::Sunny;
-    ASSERT(!ws.pending_for_hour(h, w));
-
-    ws.set_for_hour(Weather::Rainy, 13);                   // sent at 12:59
-    ASSERT_EQ((int)ws.current(), (int)Weather::Sunny);     // 12:00's weather unchanged
-    ASSERT(ws.pending_for_hour(h, w));
-    ASSERT_EQ(h, 13);
-    ASSERT_EQ((int)w, (int)Weather::Rainy);
-
-    ASSERT(!ws.apply_hour(12));                            // still 12:xx: nothing applied
-    ASSERT_EQ((int)ws.current(), (int)Weather::Sunny);
-    ASSERT(ws.pending_for_hour(h, w));
-
-    ws.set_for_hour(Weather::Snowy, 13);                   // forecast revised before the hour
-    ASSERT(ws.apply_hour(13));                             // 13:00
-    ASSERT_EQ((int)ws.current(), (int)Weather::Snowy);
-    ASSERT(!ws.pending_for_hour(h, w));                    // consumed
-    ASSERT(!ws.apply_hour(13));                            // once only
-
-    ws.set_manual(Weather::Rainy);                         // a now-weather inside the hour
-    ASSERT_EQ((int)ws.current(), (int)Weather::Rainy);
-    ASSERT(!ws.pending_for_hour(h, w));                    // does not touch the next-hour slot
-
-    ws.set_for_hour(Weather::Sunny, 14);
-    ASSERT(!ws.apply_hour(15));                            // a different hour never takes it
-    ASSERT_EQ((int)ws.current(), (int)Weather::Rainy);
-    ASSERT(ws.pending_for_hour(h, w));
-    ASSERT_EQ(h, 14);
-}
-
 static void test_weather_state_open_meteo_and_manual() {
     WeatherState ws(WeatherSource::OpenMeteo);
     ws.set_fetcher([](std::time_t) { return om_json("2026-09-20T12:00", 900, 0.3, 0.3, 0, 0); });
@@ -794,69 +759,6 @@ static void test_player_changeover_on_pushed_weather() {
     ASSERT_EQ(p.last_pick_weather.load(), (int)Weather::Rainy);
 }
 
-// Weather for the next hour (/control/weather/next/rainy at 9:59): the 9:00 track is left alone,
-// and the 10:00 hour changeover picks the rainy file.
-static void test_player_next_hour_weather_applies_at_the_hour() {
-    Mixer mixer;
-    WeatherState ws(WeatherSource::None);
-    PlayerOptions o;
-    o.sound_dir = sound_dir();
-    o.heartbeat_s = 0;
-    o.gap_s = 0.05f;
-    o.test_max_tracks = 2;
-    HourlyPlayer p(mixer, ws, o);
-    std::atomic<bool> ten{false};
-    p.set_clock([&]() { return ten ? make_tm(10, 0) : make_tm(9, 59); });
-
-    std::atomic<bool> pumping{true};
-    std::vector<int16_t> block(MIX_BLOCK_FRAMES * 2, 0);
-    std::thread pump([&]() {
-        auto next = std::chrono::steady_clock::now();
-        while (pumping) {
-            mixer.mix_block(block.data(), MIX_BLOCK_FRAMES);
-            next += std::chrono::microseconds((int64_t)MIX_BLOCK_FRAMES * 1000000 / 48000 / 40);
-            std::this_thread::sleep_until(next);
-        }
-    });
-    std::thread runner([&]() { p.run(); });
-
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (std::chrono::steady_clock::now() < deadline && p.picks.load() == 0)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    ASSERT_EQ(p.last_pick_hour.load(), 9);
-    ASSERT_EQ(p.last_pick_weather.load(), (int)Weather::Sunny);
-
-    ws.set_for_hour(Weather::Rainy, 10);                   // /control/weather/next/rainy
-    std::this_thread::sleep_for(std::chrono::seconds(2));  // several loops at 40x
-    ASSERT_EQ(p.arms.load(), 0);                           // not a changeover: it is not 10:00 yet
-    ASSERT_EQ((int)ws.current(), (int)Weather::Sunny);
-    int h; Weather w;
-    ASSERT(ws.pending_for_hour(h, w));
-    ASSERT_EQ(h, 10);
-
-    ten = true;                                            // 10:00
-    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (std::chrono::steady_clock::now() < deadline && p.arms.load() == 0)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    ASSERT_EQ(p.arms.load(), 1);
-    ASSERT_EQ(p.last_arm_from.load(), 9);
-    ASSERT_EQ(p.last_arm_to.load(), 10);
-    ASSERT_EQ((int)ws.current(), (int)Weather::Rainy);
-    ASSERT(!ws.pending_for_hour(h, w));
-
-    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(40);
-    while (std::chrono::steady_clock::now() < deadline && p.picks.load() < 2)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    p.request_stop();
-    runner.join();
-    pumping = false;
-    pump.join();
-
-    ASSERT_EQ(p.picks.load(), 2);
-    ASSERT_EQ(p.last_pick_hour.load(), 10);
-    ASSERT_EQ(p.last_pick_weather.load(), (int)Weather::Rainy);
-}
-
 // A loop-point changeover is dropped when, before the fade starts, the hour and weather point
 // back at the playing track: it keeps looping instead of fading out and restarting itself.
 static void test_player_changeover_dropped_when_track_unchanged() {
@@ -1196,7 +1098,6 @@ int main(int argc, char** argv) {
     run_test("open_meteo_last_15_minutes", test_open_meteo_last_15_minutes);
     run_test("open_meteo_rejects_hourly_and_stale", test_open_meteo_rejects_hourly_and_stale);
     run_test("weather_state_open_meteo_and_manual", test_weather_state_open_meteo_and_manual);
-    run_test("weather_state_next_hour_is_held_until_that_hour", test_weather_state_next_hour_is_held_until_that_hour);
     run_test("base64url_and_der_to_raw", test_base64url_and_der_to_raw);
     run_test("weatherkit_jwt_signature_verifies", test_weatherkit_jwt_signature_verifies);
     run_test("weather_state_refresh_and_failure", test_weather_state_refresh_and_failure);
@@ -1211,7 +1112,6 @@ int main(int argc, char** argv) {
     run_test("player_changeover_only_on_hour", test_player_changeover_only_on_hour);
     run_test("player_changeover_on_weather_change", test_player_changeover_on_weather_change);
     run_test("player_changeover_on_pushed_weather", test_player_changeover_on_pushed_weather);
-    run_test("player_next_hour_weather_applies_at_the_hour", test_player_next_hour_weather_applies_at_the_hour);
     run_test("player_changeover_dropped_when_track_unchanged", test_player_changeover_dropped_when_track_unchanged);
     run_test("player_skip_queues_next_track", test_player_skip_queues_next_track);
     run_test("stream_server_range_resume", test_stream_server_range_resume);

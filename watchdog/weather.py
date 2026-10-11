@@ -2,18 +2,21 @@
 
 A WeatherSource reports the Weather app's precipitation chart (the panel with the Now / 10m /
 20m ... bars: one bar per minute, its height the precipitation intensity, no bar when nothing is
-falling) plus the current condition name. The hourly player's weather is a three-state engine
-evaluated at the current time:
+falling), the hourly forecast, and the current condition name. The hourly player's weather is
+a three-state engine evaluated at the current time:
 
   the bar at "Now" is above zero, snow condition  -> SNOWY
   the bar at "Now" is above zero, otherwise       -> RAINY
-  no bar at "Now"                                 -> the condition's state: RAINING -> RAINY,
-                                                     SNOWING -> SNOWY, anything else -> SUNNY
+  no bar at "Now"                                 -> the state of this hour's forecast condition:
+                                                     RAINING -> RAINY, SNOWING -> SNOWY,
+                                                     anything else -> SUNNY; no row for the
+                                                     hour -> nothing
 
 The chart also says when the precipitation stops: the first later minute with no bar. The
 monitor sends the player RAINY when the bars start and, when that end minute is reached, the
-condition's state again (Cloudy before the rain -> SUNNY after it), with no new fetch needed.
-The dashboard only pushes a state the player is not already in.
+hour's forecast state again, with no new fetch needed. At the top of each hour the state is the
+new hour's forecast, and the player's hour changeover picks with it. The dashboard only pushes
+a state the player is not already in.
 
   WeatherAppSource  the macOS Weather app's own data: its cached WeatherKit responses,
                     mirrored by hourly/mac/WeatherWatch.swift (the only process with Full
@@ -35,9 +38,6 @@ from typing import Optional
 SUNNY = "sunny"
 RAINY = "rainy"
 SNOWY = "snowy"
-
-# With nothing falling, the next hour's forecast is sent this long before the hour.
-CHANGEOVER_LEAD_S = 60.0
 
 # Conditions that report precipitation falling here. Scattered and isolated thunderstorms are
 # storms in the area, not precipitation at the location, so they are in neither set.
@@ -96,31 +96,6 @@ class WeatherFollower:
         self.pending: Optional[str] = None   # weather still to be applied
         self.inflight = False
         self.next_try = 0.0
-        # The hour's weather, decided once per hour CHANGEOVER_LEAD_S before it from the forecast
-        # for that hour. The app's later readings do not change it; only precipitation does.
-        self.hour_start: Optional[float] = None
-        self.hour_weather: Optional[str] = None
-        # True while the pending weather is for the hour that has not started yet: it goes to the
-        # player's next-hour slot, so the playing hour's track is left alone.
-        self.for_next_hour = False
-
-    def follow(self, r: "WeatherReading", now: float) -> None:
-        """Every tick with the current reading: precipitation falling now wins; otherwise the
-        weather decided for the hour (the one starting within CHANGEOVER_LEAD_S, else this one)."""
-        t = now + CHANGEOVER_LEAD_S
-        lt = time.localtime(t)
-        start = t - lt.tm_min * 60 - lt.tm_sec
-        if start != self.hour_start:
-            self.hour_start = start
-            cond = forecast_condition_at(r.hours, t)
-            self.hour_weather = hourly_weather(cond if cond is not None else r.condition)
-        falling, _ = r.precipitation_at(now)
-        if falling:
-            self.for_next_hour = False
-            self.on_reading(hourly_weather(r.condition, True))
-        else:
-            self.for_next_hour = now < start
-            self.on_reading(self.hour_weather)
 
     def on_reading(self, weather: Optional[str]) -> None:
         if weather is None:
@@ -161,17 +136,19 @@ class WeatherReading:
     def precipitation_at(self, now: float) -> tuple[bool, Optional[float]]:
         return precipitation_at(self.minutes, self.minutes_end, now)
 
-    def hourly_at(self, now: float) -> str:
+    def hourly_at(self, now: float) -> Optional[str]:
+        """The weather at `now`: RAINY/SNOWY while the chart shows precipitation falling,
+        otherwise the state of the forecast condition for the hour `now` is in. At the top of
+        the hour that is the new hour's forecast, which the player's hour changeover picks with.
+        None when the forecast has no row for the hour: nothing is sent."""
         falling, _ = self.precipitation_at(now)
         if falling:
             return hourly_weather(self.condition, True)
-        cond = forecast_condition_at(self.hours, now + CHANGEOVER_LEAD_S)
-        if cond is None:
-            cond = forecast_condition_at(self.hours, now)
-        return hourly_weather(cond if cond is not None else self.condition)
+        cond = forecast_condition_at(self.hours, now)
+        return hourly_weather(cond) if cond is not None else None
 
     @property
-    def hourly(self) -> str:
+    def hourly(self) -> Optional[str]:
         """The state at the time the data describes."""
         return self.hourly_at(self.as_of)
 

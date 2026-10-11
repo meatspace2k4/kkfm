@@ -158,20 +158,10 @@ int main(int argc, char** argv) {
     hourly::HourlyPlayer player(mixer, weather, opt);
     g_player = &player;
 
-    // Dashboard controls: /control/weather/{sunny|rainy|snowy} (now),
-    // /control/weather/next/{sunny|rainy|snowy} (held for the next hour's changeover), /control/skip
+    // Dashboard controls: /control/weather/{sunny|rainy|snowy} sets the weather the next hour
+    // changeover picks with; /control/skip
     server.set_control_handler([&](const std::string& path) -> std::string {
         const std::string wpre = "/control/weather/";
-        const std::string npre = "/control/weather/next/";
-        if (path.rfind(npre, 0) == 0) {
-            hourly::Weather w;
-            if (!hourly::weather_from_name(path.substr(npre.size()), w)) return "error: unknown weather\n";
-            int hour = (hourly::hour_index(hourly::HourlyPlayer::local_now()) + 1) % 24;
-            weather.set_for_hour(w, hour);
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "ok: weather %s for hour %02d\n", hourly::weather_name(w), hour);
-            return buf;
-        }
         if (path.rfind(wpre, 0) == 0) {
             hourly::Weather w;
             if (!hourly::weather_from_name(path.substr(wpre.size()), w)) return "error: unknown weather\n";

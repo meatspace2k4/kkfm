@@ -137,16 +137,17 @@ class TestWeather(unittest.TestCase):
         t0 = 1791743220.0
         r = WeatherReading("Cloudy", t0, "t",
                            minutes=((t0, 0.0), (t0 + 60, 0.0), (t0 + 120, 0.5), (t0 + 180, 0.6), (t0 + 240, 0.0)),
-                           minutes_end=t0 + 300)
+                           minutes_end=t0 + 300, hours=((t0 - 1620, "Cloudy"),))
         self.assertEqual([r.hourly_at(t) for t in (t0, t0 + 120, t0 + 200, t0 + 240, t0 + 299)],
                          [SUNNY, RAINY, RAINY, SUNNY, SUNNY])
         self.assertEqual(r.precipitation_at(t0 + 150), (True, t0 + 240))
-        # A rain-type condition stays rainy even with no minute data.
-        self.assertEqual(WeatherReading("Rain", t0, "t").hourly_at(t0 + 999), RAINY)
+        # A rain-type hour stays rainy even with no minute data.
+        self.assertEqual(WeatherReading("Rain", t0, "t", hours=((t0, "Rain"),)).hourly_at(t0 + 999), RAINY)
 
     def test_follower_tracks_the_rain_start_and_end(self):
         t0 = 1791743220.0
-        r = WeatherReading("Cloudy", t0, "t", minutes=((t0, 0.0), (t0 + 60, 0.4), (t0 + 120, 0.0)), minutes_end=t0 + 180)
+        r = WeatherReading("Cloudy", t0, "t", minutes=((t0, 0.0), (t0 + 60, 0.4), (t0 + 120, 0.0)), minutes_end=t0 + 180,
+                           hours=((t0 - 1620, "Cloudy"),))
         f = WeatherFollower()
         f.on_reading(r.hourly_at(t0)); self.assertEqual(f.due(t0), SUNNY); f.started(); f.finished(SUNNY, True, t0)
         f.on_reading(r.hourly_at(t0 + 30)); self.assertIsNone(f.due(t0 + 30))         # same state: skipped
@@ -158,79 +159,32 @@ class TestWeather(unittest.TestCase):
     def test_no_hold_from_previous_state(self):
         # The 16:00 case: rain, then IsolatedThunderstorms with nothing falling, picks sunny.
         readings = ["Rain", "IsolatedThunderstorms", "Cloudy", "Thunderstorms", "Snow", "Clear"]
-        self.assertEqual([WeatherReading(c, 0, "t").hourly for c in readings],
+        self.assertEqual([WeatherReading(c, 0, "t", hours=((0, c),)).hourly for c in readings],
                          [RAINY, SUNNY, SUNNY, RAINY, SNOWY, SUNNY])
 
-    def test_changeover_sends_the_next_hours_forecast(self):
+    def test_state_follows_the_hours_forecast_and_flips_at_the_top_of_the_hour(self):
+        # 12 PM Cloudy, 1 PM Drizzle, 2 PM Windy; the chart shows rain 1:38-2:11.
         h12 = 1791741600.0
         r = WeatherReading("Cloudy", h12 + 48 * 60, "t",
                            minutes=((h12 + 48 * 60, 0.0), (h12 + 98 * 60, 0.5), (h12 + 131 * 60, 0.0)),
                            minutes_end=h12 + 132 * 60,
                            hours=((h12, "Cloudy"), (h12 + 3600, "Drizzle"), (h12 + 7200, "Windy")))
+        # The whole 12 PM hour, 12:59 included: 12 PM's Cloudy. The 12:00 track is left alone.
+        self.assertEqual(r.hourly_at(h12 + 5 * 60), SUNNY)
         self.assertEqual(r.hourly_at(h12 + 48 * 60), SUNNY)
-        self.assertEqual(r.hourly_at(h12 + 58 * 60), SUNNY)
-        self.assertEqual(r.hourly_at(h12 + 59 * 60), RAINY)
+        self.assertEqual(r.hourly_at(h12 + 59 * 60 + 59), SUNNY)
+        # 1:00:00: 1 PM's Drizzle. The player's hour changeover is already armed and picks 13 Rainy.
         self.assertEqual(r.hourly_at(h12 + 3600), RAINY)
-        self.assertEqual(r.hourly_at(h12 + 98 * 60), RAINY)
+        self.assertEqual(r.hourly_at(h12 + 98 * 60), RAINY)      # raining per the chart
         self.assertEqual(r.hourly_at(h12 + 7200 - 60), RAINY)    # still raining at 1:59
-        self.assertEqual(r.hourly_at(h12 + 131 * 60 + 60), SUNNY)  # rain over: 2PM Windy
-
-    def test_follow_decides_the_hour_once_and_sends_the_forecast_to_the_next_hour_slot(self):
-        # 12:48, Cloudy, 1 PM Drizzle. Local hour boundaries: build the epoch from local time.
-        h12 = time.mktime((2026, 10, 11, 12, 0, 0, 0, 0, -1))
-        r = WeatherReading("Cloudy", h12 + 48 * 60, "t",
-                           hours=((h12, "Cloudy"), (h12 + 3600, "Drizzle"), (h12 + 7200, "Windy")))
+        self.assertEqual(r.hourly_at(h12 + 7200), RAINY)         # 2:00, still raining: 14 Rainy
+        self.assertEqual(r.hourly_at(h12 + 131 * 60 + 60), SUNNY)  # rain over at 2:12: 2 PM Windy
+        # No row for the hour and nothing falling: nothing to send (no fallback to the condition).
+        self.assertIsNone(WeatherReading("Rain", h12, "t", hours=((h12, "Rain"),)).hourly_at(h12 + 3600))
+        self.assertIsNone(WeatherReading("Snow", h12, "t").hourly_at(h12 + 30 * 60))
         f = WeatherFollower()
-        f.follow(r, h12 + 48 * 60)
-        self.assertEqual(f.due(h12 + 48 * 60), SUNNY); self.assertFalse(f.for_next_hour)
-        f.started(); f.finished(SUNNY, True, h12 + 48 * 60)
-        f.follow(r, h12 + 58 * 60); self.assertIsNone(f.due(h12 + 58 * 60))
-        # 12:59: 1 PM's forecast, for the next hour (the 12:00 track is not changed over).
-        f.follow(r, h12 + 59 * 60)
-        self.assertEqual(f.due(h12 + 59 * 60), RAINY); self.assertTrue(f.for_next_hour)
-        f.started(); f.finished(RAINY, True, h12 + 59 * 60)
-        # 1:00: the app refreshes and says Cloudy now, 1 PM row Cloudy: the hour stays rainy.
-        r2 = WeatherReading("Cloudy", h12 + 3600, "t",
-                            hours=((h12 + 3600, "Cloudy"), (h12 + 7200, "Windy")))
-        for m in (0, 1, 10, 30, 58):
-            f.follow(r2, h12 + 3600 + m * 60)
-            self.assertIsNone(f.due(h12 + 3600 + m * 60), m)
-            self.assertFalse(f.for_next_hour)
-        # Rain falls at 1:20 and stops at 1:30: rainy either way, nothing sent.
-        r3 = WeatherReading("Cloudy", h12 + 80 * 60, "t",
-                            minutes=((h12 + 80 * 60, 0.4), (h12 + 90 * 60, 0.0)), minutes_end=h12 + 140 * 60,
-                            hours=((h12 + 3600, "Cloudy"), (h12 + 7200, "Windy")))
-        f.follow(r3, h12 + 85 * 60); self.assertIsNone(f.due(h12 + 85 * 60))
-        f.follow(r3, h12 + 95 * 60); self.assertIsNone(f.due(h12 + 95 * 60))
-        # 1:59: 2 PM Windy, for the next hour.
-        f.follow(r3, h12 + 119 * 60)
-        self.assertEqual(f.due(h12 + 119 * 60), SUNNY); self.assertTrue(f.for_next_hour)
-
-    def test_follow_precipitation_within_the_hour_and_back(self):
-        h = time.mktime((2026, 10, 11, 12, 0, 0, 0, 0, -1))
-        r = WeatherReading("Cloudy", h + 20 * 60, "t",
-                           minutes=((h + 20 * 60, 0.6), (h + 30 * 60, 0.0)), minutes_end=h + 80 * 60,
-                           hours=((h, "Cloudy"), (h + 3600, "Clear")))
-        f = WeatherFollower()
-        f.follow(r, h + 10 * 60)
-        self.assertEqual(f.due(h + 10 * 60), SUNNY); f.started(); f.finished(SUNNY, True, h + 10 * 60)
-        f.follow(r, h + 20 * 60)
-        self.assertEqual(f.due(h + 20 * 60), RAINY); self.assertFalse(f.for_next_hour)   # now, this hour
-        f.started(); f.finished(RAINY, True, h + 20 * 60)
-        f.follow(r, h + 25 * 60); self.assertIsNone(f.due(h + 25 * 60))
-        f.follow(r, h + 30 * 60)
-        self.assertEqual(f.due(h + 30 * 60), SUNNY); self.assertFalse(f.for_next_hour)   # back to the hour's weather
-        f.started(); f.finished(SUNNY, True, h + 30 * 60)
-        # A forecast revised mid-hour (12 PM row now Drizzle) changes nothing: the hour is decided.
-        r2 = WeatherReading("Drizzle", h + 40 * 60, "t", hours=((h, "Drizzle"), (h + 3600, "Clear")))
-        f.follow(r2, h + 40 * 60); self.assertIsNone(f.due(h + 40 * 60))
-
-    def test_follow_started_mid_hour_uses_this_hours_forecast(self):
-        h = time.mktime((2026, 10, 11, 12, 0, 0, 0, 0, -1))
-        r = WeatherReading("Clear", h + 30 * 60, "t", hours=((h, "Rain"), (h + 3600, "Clear")))
-        f = WeatherFollower()
-        f.follow(r, h + 30 * 60)
-        self.assertEqual(f.due(h + 30 * 60), RAINY); self.assertFalse(f.for_next_hour)
+        f.on_reading(None)
+        self.assertIsNone(f.due(h12))
 
     def test_precipitation_now_overrides_the_hours_forecast(self):
         h = 1791741600.0
@@ -264,19 +218,19 @@ class TestWeather(unittest.TestCase):
     def test_no_hold_from_previous_state(self):
         # The 16:00 case: rain, then IsolatedThunderstorms, picks sunny.
         readings = ["Rain", "IsolatedThunderstorms", "Cloudy", "Thunderstorms", "Snow", "Clear"]
-        self.assertEqual([WeatherReading(c, 0, "t").hourly for c in readings],
+        self.assertEqual([WeatherReading(c, 0, "t", hours=((0, c),)).hourly for c in readings],
                          [RAINY, SUNNY, SUNNY, RAINY, SNOWY, SUNNY])
 
     def test_follower_skips_identical_weather(self):
         # Playing clear: IsolatedThunderstorms then Cloudy keep it sunny, so nothing is pushed.
         f = WeatherFollower()
-        f.on_reading(WeatherReading("Clear", 0, "t").hourly)
+        f.on_reading(WeatherReading("Clear", 0, "t", hours=((0, "Clear"),)).hourly)
         self.assertEqual(f.due(0), SUNNY); f.started(); f.finished(SUNNY, True, 0)
-        f.on_reading(WeatherReading("IsolatedThunderstorms", 0, "t").hourly)
+        f.on_reading(WeatherReading("IsolatedThunderstorms", 0, "t", hours=((0, "IsolatedThunderstorms"),)).hourly)
         self.assertIsNone(f.due(100))
-        f.on_reading(WeatherReading("Cloudy", 0, "t").hourly)
+        f.on_reading(WeatherReading("Cloudy", 0, "t", hours=((0, "Cloudy"),)).hourly)
         self.assertIsNone(f.due(100))
-        f.on_reading(WeatherReading("Rain", 0, "t").hourly)
+        f.on_reading(WeatherReading("Rain", 0, "t", hours=((0, "Rain"),)).hourly)
         self.assertEqual(f.due(100), RAINY)
 
     def test_follower_retries_until_acknowledged(self):
@@ -337,7 +291,7 @@ class TestWeather(unittest.TestCase):
             db.commit()
             db.close()
             with open(os.path.join(cache, "fsCachedData", "AA-BB"), "wb") as f:
-                f.write(wk2_weather(22))
+                f.write(wk2_weather(22, hours=[(1791447660 - 60, 22)]))
             src = WeatherAppSource(mirror=mirror, latlon="40.782/-111.872")
             self.assertTrue(src.changed())
             self.assertFalse(src.changed())

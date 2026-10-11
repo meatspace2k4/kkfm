@@ -1198,9 +1198,9 @@ while True:
         weather_state: dict[str, Any] = {"reading": None}
         follower = WeatherFollower()
 
-        def _push_weather(w: str, label: str, next_hour: bool = False) -> None:
+        def _push_weather(w: str, label: str) -> None:
             follower.started()
-            url = f"{player_base}/control/weather/{'next/' if next_hour else ''}{w}"
+            url = f"{player_base}/control/weather/{w}"
 
             def _go() -> None:
                 ok = False
@@ -1219,17 +1219,16 @@ while True:
             # changed() is a cheap stamp check; the source is only read when its data moved.
             if weather_src is not None and weather_src.changed():
                 weather_state["reading"] = weather_src.read()
-            # The reading is re-evaluated at the current time every tick: the app's precipitation
-            # chart says when rain is falling and when it stops; otherwise the hour's weather,
-            # decided a minute before the hour, holds (see WeatherFollower.follow).
+            # The state is re-evaluated at the current time every tick: precipitation falling per
+            # the app's chart, otherwise the next hour's forecast. It is pushed when it differs
+            # from what the player acknowledged; the player applies it at its hour changeover.
             r = weather_state["reading"]
             if r is not None:
-                follower.follow(r, time.time())
+                follower.on_reading(r.hourly_at(time.time()))
             w = follower.due(time.time())
             if w is not None:
                 r = weather_state["reading"]
-                _push_weather(w, f"{r.source} {r.condition}" if r is not None else f"weather {w}",
-                              follower.for_next_hour)
+                _push_weather(w, f"{r.source} {r.condition}" if r is not None else f"weather {w}")
 
         def _poll_sonos() -> None:
             nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll, sonos_stopped_polls, sonos_title, sonos_resumes, sonos_handoff_ts
