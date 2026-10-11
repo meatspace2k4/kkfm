@@ -1,27 +1,23 @@
-"""Weather sources for the hourly profile: what the sky is doing right now.
+"""Weather sources for the hourly profile: is precipitation falling right now, and until when.
 
-A WeatherSource reports the current Apple WeatherKit condition ("Rain", "Cloudy", ...) and the
-app's next-hour minute data: from which minute precipitation is falling and until when. The
-hourly player's weather is a three-state engine evaluated at the current time:
+A WeatherSource reports the Weather app's precipitation chart (the panel with the Now / 10m /
+20m ... bars: one bar per minute, its height the precipitation intensity, no bar when nothing is
+falling) plus the current condition name. The hourly player's weather is a three-state engine
+evaluated at the current time:
 
-  precipitation falling now, snow-type condition  -> SNOWY
-  precipitation falling now, otherwise            -> RAINY
-  nothing falling now                             -> the condition's state: RAINING -> RAINY,
+  the bar at "Now" is above zero, snow condition  -> SNOWY
+  the bar at "Now" is above zero, otherwise       -> RAINY
+  no bar at "Now"                                 -> the condition's state: RAINING -> RAINY,
                                                      SNOWING -> SNOWY, anything else -> SUNNY
 
-"Falling now" comes from the minute data (the app's "Light Rain Forecasted" chart), not from the
-condition: the app keeps the condition at Cloudy while its chart shows rain, and the chart ends
-at a definite minute. `WeatherReading.hourly_at(now)` re-evaluates the same reading as time
-passes, so when the active precipitation ends the engine returns to the condition's state
-(Cloudy -> SUNNY) without a new fetch. The dashboard only pushes a state the player is not
-already in.
+The chart also says when the precipitation stops: the first later minute with no bar. The
+monitor sends the player RAINY when the bars start and, when that end minute is reached, the
+condition's state again (Cloudy before the rain -> SUNNY after it), with no new fetch needed.
+The dashboard only pushes a state the player is not already in.
 
   WeatherAppSource  the macOS Weather app's own data: its cached WeatherKit responses,
                     mirrored by hourly/mac/WeatherWatch.swift (the only process with Full
                     Disk Access) whenever the app writes them. No WeatherKit license needed.
-
-A WeatherKit REST source drops in by subclassing WeatherSource: currentWeather.conditionCode
-and forecastNextHour.minutes[].precipitationIntensity in the REST JSON are the same values.
 """
 from __future__ import annotations
 
@@ -58,15 +54,16 @@ def hourly_weather(condition: str, precipitating: bool = False) -> str:
     return SUNNY
 
 
-# The app's next-hour minute data as segments: each (start, intensity mm/h) holds from its start
-# until the next segment's start; the last holds until `end`.
-Minutes = tuple[tuple[float, float], ...]
+# The app's precipitation chart as bars: (minute start, intensity mm/h); a bar holds until the
+# next bar's start, the last until `end`.
+Chart = tuple[tuple[float, float], ...]
+Minutes = Chart
 
 
-def precipitation_at(minutes: Minutes, end: float, now: float) -> tuple[bool, Optional[float]]:
-    """(falling now, when it stops). Falling when the segment covering `now` has intensity > 0;
-    it stops at the first later segment with intensity 0 (or at `end`). Outside the data's
-    span nothing is known, so nothing is falling."""
+def precipitation_at(minutes: Chart, end: float, now: float) -> tuple[bool, Optional[float]]:
+    """(falling now, when it stops). Falling when the bar covering `now` is above zero; it stops
+    at the first later bar at zero (or when the chart ends). Outside the chart's span nothing is
+    known, so nothing is falling."""
     if not minutes or now < minutes[0][0] or now >= end:
         return False, None
     idx = 0
@@ -128,8 +125,8 @@ class WeatherReading:
     condition: str              # Apple conditionCode name, e.g. "MostlyCloudy"
     as_of: float                # epoch seconds the data describes
     source: str                 # WeatherSource.name
-    minutes: Minutes = ()       # next-hour precipitation segments (start, mm/h)
-    minutes_end: float = 0.0    # when the minute data ends
+    minutes: Chart = ()         # the precipitation chart's bars (minute start, mm/h)
+    minutes_end: float = 0.0    # when the chart ends
 
     def precipitation_at(self, now: float) -> tuple[bool, Optional[float]]:
         return precipitation_at(self.minutes, self.minutes_end, now)
@@ -170,11 +167,12 @@ WK2_CONDITIONS = [
 ]
 
 
-# WK2.Weather root fields: currentWeather 1, forecastNextHour 4. NextHourForecast: start (3),
+# WK2.Weather root fields: currentWeather 1, the precipitation chart 4 (WeatherKit calls it
+# forecastNextHour; the app draws it as the Now / 10m / 20m bars). Chart table: start (3),
 # end (4), minutes (5). A minute entry: startTime (0), precipitationChance (2),
 # precipitationIntensity (3, mm/h, absent when 0). Checked against the app's cache on
-# 2026-10-11: minutes 12:27..12:32 then 13:48.., chance 0.68..0.85, intensity 0.579 at 12:32,
-# the app's chart showing light rain from then; the summary periods give 12:32-12:45.
+# 2026-10-11 12:27: intensity 0.579 from 12:32 while the app showed "Light Rain" bars, no
+# intensity field in the dry minutes before and after.
 WK2_ROOT_CURRENT = 1
 WK2_ROOT_NEXT_HOUR = 4
 WK2_NEXT_HOUR_END = 4
@@ -191,8 +189,8 @@ def _wk2_fields(b: bytes, t: int) -> dict[int, int]:
     return {i: t + u16(vt + 4 + 2 * i) for i in range(n) if u16(vt + 4 + 2 * i)}
 
 
-def wk2_next_hour(b: bytes) -> tuple[Minutes, float]:
-    """(minute segments, end) from the forecastNextHour table; (() , 0.0) when absent."""
+def wk2_next_hour(b: bytes) -> tuple[Chart, float]:
+    """(chart bars, chart end) from the precipitation chart table; ((), 0.0) when absent."""
     u32 = lambda o: struct.unpack_from("<I", b, o)[0]
     f32 = lambda o: struct.unpack_from("<f", b, o)[0]
     try:

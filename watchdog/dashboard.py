@@ -1219,8 +1219,8 @@ while True:
             # changed() is a cheap stamp check; the source is only read when its data moved.
             if weather_src is not None and weather_src.changed():
                 weather_state["reading"] = weather_src.read()
-            # The reading is re-evaluated at the current time every tick: precipitation in its
-            # minute data starts and ends at definite minutes, and the state follows them.
+            # The reading is re-evaluated at the current time every tick: the app's precipitation
+            # chart says when rain is falling and when it stops, and the state follows that.
             r = weather_state["reading"]
             if r is not None:
                 follower.on_reading(r.hourly_at(time.time()))
