@@ -35,6 +35,9 @@ SUNNY = "sunny"
 RAINY = "rainy"
 SNOWY = "snowy"
 
+# With nothing falling, the next hour's forecast is sent this long before the hour.
+CHANGEOVER_LEAD_S = 60.0
+
 # Conditions that report precipitation falling here. Scattered and isolated thunderstorms are
 # storms in the area, not precipitation at the location, so they are in neither set.
 RAINING = frozenset({
@@ -127,13 +130,19 @@ class WeatherReading:
     source: str                 # WeatherSource.name
     minutes: Chart = ()         # the precipitation chart's bars (minute start, mm/h)
     minutes_end: float = 0.0    # when the chart ends
+    hours: Hours = ()           # the hourly forecast (hour start, condition)
 
     def precipitation_at(self, now: float) -> tuple[bool, Optional[float]]:
         return precipitation_at(self.minutes, self.minutes_end, now)
 
     def hourly_at(self, now: float) -> str:
         falling, _ = self.precipitation_at(now)
-        return hourly_weather(self.condition, falling)
+        if falling:
+            return hourly_weather(self.condition, True)
+        cond = forecast_condition_at(self.hours, now + CHANGEOVER_LEAD_S)
+        if cond is None:
+            cond = forecast_condition_at(self.hours, now)
+        return hourly_weather(cond if cond is not None else self.condition)
 
     @property
     def hourly(self) -> str:
@@ -212,6 +221,45 @@ def wk2_next_hour(b: bytes) -> tuple[Chart, float]:
     except (struct.error, IndexError, KeyError):
         return (), 0.0
     return tuple(out), end
+
+
+# Hourly forecast: WK2.Weather root field 3, its vector field 1; an hour entry: forecastStart (0),
+# conditionCode (5). Checked against the app's Conditions row on 2026-10-11 12:48.
+WK2_ROOT_HOURLY = 3
+WK2_HOURLY_HOURS = 1
+WK2_HOUR_START = 0
+WK2_HOUR_CONDITION = 5
+
+Hours = tuple[tuple[float, str], ...]   # (hour start, condition name)
+
+
+def wk2_hourly(b: bytes) -> Hours:
+    u32 = lambda o: struct.unpack_from("<I", b, o)[0]
+    try:
+        root = _wk2_fields(b, u32(0))
+        if WK2_ROOT_HOURLY not in root:
+            return ()
+        hf = _wk2_fields(b, root[WK2_ROOT_HOURLY] + u32(root[WK2_ROOT_HOURLY]))
+        if WK2_HOURLY_HOURS not in hf:
+            return ()
+        v = hf[WK2_HOURLY_HOURS] + u32(hf[WK2_HOURLY_HOURS])
+        out = []
+        for i in range(u32(v)):
+            e = v + 4 + 4 * i
+            h = _wk2_fields(b, e + u32(e))
+            start = float(u32(h[WK2_HOUR_START])) if WK2_HOUR_START in h else 0.0
+            code = b[h[WK2_HOUR_CONDITION]] if WK2_HOUR_CONDITION in h else 0
+            out.append((start, WK2_CONDITIONS[code] if code < len(WK2_CONDITIONS) else f"Code{code}"))
+    except (struct.error, IndexError, KeyError):
+        return ()
+    return tuple(out)
+
+
+def forecast_condition_at(hours: Hours, t: float) -> Optional[str]:
+    for start, cond in hours:
+        if start <= t < start + 3600:
+            return cond
+    return None
 
 
 def wk2_current_condition(b: bytes) -> Optional[tuple[str, float]]:
@@ -301,7 +349,8 @@ class WeatherAppSource(WeatherSource):
         if not cc:
             return None
         minutes, end = wk2_next_hour(body)
-        return WeatherReading(condition=cc[0], as_of=cc[1], source=self.name, minutes=minutes, minutes_end=end)
+        return WeatherReading(condition=cc[0], as_of=cc[1], source=self.name, minutes=minutes, minutes_end=end,
+                              hours=wk2_hourly(body))
 
 
 SOURCES: dict[str, type[WeatherSource]] = {

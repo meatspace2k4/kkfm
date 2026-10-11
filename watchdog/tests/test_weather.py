@@ -17,7 +17,9 @@ from watchdog.weather import (
     hourly_weather,
     make_source,
     wk2_current_condition,
+    wk2_hourly,
     wk2_next_hour,
+    forecast_condition_at,
     precipitation_at,
 )
 
@@ -54,7 +56,7 @@ def _point(buf, pos, target):
     struct.pack_into("<I", buf, pos, target - pos)
 
 
-def wk2_weather(code=None, as_of=1791447660, minutes=None, end=None):
+def wk2_weather(code=None, as_of=1791447660, minutes=None, end=None, hours=None):
     """A WK2.Weather FlatBuffer: root field 1 -> CurrentWeatherData (asOf field 1, conditionCode
     field 6 unless None) and, when `minutes` is given, root field 4 -> NextHourForecast (end field
     4, minutes field 5: entries with startTime field 0 and precipitationIntensity field 3 when
@@ -63,6 +65,8 @@ def wk2_weather(code=None, as_of=1791447660, minutes=None, end=None):
     root_fields = {1: b"\0\0\0\0"}
     if minutes is not None:
         root_fields[4] = b"\0\0\0\0"
+    if hours is not None:
+        root_fields[3] = b"\0\0\0\0"
     root_tab = _table(buf, root_fields)
     struct.pack_into("<I", buf, 0, root_tab)
 
@@ -84,6 +88,14 @@ def wk2_weather(code=None, as_of=1791447660, minutes=None, end=None):
             if inten:
                 ef[3] = struct.pack("<f", inten)
             _point(buf, vec + 4 + 4 * i, _table(buf, ef))
+    if hours is not None:
+        hf_tab = _table(buf, {1: b"\0\0\0\0"})
+        _point(buf, _field_pos(buf, root_tab, 3), hf_tab)
+        vec = len(buf)
+        buf += struct.pack("<I", len(hours)) + b"\0\0\0\0" * len(hours)
+        _point(buf, _field_pos(buf, hf_tab, 1), vec)
+        for i, (start, code) in enumerate(hours):
+            _point(buf, vec + 4 + 4 * i, _table(buf, {0: struct.pack("<I", int(start)), 5: struct.pack("<B", code) + b"\0\0\0"}))
     return bytes(buf)
 
 
@@ -147,6 +159,35 @@ class TestWeather(unittest.TestCase):
         readings = ["Rain", "IsolatedThunderstorms", "Cloudy", "Thunderstorms", "Snow", "Clear"]
         self.assertEqual([WeatherReading(c, 0, "t").hourly for c in readings],
                          [RAINY, SUNNY, SUNNY, RAINY, SNOWY, SUNNY])
+
+    def test_changeover_sends_the_next_hours_forecast(self):
+        h12 = 1791741600.0
+        r = WeatherReading("Cloudy", h12 + 48 * 60, "t",
+                           minutes=((h12 + 48 * 60, 0.0), (h12 + 98 * 60, 0.5), (h12 + 131 * 60, 0.0)),
+                           minutes_end=h12 + 132 * 60,
+                           hours=((h12, "Cloudy"), (h12 + 3600, "Drizzle"), (h12 + 7200, "Windy")))
+        self.assertEqual(r.hourly_at(h12 + 48 * 60), SUNNY)
+        self.assertEqual(r.hourly_at(h12 + 58 * 60), SUNNY)
+        self.assertEqual(r.hourly_at(h12 + 59 * 60), RAINY)
+        self.assertEqual(r.hourly_at(h12 + 3600), RAINY)
+        self.assertEqual(r.hourly_at(h12 + 98 * 60), RAINY)
+        self.assertEqual(r.hourly_at(h12 + 7200 - 60), RAINY)    # still raining at 1:59
+        self.assertEqual(r.hourly_at(h12 + 131 * 60 + 60), SUNNY)  # rain over: 2PM Windy
+
+    def test_precipitation_now_overrides_the_hours_forecast(self):
+        h = 1791741600.0
+        r = WeatherReading("Cloudy", h, "t", minutes=((h, 0.6), (h + 600, 0.0)), minutes_end=h + 3600,
+                           hours=((h, "Cloudy"), (h + 3600, "Clear")))
+        self.assertEqual(r.hourly_at(h + 300), RAINY)
+        self.assertEqual(r.hourly_at(h + 600), SUNNY)
+
+    def test_decode_hourly_forecast(self):
+        h = 1791741600
+        b = wk2_weather(5, as_of=h, hours=[(h, 5), (h + 3600, 6), (h + 7200, 32)])
+        self.assertEqual(wk2_hourly(b), ((float(h), "Cloudy"), (float(h + 3600), "Drizzle"), (float(h + 7200), "Windy")))
+        self.assertEqual(wk2_hourly(wk2_weather(5)), ())
+        self.assertEqual(forecast_condition_at(wk2_hourly(b), h + 3700), "Drizzle")
+        self.assertIsNone(forecast_condition_at((), h))
 
     def test_decode_next_hour_minutes(self):
         t0 = 1791743220
