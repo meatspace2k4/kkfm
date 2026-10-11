@@ -17,42 +17,79 @@ from watchdog.weather import (
     hourly_weather,
     make_source,
     wk2_current_condition,
+    wk2_next_hour,
+    precipitation_at,
 )
 
 
-def wk2_weather(code=None, as_of=1791447660):
-    """A minimal WK2.Weather FlatBuffer: root field 1 -> CurrentWeatherData with asOf (field 1)
-    and, unless None, conditionCode (field 6)."""
+def _table(buf, fields_bytes):
+    """Append a vtable + table whose fields (dict idx -> packed bytes, 4-byte multiples) are
+    given; returns the table offset. uoffset fields are patched afterwards with _point()."""
+    n = (max(fields_bytes) + 1) if fields_bytes else 0
+    slots = [0] * n
+    layout, off = [], 4
+    for idx in sorted(fields_bytes):
+        slots[idx] = off
+        layout.append(fields_bytes[idx])
+        off += len(fields_bytes[idx])
+    vt = len(buf)
+    buf += struct.pack("<HH", 4 + 2 * n, off) + struct.pack(f"<{n}H", *slots)
+    while len(buf) % 4:
+        buf += b"\0"
+    tab = len(buf)
+    buf += struct.pack("<i", tab - vt) + b"".join(layout)
+    while len(buf) % 4:
+        buf += b"\0"
+    return tab
+
+
+def _field_pos(buf, tab, idx):
+    vt = tab - struct.unpack_from("<i", buf, tab)[0]
+    return tab + struct.unpack_from("<H", buf, vt + 4 + 2 * idx)[0]
+
+
+def _point(buf, pos, target):
+    """Store a FlatBuffers uoffset (unsigned, forward) at pos -> target."""
+    assert target > pos, "referenced objects must come after the reference"
+    struct.pack_into("<I", buf, pos, target - pos)
+
+
+def wk2_weather(code=None, as_of=1791447660, minutes=None, end=None):
+    """A WK2.Weather FlatBuffer: root field 1 -> CurrentWeatherData (asOf field 1, conditionCode
+    field 6 unless None) and, when `minutes` is given, root field 4 -> NextHourForecast (end field
+    4, minutes field 5: entries with startTime field 0 and precipitationIntensity field 3 when
+    non-zero). Objects are laid out after whatever references them, as uoffsets require."""
+    buf = bytearray(4)
+    root_fields = {1: b"\0\0\0\0"}
+    if minutes is not None:
+        root_fields[4] = b"\0\0\0\0"
+    root_tab = _table(buf, root_fields)
+    struct.pack_into("<I", buf, 0, root_tab)
+
     cur_fields = {1: struct.pack("<I", as_of)}
     if code is not None:
         cur_fields[6] = struct.pack("<B", code) + b"\0\0\0"
-    buf = bytearray(4)                                # root offset, patched below
-    # root vtable + table
-    root_vt = len(buf)
-    buf += struct.pack("<HHHH", 8, 8, 0, 4)           # vt size 8, table size 8, field0 absent, field1 @4
-    root_tab = len(buf)
-    buf += struct.pack("<i", root_tab - root_vt)
-    ref_pos = len(buf)
-    buf += b"\0\0\0\0"                                # uoffset to CurrentWeatherData
-    cur_vt = len(buf)
-    slots = [0] * 7
-    layout, off = [], 4
-    for idx in sorted(cur_fields):
-        slots[idx] = off
-        layout.append(cur_fields[idx])
-        off += len(cur_fields[idx])
-    buf += struct.pack("<HH", 4 + 2 * len(slots), off) + struct.pack(f"<{len(slots)}H", *slots)
-    while len(buf) % 4:
-        buf += b"\0"
-    cur_tab = len(buf)
-    buf += struct.pack("<i", cur_tab - cur_vt) + b"".join(layout)
-    struct.pack_into("<I", buf, 0, root_tab)
-    struct.pack_into("<I", buf, ref_pos, cur_tab - ref_pos)
+    cur_tab = _table(buf, cur_fields)
+    _point(buf, _field_pos(buf, root_tab, 1), cur_tab)
+
+    if minutes is not None:
+        nh_tab = _table(buf, {4: struct.pack("<I", int(end if end is not None else minutes[-1][0] + 60)),
+                              5: b"\0\0\0\0"})
+        _point(buf, _field_pos(buf, root_tab, 4), nh_tab)
+        vec = len(buf)
+        buf += struct.pack("<I", len(minutes)) + b"\0\0\0\0" * len(minutes)
+        _point(buf, _field_pos(buf, nh_tab, 5), vec)
+        for i, (start, inten) in enumerate(minutes):
+            ef = {0: struct.pack("<I", int(start))}
+            if inten:
+                ef[3] = struct.pack("<f", inten)
+            _point(buf, vec + 4 + 4 * i, _table(buf, ef))
     return bytes(buf)
 
 
 class TestWeather(unittest.TestCase):
     def test_state_engine(self):
+        # Nothing falling: the condition decides.
         self.assertEqual(hourly_weather("Rain"), RAINY)
         self.assertEqual(hourly_weather("HeavyRain"), RAINY)
         self.assertEqual(hourly_weather("Drizzle"), RAINY)
@@ -63,6 +100,62 @@ class TestWeather(unittest.TestCase):
         self.assertEqual(hourly_weather("ScatteredThunderstorms"), SUNNY)
         self.assertEqual(hourly_weather("Cloudy"), SUNNY)
         self.assertEqual(hourly_weather("Clear"), SUNNY)
+        # Precipitation falling now: rainy whatever the condition says, snowy for a snow condition.
+        self.assertEqual(hourly_weather("Cloudy", precipitating=True), RAINY)
+        self.assertEqual(hourly_weather("IsolatedThunderstorms", precipitating=True), RAINY)
+        self.assertEqual(hourly_weather("Snow", precipitating=True), SNOWY)
+
+    def test_precipitation_at_follows_the_minute_data(self):
+        t0 = 1791743220.0   # 12:27
+        m = ((t0, 0.0), (t0 + 60, 0.0), (t0 + 120, 0.5), (t0 + 180, 0.6), (t0 + 240, 0.0), (t0 + 300, 0.0))
+        end = t0 + 360
+        self.assertEqual(precipitation_at(m, end, t0 + 30), (False, None))      # before it starts
+        self.assertEqual(precipitation_at(m, end, t0 + 120), (True, t0 + 240))  # starts at 12:29
+        self.assertEqual(precipitation_at(m, end, t0 + 239), (True, t0 + 240))  # ...until 12:31
+        self.assertEqual(precipitation_at(m, end, t0 + 240), (False, None))     # stopped
+        self.assertEqual(precipitation_at(m, end, t0 - 1), (False, None))       # outside the data
+        self.assertEqual(precipitation_at(m, end, end), (False, None))
+        self.assertEqual(precipitation_at((), 0.0, t0), (False, None))
+        # Falling through the end of the data: it stops when the data does.
+        self.assertEqual(precipitation_at(((t0, 0.3),), t0 + 60, t0 + 10), (True, t0 + 60))
+
+    def test_reading_returns_to_the_condition_when_the_rain_ends(self):
+        # Cloudy before, light rain 12:29-12:31 per the chart, Cloudy after: sunny, rainy, sunny.
+        t0 = 1791743220.0
+        r = WeatherReading("Cloudy", t0, "t",
+                           minutes=((t0, 0.0), (t0 + 60, 0.0), (t0 + 120, 0.5), (t0 + 180, 0.6), (t0 + 240, 0.0)),
+                           minutes_end=t0 + 300)
+        self.assertEqual([r.hourly_at(t) for t in (t0, t0 + 120, t0 + 200, t0 + 240, t0 + 299)],
+                         [SUNNY, RAINY, RAINY, SUNNY, SUNNY])
+        self.assertEqual(r.precipitation_at(t0 + 150), (True, t0 + 240))
+        # A rain-type condition stays rainy even with no minute data.
+        self.assertEqual(WeatherReading("Rain", t0, "t").hourly_at(t0 + 999), RAINY)
+
+    def test_follower_tracks_the_rain_start_and_end(self):
+        t0 = 1791743220.0
+        r = WeatherReading("Cloudy", t0, "t", minutes=((t0, 0.0), (t0 + 60, 0.4), (t0 + 120, 0.0)), minutes_end=t0 + 180)
+        f = WeatherFollower()
+        f.on_reading(r.hourly_at(t0)); self.assertEqual(f.due(t0), SUNNY); f.started(); f.finished(SUNNY, True, t0)
+        f.on_reading(r.hourly_at(t0 + 30)); self.assertIsNone(f.due(t0 + 30))         # same state: skipped
+        f.on_reading(r.hourly_at(t0 + 60)); self.assertEqual(f.due(t0 + 60), RAINY)    # rain starts
+        f.started(); f.finished(RAINY, True, t0 + 60)
+        f.on_reading(r.hourly_at(t0 + 90)); self.assertIsNone(f.due(t0 + 90))
+        f.on_reading(r.hourly_at(t0 + 120)); self.assertEqual(f.due(t0 + 120), SUNNY)  # rain ends: back to Cloudy's state
+
+    def test_no_hold_from_previous_state(self):
+        # The 16:00 case: rain, then IsolatedThunderstorms with nothing falling, picks sunny.
+        readings = ["Rain", "IsolatedThunderstorms", "Cloudy", "Thunderstorms", "Snow", "Clear"]
+        self.assertEqual([WeatherReading(c, 0, "t").hourly for c in readings],
+                         [RAINY, SUNNY, SUNNY, RAINY, SNOWY, SUNNY])
+
+    def test_decode_next_hour_minutes(self):
+        t0 = 1791743220
+        b = wk2_weather(5, as_of=t0, minutes=[(t0, 0.0), (t0 + 60, 0.579), (t0 + 120, 0.0)], end=t0 + 180)
+        self.assertEqual(wk2_current_condition(b), ("Cloudy", float(t0)))
+        minutes, end = wk2_next_hour(b)
+        self.assertEqual(end, float(t0 + 180))
+        self.assertEqual([(int(s), round(i, 3)) for s, i in minutes], [(t0, 0.0), (t0 + 60, 0.579), (t0 + 120, 0.0)])
+        self.assertEqual(wk2_next_hour(wk2_weather(5)), ((), 0.0))   # no next-hour table
 
     def test_rain_and_snow_sets_are_apple_conditions(self):
         self.assertTrue(RAINING <= set(WK2_CONDITIONS))

@@ -1218,9 +1218,12 @@ while True:
         def _poll_weather() -> None:
             # changed() is a cheap stamp check; the source is only read when its data moved.
             if weather_src is not None and weather_src.changed():
-                r = weather_src.read()
-                weather_state["reading"] = r
-                follower.on_reading(r.hourly if r is not None else None)
+                weather_state["reading"] = weather_src.read()
+            # The reading is re-evaluated at the current time every tick: precipitation in its
+            # minute data starts and ends at definite minutes, and the state follows them.
+            r = weather_state["reading"]
+            if r is not None:
+                follower.on_reading(r.hourly_at(time.time()))
             w = follower.due(time.time())
             if w is not None:
                 r = weather_state["reading"]
@@ -1608,8 +1611,13 @@ while True:
                     ctl = ("1 Sunny  2 Rainy  3 Snowy  " if prof.weather_controls else "") + "r next track"
                     if weather_src is not None:
                         r = weather_state["reading"]
-                        ctl += f"   |  {weather_src.name}: " + (
-                            f"{r.condition} ({time.strftime('%H:%M', time.localtime(r.as_of))})" if r else "no data")
+                        if r:
+                            falling, until = r.precipitation_at(time.time())
+                            precip = (f", precip until {time.strftime('%H:%M', time.localtime(until))}"
+                                      if falling and until else "")
+                            ctl += f"   |  {weather_src.name}: {r.condition}{precip} ({time.strftime('%H:%M', time.localtime(r.as_of))})"
+                        else:
+                            ctl += f"   |  {weather_src.name}: no data"
                     if control_msg["text"]:
                         ctl += "   |  " + str(control_msg["text"])
                     stdscr.attron(curses.color_pair(3))

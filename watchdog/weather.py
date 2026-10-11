@@ -1,24 +1,27 @@
-"""Weather sources for the hourly profile: what the sky is doing, as an Apple condition.
+"""Weather sources for the hourly profile: what the sky is doing right now.
 
-A WeatherSource reports the current condition as an Apple WeatherKit conditionCode name
-("Rain", "MostlyCloudy", ...). The hourly player's weather is a three-state engine driven by
-that condition alone:
+A WeatherSource reports the current Apple WeatherKit condition ("Rain", "Cloudy", ...) and the
+app's next-hour minute data: from which minute precipitation is falling and until when. The
+hourly player's weather is a three-state engine evaluated at the current time:
 
-  rain-type precipitation (RAINING)  -> RAINY
-  snow-type precipitation (SNOWING)  -> SNOWY
-  any other condition                -> SUNNY   (the app reports nothing falling; this includes
-                                                 IsolatedThunderstorms and ScatteredThunderstorms)
+  precipitation falling now, snow-type condition  -> SNOWY
+  precipitation falling now, otherwise            -> RAINY
+  nothing falling now                             -> the condition's state: RAINING -> RAINY,
+                                                     SNOWING -> SNOWY, anything else -> SUNNY
 
-Every reading moves the engine to the state its condition belongs to; no state is held over
-from the previous reading. The dashboard only pushes a state the player is not already in.
+"Falling now" comes from the minute data (the app's "Light Rain Forecasted" chart), not from the
+condition: the app keeps the condition at Cloudy while its chart shows rain, and the chart ends
+at a definite minute. `WeatherReading.hourly_at(now)` re-evaluates the same reading as time
+passes, so when the active precipitation ends the engine returns to the condition's state
+(Cloudy -> SUNNY) without a new fetch. The dashboard only pushes a state the player is not
+already in.
 
   WeatherAppSource  the macOS Weather app's own data: its cached WeatherKit responses,
                     mirrored by hourly/mac/WeatherWatch.swift (the only process with Full
                     Disk Access) whenever the app writes them. No WeatherKit license needed.
 
 A WeatherKit REST source drops in by subclassing WeatherSource: currentWeather.conditionCode
-in the REST JSON already uses these names, so `read()` returns it as-is and register it in
-SOURCES.
+and forecastNextHour.minutes[].precipitationIntensity in the REST JSON are the same values.
 """
 from __future__ import annotations
 
@@ -45,14 +48,39 @@ RAINING = frozenset({
 SNOWING = frozenset({"Flurries", "SunFlurries", "Snow", "HeavySnow", "Blizzard", "BlowingSnow"})
 
 
-def hourly_weather(condition: str) -> str:
-    """The state a condition puts the engine in: RAINY while rain-type precipitation is reported,
-    SNOWY while snow is, SUNNY while nothing is falling."""
-    if condition in RAINING:
-        return RAINY
+def hourly_weather(condition: str, precipitating: bool = False) -> str:
+    """The engine's state: RAINY while precipitation falls (or a rain-type condition is reported),
+    SNOWY when it is snow, SUNNY while nothing is falling."""
     if condition in SNOWING:
         return SNOWY
+    if precipitating or condition in RAINING:
+        return RAINY
     return SUNNY
+
+
+# The app's next-hour minute data as segments: each (start, intensity mm/h) holds from its start
+# until the next segment's start; the last holds until `end`.
+Minutes = tuple[tuple[float, float], ...]
+
+
+def precipitation_at(minutes: Minutes, end: float, now: float) -> tuple[bool, Optional[float]]:
+    """(falling now, when it stops). Falling when the segment covering `now` has intensity > 0;
+    it stops at the first later segment with intensity 0 (or at `end`). Outside the data's
+    span nothing is known, so nothing is falling."""
+    if not minutes or now < minutes[0][0] or now >= end:
+        return False, None
+    idx = 0
+    for i, (start, _) in enumerate(minutes):
+        if start <= now:
+            idx = i
+        else:
+            break
+    if minutes[idx][1] <= 0.0:
+        return False, None
+    for start, intensity in minutes[idx + 1:]:
+        if intensity <= 0.0:
+            return True, start
+    return True, end
 
 
 class WeatherFollower:
@@ -97,13 +125,23 @@ class WeatherFollower:
 
 @dataclass(frozen=True)
 class WeatherReading:
-    condition: str      # Apple conditionCode name, e.g. "MostlyCloudy"
-    as_of: float        # epoch seconds the data describes
-    source: str         # WeatherSource.name
+    condition: str              # Apple conditionCode name, e.g. "MostlyCloudy"
+    as_of: float                # epoch seconds the data describes
+    source: str                 # WeatherSource.name
+    minutes: Minutes = ()       # next-hour precipitation segments (start, mm/h)
+    minutes_end: float = 0.0    # when the minute data ends
+
+    def precipitation_at(self, now: float) -> tuple[bool, Optional[float]]:
+        return precipitation_at(self.minutes, self.minutes_end, now)
+
+    def hourly_at(self, now: float) -> str:
+        falling, _ = self.precipitation_at(now)
+        return hourly_weather(self.condition, falling)
 
     @property
     def hourly(self) -> str:
-        return hourly_weather(self.condition)
+        """The state at the time the data describes."""
+        return self.hourly_at(self.as_of)
 
 
 class WeatherSource(ABC):
@@ -130,6 +168,52 @@ WK2_CONDITIONS = [
     "Rain", "ScatteredThunderstorms", "Sleet", "Smoky", "Snow", "StrongStorms", "SunFlurries",
     "SunShowers", "Thunderstorms", "TropicalStorm", "Windy", "WintryMix",
 ]
+
+
+# WK2.Weather root fields: currentWeather 1, forecastNextHour 4. NextHourForecast: start (3),
+# end (4), minutes (5). A minute entry: startTime (0), precipitationChance (2),
+# precipitationIntensity (3, mm/h, absent when 0). Checked against the app's cache on
+# 2026-10-11: minutes 12:27..12:32 then 13:48.., chance 0.68..0.85, intensity 0.579 at 12:32,
+# the app's chart showing light rain from then; the summary periods give 12:32-12:45.
+WK2_ROOT_CURRENT = 1
+WK2_ROOT_NEXT_HOUR = 4
+WK2_NEXT_HOUR_END = 4
+WK2_NEXT_HOUR_MINUTES = 5
+WK2_MINUTE_START = 0
+WK2_MINUTE_INTENSITY = 3
+
+
+def _wk2_fields(b: bytes, t: int) -> dict[int, int]:
+    i32 = lambda o: struct.unpack_from("<i", b, o)[0]
+    u16 = lambda o: struct.unpack_from("<H", b, o)[0]
+    vt = t - i32(t)
+    n = (u16(vt) - 4) // 2
+    return {i: t + u16(vt + 4 + 2 * i) for i in range(n) if u16(vt + 4 + 2 * i)}
+
+
+def wk2_next_hour(b: bytes) -> tuple[Minutes, float]:
+    """(minute segments, end) from the forecastNextHour table; (() , 0.0) when absent."""
+    u32 = lambda o: struct.unpack_from("<I", b, o)[0]
+    f32 = lambda o: struct.unpack_from("<f", b, o)[0]
+    try:
+        root = _wk2_fields(b, u32(0))
+        if WK2_ROOT_NEXT_HOUR not in root:
+            return (), 0.0
+        nh = _wk2_fields(b, root[WK2_ROOT_NEXT_HOUR] + u32(root[WK2_ROOT_NEXT_HOUR]))
+        end = float(u32(nh[WK2_NEXT_HOUR_END])) if WK2_NEXT_HOUR_END in nh else 0.0
+        if WK2_NEXT_HOUR_MINUTES not in nh:
+            return (), end
+        v = nh[WK2_NEXT_HOUR_MINUTES] + u32(nh[WK2_NEXT_HOUR_MINUTES])
+        out = []
+        for i in range(u32(v)):
+            e = v + 4 + 4 * i
+            m = _wk2_fields(b, e + u32(e))
+            start = float(u32(m[WK2_MINUTE_START])) if WK2_MINUTE_START in m else 0.0
+            inten = float(f32(m[WK2_MINUTE_INTENSITY])) if WK2_MINUTE_INTENSITY in m else 0.0
+            out.append((start, inten))
+    except (struct.error, IndexError, KeyError):
+        return (), 0.0
+    return tuple(out), end
 
 
 def wk2_current_condition(b: bytes) -> Optional[tuple[str, float]]:
@@ -218,7 +302,8 @@ class WeatherAppSource(WeatherSource):
         cc = wk2_current_condition(body) if body else None
         if not cc:
             return None
-        return WeatherReading(condition=cc[0], as_of=cc[1], source=self.name)
+        minutes, end = wk2_next_hour(body)
+        return WeatherReading(condition=cc[0], as_of=cc[1], source=self.name, minutes=minutes, minutes_end=end)
 
 
 SOURCES: dict[str, type[WeatherSource]] = {
