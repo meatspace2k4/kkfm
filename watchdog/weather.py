@@ -27,6 +27,7 @@ import shutil
 import sqlite3
 import struct
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
@@ -95,6 +96,31 @@ class WeatherFollower:
         self.pending: Optional[str] = None   # weather still to be applied
         self.inflight = False
         self.next_try = 0.0
+        # The hour's weather, decided once per hour CHANGEOVER_LEAD_S before it from the forecast
+        # for that hour. The app's later readings do not change it; only precipitation does.
+        self.hour_start: Optional[float] = None
+        self.hour_weather: Optional[str] = None
+        # True while the pending weather is for the hour that has not started yet: it goes to the
+        # player's next-hour slot, so the playing hour's track is left alone.
+        self.for_next_hour = False
+
+    def follow(self, r: "WeatherReading", now: float) -> None:
+        """Every tick with the current reading: precipitation falling now wins; otherwise the
+        weather decided for the hour (the one starting within CHANGEOVER_LEAD_S, else this one)."""
+        t = now + CHANGEOVER_LEAD_S
+        lt = time.localtime(t)
+        start = t - lt.tm_min * 60 - lt.tm_sec
+        if start != self.hour_start:
+            self.hour_start = start
+            cond = forecast_condition_at(r.hours, t)
+            self.hour_weather = hourly_weather(cond if cond is not None else r.condition)
+        falling, _ = r.precipitation_at(now)
+        if falling:
+            self.for_next_hour = False
+            self.on_reading(hourly_weather(r.condition, True))
+        else:
+            self.for_next_hour = now < start
+            self.on_reading(self.hour_weather)
 
     def on_reading(self, weather: Optional[str]) -> None:
         if weather is None:

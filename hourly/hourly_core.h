@@ -388,6 +388,10 @@ class WeatherState {
     bool has_override = false;
     Weather override_w = Weather::Sunny;
     WeatherSource source = WeatherSource::OpenMeteo;
+    // Weather held for an upcoming hour (/control/weather/next/<w>); see set_for_hour().
+    bool next_valid = false;
+    Weather next_w = Weather::Sunny;
+    int next_hour = -1;
     // Returns the raw response for the request made at `now`.
     std::function<std::string(std::time_t)> fetcher;
 
@@ -443,6 +447,37 @@ public:
             obs = o;
         }
         log_info_f(C_YELLOW "[HOURLY] " C_RESET "Weather set: " C_BOLD "%s" C_RESET " (manual)", weather_name(w));
+    }
+
+    // Weather for `hour` (the dashboard's next-hour forecast, sent before the hour changeover).
+    // It is held, so the playing hour's track is untouched; apply_hour() makes it current once
+    // the clock reaches that hour, and the hour changeover picks with it.
+    void set_for_hour(Weather w, int hour) {
+        {
+            std::lock_guard<std::mutex> l(mut);
+            next_valid = true;
+            next_w = w;
+            next_hour = hour;
+        }
+        log_info_f(C_YELLOW "[HOURLY] " C_RESET "Weather set: " C_BOLD "%s" C_RESET " for hour %02d", weather_name(w), hour);
+    }
+    bool pending_for_hour(int& hour, Weather& w) const {
+        std::lock_guard<std::mutex> l(mut);
+        hour = next_hour;
+        w = next_w;
+        return next_valid;
+    }
+    // Called with the current hour: the weather held for it becomes current. True when it did.
+    bool apply_hour(int hour) {
+        Weather w;
+        {
+            std::lock_guard<std::mutex> l(mut);
+            if (!next_valid || next_hour != hour) return false;
+            next_valid = false;
+            w = next_w;
+        }
+        set_manual(w);
+        return true;
     }
 
     // Fetch and replace the in-memory observation. Open-Meteo: the last completed
@@ -659,6 +694,7 @@ public:
         while (!stop_sig) {
             std::tm now = clock();
             int hour = hour_index(now);
+            weather.apply_hour(hour);
             Weather w = weather.current();
 
             auto lb = load_for(hour, w);
@@ -704,6 +740,9 @@ public:
                     weather_block_id = weather_block(now);
                     weather_block_changes = 0;
                 }
+                // The weather held for the next hour becomes current at the hour change itself,
+                // so the changeover below picks with it; before that it changes nothing.
+                weather.apply_hour(hour_index(now));
                 bool weather_differs = weather.current() != w;
                 bool weather_changed = weather_differs && weather_block_changes < WEATHER_CHANGES_PER_BLOCK;
                 bool hour_changed = hour_index(now) != playing_hour;

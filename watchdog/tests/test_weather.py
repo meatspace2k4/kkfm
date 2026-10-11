@@ -2,6 +2,7 @@ import os
 import sqlite3
 import struct
 import tempfile
+import time
 import unittest
 
 from watchdog.weather import (
@@ -173,6 +174,63 @@ class TestWeather(unittest.TestCase):
         self.assertEqual(r.hourly_at(h12 + 98 * 60), RAINY)
         self.assertEqual(r.hourly_at(h12 + 7200 - 60), RAINY)    # still raining at 1:59
         self.assertEqual(r.hourly_at(h12 + 131 * 60 + 60), SUNNY)  # rain over: 2PM Windy
+
+    def test_follow_decides_the_hour_once_and_sends_the_forecast_to_the_next_hour_slot(self):
+        # 12:48, Cloudy, 1 PM Drizzle. Local hour boundaries: build the epoch from local time.
+        h12 = time.mktime((2026, 10, 11, 12, 0, 0, 0, 0, -1))
+        r = WeatherReading("Cloudy", h12 + 48 * 60, "t",
+                           hours=((h12, "Cloudy"), (h12 + 3600, "Drizzle"), (h12 + 7200, "Windy")))
+        f = WeatherFollower()
+        f.follow(r, h12 + 48 * 60)
+        self.assertEqual(f.due(h12 + 48 * 60), SUNNY); self.assertFalse(f.for_next_hour)
+        f.started(); f.finished(SUNNY, True, h12 + 48 * 60)
+        f.follow(r, h12 + 58 * 60); self.assertIsNone(f.due(h12 + 58 * 60))
+        # 12:59: 1 PM's forecast, for the next hour (the 12:00 track is not changed over).
+        f.follow(r, h12 + 59 * 60)
+        self.assertEqual(f.due(h12 + 59 * 60), RAINY); self.assertTrue(f.for_next_hour)
+        f.started(); f.finished(RAINY, True, h12 + 59 * 60)
+        # 1:00: the app refreshes and says Cloudy now, 1 PM row Cloudy: the hour stays rainy.
+        r2 = WeatherReading("Cloudy", h12 + 3600, "t",
+                            hours=((h12 + 3600, "Cloudy"), (h12 + 7200, "Windy")))
+        for m in (0, 1, 10, 30, 58):
+            f.follow(r2, h12 + 3600 + m * 60)
+            self.assertIsNone(f.due(h12 + 3600 + m * 60), m)
+            self.assertFalse(f.for_next_hour)
+        # Rain falls at 1:20 and stops at 1:30: rainy either way, nothing sent.
+        r3 = WeatherReading("Cloudy", h12 + 80 * 60, "t",
+                            minutes=((h12 + 80 * 60, 0.4), (h12 + 90 * 60, 0.0)), minutes_end=h12 + 140 * 60,
+                            hours=((h12 + 3600, "Cloudy"), (h12 + 7200, "Windy")))
+        f.follow(r3, h12 + 85 * 60); self.assertIsNone(f.due(h12 + 85 * 60))
+        f.follow(r3, h12 + 95 * 60); self.assertIsNone(f.due(h12 + 95 * 60))
+        # 1:59: 2 PM Windy, for the next hour.
+        f.follow(r3, h12 + 119 * 60)
+        self.assertEqual(f.due(h12 + 119 * 60), SUNNY); self.assertTrue(f.for_next_hour)
+
+    def test_follow_precipitation_within_the_hour_and_back(self):
+        h = time.mktime((2026, 10, 11, 12, 0, 0, 0, 0, -1))
+        r = WeatherReading("Cloudy", h + 20 * 60, "t",
+                           minutes=((h + 20 * 60, 0.6), (h + 30 * 60, 0.0)), minutes_end=h + 80 * 60,
+                           hours=((h, "Cloudy"), (h + 3600, "Clear")))
+        f = WeatherFollower()
+        f.follow(r, h + 10 * 60)
+        self.assertEqual(f.due(h + 10 * 60), SUNNY); f.started(); f.finished(SUNNY, True, h + 10 * 60)
+        f.follow(r, h + 20 * 60)
+        self.assertEqual(f.due(h + 20 * 60), RAINY); self.assertFalse(f.for_next_hour)   # now, this hour
+        f.started(); f.finished(RAINY, True, h + 20 * 60)
+        f.follow(r, h + 25 * 60); self.assertIsNone(f.due(h + 25 * 60))
+        f.follow(r, h + 30 * 60)
+        self.assertEqual(f.due(h + 30 * 60), SUNNY); self.assertFalse(f.for_next_hour)   # back to the hour's weather
+        f.started(); f.finished(SUNNY, True, h + 30 * 60)
+        # A forecast revised mid-hour (12 PM row now Drizzle) changes nothing: the hour is decided.
+        r2 = WeatherReading("Drizzle", h + 40 * 60, "t", hours=((h, "Drizzle"), (h + 3600, "Clear")))
+        f.follow(r2, h + 40 * 60); self.assertIsNone(f.due(h + 40 * 60))
+
+    def test_follow_started_mid_hour_uses_this_hours_forecast(self):
+        h = time.mktime((2026, 10, 11, 12, 0, 0, 0, 0, -1))
+        r = WeatherReading("Clear", h + 30 * 60, "t", hours=((h, "Rain"), (h + 3600, "Clear")))
+        f = WeatherFollower()
+        f.follow(r, h + 30 * 60)
+        self.assertEqual(f.due(h + 30 * 60), RAINY); self.assertFalse(f.for_next_hour)
 
     def test_precipitation_now_overrides_the_hours_forecast(self):
         h = 1791741600.0
