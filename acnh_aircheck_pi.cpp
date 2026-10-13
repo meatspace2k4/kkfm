@@ -1848,8 +1848,9 @@ private:
         using clock = std::chrono::steady_clock;
         const bool have_dac = (dac && dac->is_ready());
         const uint32_t sr = have_dac ? std::max<uint32_t>(1u, dac->sample_rate()) : engine_sample_rate();
-        const auto block_duration = std::chrono::microseconds(
-            static_cast<int64_t>(MIX_BLOCK_FRAMES) * 1000000LL / (int64_t)sr);
+        const auto block_duration = std::chrono::nanoseconds(
+            static_cast<int64_t>(MIX_BLOCK_FRAMES) * 1000000000LL / (int64_t)sr);
+        const auto max_catchup = std::chrono::milliseconds(500);
         std::vector<int16_t> stereo_block(MIX_BLOCK_FRAMES * 2, 0);
         auto next = clock::now();
         while (running.load()) {
@@ -1882,11 +1883,14 @@ private:
                     }
                 } else {
                     next += block_duration;
-                    // If we ever fall behind (decode hiccup / OS scheduling), do NOT "catch up" by
-                    // mixing multiple blocks back-to-back — that can overfill downstream buffers.
+                    // Behind schedule after a decode hiccup or a late wakeup: mix the missed blocks
+                    // back-to-back so the output keeps wall-clock rate. Dropping the deficit instead
+                    // makes the stream run slow for good, and a stream-only listener (the Sonos HLS
+                    // relay) loses that much of its cushion each time. Only a stall longer than
+                    // max_catchup resets the schedule.
                     const auto now = clock::now();
-                    if (next < now) {
-                        next = now + block_duration;
+                    if (now - next > max_catchup) {
+                        next = now;
                     }
                     std::this_thread::sleep_until(next);
                 }
