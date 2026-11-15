@@ -1,9 +1,15 @@
 #include <Wire.h>
+#include <avr/wdt.h>
 #include <Adafruit_Si4713.h>
 
 /* ---------- user-adjustable ------------------------------------------- */
-#define FIXED_FREQ      9270    // 92.7 MHz (×10 kHz)
-#define TX_POWER_dBuV     105
+#define FIXED_FREQ     10010    // 100.1 MHz (×10 kHz)
+#define TX_POWER_dBuV     115
+// Antenna capacitor, fixed (×0.25 pF). Found by listening sweeps at 100.1 MHz with the
+// 1 m wire plus a 75 cm ground-side wire: best around 40, broad peak (30..40 hard to
+// tell apart), clearly worse at 10 and 70. The chip's auto-tune (value 0) landed on
+// 53..66 here, and the AN332 example settings with auto-tune sounded worse.
+#define TX_ANTCAP          40
 #define LOG_MS           100   // serial log period
 #define SCAN_MIN_FREQ    8810   // 88.10 MHz
 #define SCAN_MAX_FREQ   10790   // 107.90 MHz
@@ -15,6 +21,12 @@
 // Auto-recovery: if we detect an I2C timeout or repeated errors, re-init the chip.
 #define RECOVERY_COOLDOWN_MS 2000
 #define INIT_RETRIES            5
+// The Si4713 library waits forever for the chip's CTS bit. A chip knocked into
+// powerdown by a transient never sets it, so the hardware watchdog reboots the
+// sketch, and setup() hard-resets and re-tunes the chip.
+#define WDT_TIMEOUT        WDTO_4S
+// Consecutive telemetry reads off-frequency before the chip is re-initialised.
+#define STATE_LOST_READS        3
 /* ---------------------------------------------------------------------- */
 
 #define LED_PIN        LED_BUILTIN    // on-board LED
@@ -23,10 +35,6 @@
 /* property IDs (from datasheet) */
 #define PROP_TX_AUDIO_DEVIATION        0x2101
 #define PROP_TX_PILOT_DEVIATION        0x2102
-// WARNING: Do NOT change 0x3100 to 0x2104!  0x2104 is the documented
-// TX_LINE_INPUT_LEVEL but sending 0x8120 to it causes permanent overmod
-// and kills audio output.  0x3100 works in practice; leave it alone.
-#define PROP_TX_INPUT_LEVEL            0x3100
 #define PROP_TX_PREEMPHASIS            0x2106
 #define PROP_TX_ACOMP_ENABLE           0x2200
 #define PROP_TX_ACOMP_THRESHOLD        0x2201
@@ -100,6 +108,7 @@ static uint16_t scanBestFrequency()
 
     Serial.println(F("SCAN_BEGIN"));
     for (uint16_t freq = SCAN_MIN_FREQ; freq <= SCAN_MAX_FREQ; freq += SCAN_STEP) {
+        wdt_reset();
         radio.readTuneMeasure(freq);
         radio.readTuneStatus();
 
@@ -136,40 +145,33 @@ static bool initRadio()
     }
 
     /* --------- Frequency & output power -------------------------------- */
-    radio.setTXpower(TX_POWER_dBuV);
+    radio.setTXpower(TX_POWER_dBuV, TX_ANTCAP);
     radio.tuneFM(g_selected_freq);
     /* ------------------------------------------------------------------ */
 
-    /* --------- deviation, input pad, limiter --------------------------- */
-    // radio.setProperty(PROP_TX_AUDIO_DEVIATION,  6500);   // 65 kHz audio peak
-    radio.setProperty(PROP_TX_AUDIO_DEVIATION,  6000);   // 60 kHz audio peak
-    radio.setProperty(PROP_TX_PILOT_DEVIATION,   750);   // 7.5 kHz pilot
+    /* --------- audio processing ---------------------------------------- */
+    // Line input stays at the chip default (0x2104 = 0x327C: 636 mVpk full scale).
+    radio.setProperty(PROP_TX_PREEMPHASIS,      0x0000); // 75 µs, US receivers (AN332: 0 = 75 µs, 1 = 50 µs, 2 = off)
 
-    // Input level/pad: if LED is "blinking rapidly" it's usually OVERMOD due to hot audio.
-    // Increase LIATTEN to reduce modulation peaks (trading some SNR for stability).
-    // radio.setProperty(PROP_TX_INPUT_LEVEL,      0x515E); // LIATTEN=2, LILEVEL=350 mVPK
-    // radio.setProperty(PROP_TX_INPUT_LEVEL,      0x6120); // LIATTEN=6 (~18 dB pad), LILEVEL≈200 mVpk
-    radio.setProperty(PROP_TX_INPUT_LEVEL,      0x8120);   // LIATTEN=8 (~24 dB pad), LILEVEL≈200 mVpk
-    radio.setProperty(PROP_TX_PREEMPHASIS,      0x0002); // 50 µs (0 =75 µs, 1 = NO, 2 = 50 µs)
-
-    radio.setProperty(PROP_TX_ACOMP_ENABLE,     0x0002); // limiter-only
-    // radio.setProperty(PROP_TX_ACOMP_ENABLE,     0x0003); // compressor + limiter
-    // radio.setProperty(PROP_TX_ACOMP_THRESHOLD,  0xFFF6); // −10 dBFS knee
-    // radio.setProperty(PROP_TX_ACOMP_THRESHOLD,  0xFFF8); // about –6 dBFS knee
-    radio.setProperty(PROP_TX_ACOMP_THRESHOLD,  0xFFFA);   // ≈ –5 dBFS knee
-    // radio.setProperty(PROP_TX_ACOMP_THRESHOLD,  0xFFFC); // about –3 dBFS knee (compressor)
-
-    // radio.setProperty(PROP_TX_ACOMP_ATTACK_TIME,    0); // 0.5 ms
-    // radio.setProperty(PROP_TX_ACOMP_ATTACK_TIME, 0x0001);  // 1.5 ms
-    radio.setProperty(PROP_TX_ACOMP_RELEASE_TIME, 0x0002);  // 64 ms enum 2
-    // radio.setProperty(PROP_TX_ACOMP_RELEASE_TIME, 0x0001); // 32 ms
-    radio.setProperty(PROP_TX_ACOMP_GAIN,         0x0000); // leave 0 dB makeup
+    // Compressor + limiter. The music sits 10-25 dB under full scale; the compressor
+    // lifts everything below the threshold by the gain so the carrier is modulated
+    // properly, and the limiter holds peaks at the set deviation.
+    radio.setProperty(PROP_TX_ACOMP_ENABLE,       0x0003); // bit1 limiter, bit0 compressor
+    radio.setProperty(PROP_TX_ACOMP_THRESHOLD,    0xFFD8); // -40 dBFS (chip default)
+    radio.setProperty(PROP_TX_ACOMP_GAIN,         0x000F); // 15 dB (chip default)
+    radio.setProperty(PROP_TX_ACOMP_RELEASE_TIME, 0x0002);
     /* ------------------------------------------------------------------ */
 
     /* -------- RDS ------------------------------------------------------ */
     radio.beginRDS();
     radio.setRDSstation("KKFM");
     radio.setRDSbuffer ("Si4713 demo");
+    /* ------------------------------------------------------------------ */
+
+    /* --------- deviation: set after beginRDS(), which overwrites it ----- */
+    // 66.25 audio + 6.75 pilot + 2.00 RDS = 75.00 kHz total.
+    radio.setProperty(PROP_TX_AUDIO_DEVIATION,  6625);
+    radio.setProperty(PROP_TX_PILOT_DEVIATION,   675);
     /* ------------------------------------------------------------------ */
 
     return true;
@@ -191,6 +193,7 @@ static void recoverIfNeeded(const __FlashStringHelper* why)
     i2cBusRecover();
 
     for (int i = 0; i < INIT_RETRIES; i++) {
+        wdt_reset();
         if (initRadio()) {
             Serial.println(F("RECOVER: initRadio OK"));
             return;
@@ -209,10 +212,13 @@ void setup()
     digitalWrite(LED_PIN, LOW);
 
     Serial.begin(115200);
+    Serial.println(F("BOOT"));
+    wdt_enable(WDT_TIMEOUT);
 
     // Initial bring-up (retry a few times so you don't have to mash Run).
     bool ok = false;
     for (int i = 0; i < INIT_RETRIES; i++) {
+        wdt_reset();
         if (initRadio()) {
             ok = true;
             break;
@@ -232,6 +238,9 @@ void setup()
     Serial.print(F(" MHz  PWR="));
     Serial.print(TX_POWER_dBuV);
     Serial.println(F(" dBµV"));
+    radio.readTuneStatus();
+    Serial.print(F("BOOT antcap="));
+    Serial.println(radio.currAntCap);
     Serial.println(F("LOG  ms  freq  noise  dBFS  overMod"));
 }
 
@@ -239,7 +248,33 @@ void loop()
 {
     static uint32_t t0 = 0;
     static uint32_t overmod_until = 0;
+    static uint8_t off_freq_reads = 0;
     const uint32_t now = millis();
+
+    wdt_reset();
+
+    // 'T' on serial: re-run the chip's antenna auto-tune and report the capacitor it chose.
+    // The chip only tunes the antenna when told to tune, so whatever was near the wire at
+    // boot (a hand on RESET) is baked in until the next tune.
+    // 'C<n>' on serial: set the antenna capacitor by hand to n (1..191, 0.25 pF each).
+    if (Serial.available()) {
+        const int c = Serial.read();
+        if (c == 'T') {
+            radio.setTXpower(TX_POWER_dBuV);
+            radio.tuneFM(g_selected_freq);
+            radio.readTuneStatus();
+            Serial.print(F("RETUNE antcap="));
+            Serial.println(radio.currAntCap);
+        } else if (c == 'C') {
+            const long v = Serial.parseInt();
+            if (v >= 1 && v <= 191) {
+                radio.setTXpower(TX_POWER_dBuV, (uint8_t)v);
+                radio.readTuneStatus();
+                Serial.print(F("SETCAP antcap="));
+                Serial.println(radio.currAntCap);
+            }
+        }
+    }
 
     if (now - t0 >= LOG_MS) {
         t0 = now;
@@ -253,6 +288,14 @@ void loop()
 
         radio.readASQ();                  // updates currASQ & currInLevel
         radio.readTuneStatus();           // updates currNoiseLevel
+
+        // A chip that answers but is no longer on our frequency has lost its state.
+        if (radio.currFreq == g_selected_freq) {
+            off_freq_reads = 0;
+        } else if (++off_freq_reads >= STATE_LOST_READS) {
+            off_freq_reads = 0;
+            recoverIfNeeded(F("StateLost"));
+        }
 
         /* bit 2 (0x04) is SQINT / OVERMOD when deviation > TX_AUDIO_DEVIATION */
         const bool over = radio.currASQ & 0x04;
