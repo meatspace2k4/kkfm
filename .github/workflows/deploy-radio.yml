@@ -41,9 +41,11 @@ jobs:
 
       - name: Deploy (backup, install, one restart)
         run: |
-          date '+%F %T' > .deployed-at
           sudo -n /usr/local/sbin/kkfm-radio-deploy deploy "$PWD/acnh_aircheck_pi"
           sudo -n /usr/local/sbin/kkfm-radio-deploy status
+          # (the songs counted are the new binary's: from the service's start. Stamped as this step began, the ten
+          # minutes the USB drive took to take the file were the old binary's songs, and the check failed on them)
+          date -d "$(systemctl show -p ActiveEnterTimestamp --value acnh-aircheck.service)" '+%F %T' > .deployed-at
 
       - name: After - three song changes, each 18 s from the loop point
         run: sh .github/workflows/song-gaps.sh wait 3 "$(cat .deployed-at)"
