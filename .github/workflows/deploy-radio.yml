@@ -1,0 +1,51 @@
+# Deploys the radio (acnh_aircheck_pi) to the Pi: tests, build, one deploy with a backup and one restart, then the
+# log read for three songs. Runs on the Pi's own runner (label kkfm-radio); the root half is
+# /usr/local/sbin/kkfm-radio-deploy, the one command the runner's account may run as root.
+# A push to deploy/radio deploys that commit; nothing else does.
+name: deploy-radio
+on:
+  push:
+    branches: [deploy/radio]
+concurrency:
+  group: deploy-radio
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: [self-hosted, kkfm-radio]
+    timeout-minutes: 90
+    env:
+      ASSETS: /home/jpark/Aircheck/kkfm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests (the fade's test fails on a 10 s play)
+        run: |
+          # (-fno-access-control: the older tests call Radio::plan_overlay, private since e65d59b)
+          g++ -std=c++17 -fno-access-control -DKKFM_TEST_MODE tests_cpp.cpp -o tests_cpp -pthread
+          ./tests_cpp -v 2>&1 | grep -v '\[LOOP\]'
+          test "${PIPESTATUS[0]}" = 0
+
+      - name: Before - the service, and the log's last three song changes
+        run: |
+          sudo -n /usr/local/sbin/kkfm-radio-deploy status
+          sh .github/workflows/song-gaps.sh last 3
+
+      - name: Build
+        run: |
+          for f in assets.S assets_blob.bin; do ln -sf "$ASSETS/$f" "$f"; done
+          # (-O2: this commit's parent built so on this Pi is 171,796,336 bytes, the deployed binary 171,796,328;
+          # unoptimized it is 172,648,152)
+          nice -n 15 g++ -O2 -o acnh_aircheck_pi acnh_aircheck_pi.cpp StreamServer.cpp assets.S -std=c++17 -pthread -I. -ldl -lm
+          ls -la acnh_aircheck_pi
+          sha256sum acnh_aircheck_pi
+
+      - name: Deploy (backup, install, one restart)
+        run: |
+          sudo -n /usr/local/sbin/kkfm-radio-deploy deploy "$PWD/acnh_aircheck_pi"
+          sudo -n /usr/local/sbin/kkfm-radio-deploy status
+          # (the songs counted are the new binary's: from the service's start. Stamped as this step began, the ten
+          # minutes the USB drive took to take the file were the old binary's songs, and the check failed on them)
+          date -d "$(systemctl show -p ActiveEnterTimestamp --value acnh-aircheck.service)" '+%F %T' > .deployed-at
+
+      - name: After - three song changes, each 18 s from the loop point
+        run: sh .github/workflows/song-gaps.sh wait 3 "$(cat .deployed-at)"

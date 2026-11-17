@@ -103,6 +103,46 @@ void test_overlay_decision_logic() {
     ASSERT_TRUE(res.plan != OverlayPlan::NoOverlay);
 }
 
+// The radio's end of a song: after the loop point the song plays on for FADE_PLAY_DURATION at full level, then fades
+// over FADE_TIME_DURATION, and the next song follows: 11 s and 7 s, 18 s from the loop point. Measured on the decoder's
+// own output, a looping track of one constant level: the first sample below that level, and the last sample.
+// (A build with the play at 10 s is quiet a second early and ends at 17 s: both assertions fail on it. That is the
+// build e65d59b made, the Pi's deployed binary: 17.03 s from its log's loop hit to the next Now Playing.)
+void test_radio_post_loop_play_then_fade() {
+    const uint32_t rate = 32000;
+    const int blocks = 100;
+    static std::vector<uint8_t> raw;
+    raw.assign((size_t)blocks * BLK_BYTES, 0x11);                  // every nibble 1
+    for (int b = 0; b < blocks; ++b) raw[(size_t)b * BLK_BYTES] = 0x0c;   // coefficient pair 0, scale 4096
+
+    auto ctx = std::make_shared<AudioCtx>();
+    ctx->raw_data = raw.data(); ctx->raw_len = raw.size();
+    ctx->name = "test"; ctx->title = "test"; ctx->id = 0;
+    ctx->rate = rate; ctx->total_samples = (uint32_t)blocks * BLK_SAMP;
+    ctx->start_offset = 0; ctx->loops = 1;
+    ctx->loop_start = 0; ctx->loop_end = (uint32_t)blocks * BLK_SAMP;
+    ctx->hist1 = 0; ctx->hist2 = 0;
+    ctx->coeffs = { {0, 0} };
+
+    // as the radio adds a song (Mixer::add's defaults)
+    Decoder d(ctx, false, FADE_PLAY_DURATION, FADE_TIME_DURATION);
+    int16_t buf[BLK_SAMP];
+    const int16_t level = 4096;
+    long post = 0, first_quiet = -1;
+    for (long guard = 0; !d.is_exhausted() && guard < 4000000; ++guard) {
+        for (int i = 0; i < BLK_SAMP; ++i) buf[i] = level;
+        d.decode_block(buf);
+        if (!d.has_looped()) { for (int i = 0; i < BLK_SAMP; ++i) ASSERT_EQ(buf[i], level); continue; }
+        for (int i = 0; i < BLK_SAMP; ++i) if (first_quiet < 0 && buf[i] < level) first_quiet = post + i;
+        post += BLK_SAMP;
+    }
+    ASSERT_TRUE(d.is_exhausted());
+    const double play_s = (double)first_quiet / rate, total_s = (double)post / rate;
+    if (g_verbose) std::cout << "  after the loop point: full level for " << play_s << " s, the next song at " << total_s << " s" << std::endl;
+    ASSERT_NEAR(play_s, 11.0, 0.01);
+    ASSERT_NEAR(total_s, 18.0, 0.01);
+}
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "-v") g_verbose = true;
@@ -115,6 +155,7 @@ int main(int argc, char** argv) {
     run_test("test_bwav_parser_null", test_bwav_parser_null);
     run_test("test_overlay_decision_none", test_overlay_decision_none);
     run_test("test_overlay_decision_logic", test_overlay_decision_logic);
+    run_test("test_radio_post_loop_play_then_fade", test_radio_post_loop_play_then_fade);
 
     int failed = 0;
     for (const auto& r : g_results) {
