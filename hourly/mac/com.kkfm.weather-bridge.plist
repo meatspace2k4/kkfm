@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent for the weather bridge (watchdog/weather_bridge.py): the hourly player's weather kept to the
+     Weather app's, read from Weather Always's URL cache (~/Library/Caches/com.apple.weather, outside any
+     container) and pushed to the player over SSH. It needs no Full Disk Access. Installed copies: ~/.local/share/kkfm-weather-bridge/{weather,weather_bridge}.py -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.kkfm.weather-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/johusha/.local/share/kkfm-weather-bridge/weather_bridge.py</string>
+    <string>--ssh</string>
+    <string>jpark@aircheck-pi.local</string>
+    <string>--weather-source</string>
+    <string>weather-always</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/tmp/kkfm-weather-bridge.log</string>
+  <key>StandardErrorPath</key><string>/tmp/kkfm-weather-bridge.log</string>
+</dict>
+</plist>
