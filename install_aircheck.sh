@@ -70,21 +70,19 @@ echo "── deploy ──"
 run sudo cp "$SRC_DIR/$BIN_NAME" "$DEPLOY_DIR/$BIN_NAME"
 echo
 
-# ── 4b. Units: the radio's and the hourly player's systemd units and drop-ins, from the repo ──
+# ── 4b. Units: the radio's, the hourly player's and its watchdog's systemd units, from the repo ──
+# Each unit file is complete: drop-ins left from before (and set-property ones) are removed so
+# nothing overrides it.
 echo "── units ──"
-UNIT_DIR=/etc/systemd/system
-install_unit() {   # install_unit <unit file in the repo> [<drop-in dir in the repo>]
-    local unit="$1" dropins="${2-}" name
-    name=$(basename "$unit")
-    run sudo install -m 644 "$unit" "$UNIT_DIR/$name"
-    if [[ -n "$dropins" ]]; then
-        run sudo install -d -m 755 "$UNIT_DIR/$name.d"
-        for f in "$dropins"/*.conf; do run sudo install -m 644 "$f" "$UNIT_DIR/$name.d/"; done
-    fi
+install_unit() {   # install_unit <unit file in the repo>
+    local name
+    name=$(basename "$1")
+    run sudo install -m 644 "$1" "/etc/systemd/system/$name"
+    run sudo rm -rf "/etc/systemd/system/$name.d" "/etc/systemd/system.control/$name.d"
 }
-install_unit "$SRC_DIR/deploy/acnh-aircheck.service" "$SRC_DIR/deploy/acnh-aircheck.service.d"
-install_unit "$SRC_DIR/hourly/deploy/acnh-hourly.service" "$SRC_DIR/hourly/deploy/acnh-hourly.service.d"
-install_unit "$SRC_DIR/hourly/deploy/acnh-hourly-watchdog.service" "$SRC_DIR/hourly/deploy/acnh-hourly-watchdog.service.d"
+install_unit "$SRC_DIR/deploy/acnh-aircheck.service"
+install_unit "$SRC_DIR/hourly/deploy/acnh-hourly.service"
+install_unit "$SRC_DIR/hourly/deploy/acnh-hourly-watchdog.service"
 run sudo systemctl daemon-reload
 echo
 

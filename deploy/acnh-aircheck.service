@@ -6,13 +6,28 @@ Wants=network-online.target
 RequiresMountsFor=/mnt/kkfm-usb
 
 [Service]
+User=svc-kkfm
+Group=svc-kkfm
+SupplementaryGroups=svc-home audio dialout systemd-journal
 WorkingDirectory=/mnt/kkfm-usb/kkfm
 ExecStart=/mnt/kkfm-usb/kkfm/acnh_aircheck_pi
 Restart=on-failure
 RestartSec=5
-User=jpark
 Environment=ACNH_STREAM_PORT=9000
-Environment=ACNH_LOCALHOST_ONLY=0
+# The :9000 stream server binds loopback only; cloudflared and sonos-smapi reach it via localhost.
+Environment=ACNH_LOCALHOST_ONLY=1
+# Discord Activity keys
+EnvironmentFile=/etc/acnh-aircheck.env
+# Audio first: other services yield to the radio. svc-kkfm cannot raise its own threads to
+# realtime, so systemd sets it before dropping to the account.
+Nice=-10
+IOSchedulingClass=realtime
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=70
+LimitRTPRIO=95
+AllowedCPUs=0-1
+NoNewPrivileges=yes
+PrivateTmp=yes
 StandardOutput=journal
 StandardError=journal
 
