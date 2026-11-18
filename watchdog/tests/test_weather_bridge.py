@@ -1,6 +1,6 @@
 import unittest
 
-from watchdog.weather import RAINY, SUNNY, WeatherReading, WeatherSource
+from watchdog.weather import RAINY, SNOWY, SUNNY, WeatherReading, WeatherSource
 from watchdog.weather_bridge import Bridge
 
 HOUR = 3600.0
@@ -73,6 +73,23 @@ class BridgeTest(unittest.TestCase):
         self.bridge.tick(t0 + 20)                      # acknowledged: not sent again
         self.assertEqual(self.sent, [RAINY, RAINY])
         self.assertEqual(sum("not sent" in s for s in self.said), 1)
+
+    def test_the_charts_snow_type_wins_over_a_rain_condition(self):
+        t0 = 10 * HOUR
+        chart = ((t0, 2.0),)
+        r = WeatherReading(condition="Rain", as_of=t0, source="fake", minutes=chart, minutes_end=t0 + 3600,
+                           hours=((t0, "Rain"),), kinds=((t0, t0 + 3600, 5),))
+        self.src.give(r)
+        self.bridge.tick(t0 + 60)
+        self.assertEqual(self.sent, [SNOWY])
+
+    def test_a_rain_type_chart_stays_rainy(self):
+        t0 = 10 * HOUR
+        r = WeatherReading(condition="Rain", as_of=t0, source="fake", minutes=((t0, 2.0),), minutes_end=t0 + 3600,
+                           hours=((t0, "Rain"),), kinds=((t0, t0 + 3600, 3),))
+        self.src.give(r)
+        self.bridge.tick(t0 + 60)
+        self.assertEqual(self.sent, [RAINY])
 
     def test_data_that_does_not_cover_the_hour_sends_nothing(self):
         t0 = 10 * HOUR

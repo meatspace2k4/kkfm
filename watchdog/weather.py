@@ -62,6 +62,13 @@ def hourly_weather(condition: str, precipitating: bool = False) -> str:
 # next bar's start, the last until `end`.
 Chart = tuple[tuple[float, float], ...]
 Minutes = Chart
+Kinds = tuple[tuple[float, float, int], ...]   # (start, end, WK2 precipitation type)
+
+# The chart summary's precipitation type (WeatherKit's Precipitation, alphabetical after none:
+# 1 hail, 2 mixed, 3 rain, 4 sleet, 5 snow), as the condition the engine maps. Checked on
+# 2026-11-17 18:50: type 5 on every summary span while the app titled the chart
+# "Snow for the next hour" and the current condition was Rain.
+WK2_PRECIP_CONDITION = {1: "Hail", 2: "WintryMix", 3: "Rain", 4: "Sleet", 5: "Snow"}
 
 
 def precipitation_at(minutes: Chart, end: float, now: float) -> tuple[bool, Optional[float]]:
@@ -132,9 +139,18 @@ class WeatherReading:
     minutes: Chart = ()         # the precipitation chart's bars (minute start, mm/h)
     minutes_end: float = 0.0    # when the chart ends
     hours: Hours = ()           # the hourly forecast (hour start, condition)
+    kinds: Kinds = ()           # the chart's summary: (start, end, precipitation type)
 
     def precipitation_at(self, now: float) -> tuple[bool, Optional[float]]:
         return precipitation_at(self.minutes, self.minutes_end, now)
+
+    def falling_condition_at(self, now: float) -> str:
+        """The condition while the chart shows precipitation: the chart's own type for `now`
+        (what the app titles "Snow for the next hour"), else the current condition."""
+        for start, end, kind in self.kinds:
+            if start <= now < end and kind in WK2_PRECIP_CONDITION:
+                return WK2_PRECIP_CONDITION[kind]
+        return self.condition
 
     def hourly_at(self, now: float) -> Optional[str]:
         """The weather at `now`: RAINY/SNOWY while the chart shows precipitation falling,
@@ -143,7 +159,7 @@ class WeatherReading:
         None when the forecast has no row for the hour: nothing is sent."""
         falling, _ = self.precipitation_at(now)
         if falling:
-            return hourly_weather(self.condition, True)
+            return hourly_weather(self.falling_condition_at(now), True)
         cond = forecast_condition_at(self.hours, now)
         return hourly_weather(cond) if cond is not None else None
 
@@ -224,6 +240,34 @@ def wk2_next_hour(b: bytes) -> tuple[Chart, float]:
     except (struct.error, IndexError, KeyError):
         return (), 0.0
     return tuple(out), end
+
+
+# Chart summary: next-hour table field 1, a vector of spans: start (0), end (1, absent on the
+# last span: it runs to the chart's end), precipitation type (2, absent when none).
+WK2_NEXT_HOUR_SUMMARY = 1
+
+
+def wk2_next_hour_kinds(b: bytes) -> Kinds:
+    u32 = lambda o: struct.unpack_from("<I", b, o)[0]
+    try:
+        root = _wk2_fields(b, u32(0))
+        if WK2_ROOT_NEXT_HOUR not in root:
+            return ()
+        nh = _wk2_fields(b, root[WK2_ROOT_NEXT_HOUR] + u32(root[WK2_ROOT_NEXT_HOUR]))
+        end = float(u32(nh[WK2_NEXT_HOUR_END])) if WK2_NEXT_HOUR_END in nh else 0.0
+        if WK2_NEXT_HOUR_SUMMARY not in nh:
+            return ()
+        v = nh[WK2_NEXT_HOUR_SUMMARY] + u32(nh[WK2_NEXT_HOUR_SUMMARY])
+        out = []
+        for i in range(u32(v)):
+            e = v + 4 + 4 * i
+            s = _wk2_fields(b, e + u32(e))
+            if 2 not in s or 0 not in s:
+                continue
+            out.append((float(u32(s[0])), float(u32(s[1])) if 1 in s else end, b[s[2]]))
+    except (struct.error, IndexError, KeyError):
+        return ()
+    return tuple(out)
 
 
 # Hourly forecast: WK2.Weather root field 3, its vector field 1; an hour entry: forecastStart (0),
@@ -353,7 +397,7 @@ class WeatherAppSource(WeatherSource):
             return None
         minutes, end = wk2_next_hour(body)
         return WeatherReading(condition=cc[0], as_of=cc[1], source=self.name, minutes=minutes, minutes_end=end,
-                              hours=wk2_hourly(body))
+                              hours=wk2_hourly(body), kinds=wk2_next_hour_kinds(body))
 
 
 class WeatherAlwaysSource(WeatherAppSource):
