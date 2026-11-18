@@ -70,6 +70,24 @@ echo "── deploy ──"
 run sudo cp "$SRC_DIR/$BIN_NAME" "$DEPLOY_DIR/$BIN_NAME"
 echo
 
+# ── 4b. Units: the radio's and the hourly player's systemd units and drop-ins, from the repo ──
+echo "── units ──"
+UNIT_DIR=/etc/systemd/system
+install_unit() {   # install_unit <unit file in the repo> [<drop-in dir in the repo>]
+    local unit="$1" dropins="${2-}" name
+    name=$(basename "$unit")
+    run sudo install -m 644 "$unit" "$UNIT_DIR/$name"
+    if [[ -n "$dropins" ]]; then
+        run sudo install -d -m 755 "$UNIT_DIR/$name.d"
+        for f in "$dropins"/*.conf; do run sudo install -m 644 "$f" "$UNIT_DIR/$name.d/"; done
+    fi
+}
+install_unit "$SRC_DIR/deploy/acnh-aircheck.service" "$SRC_DIR/deploy/acnh-aircheck.service.d"
+install_unit "$SRC_DIR/hourly/deploy/acnh-hourly.service" "$SRC_DIR/hourly/deploy/acnh-hourly.service.d"
+install_unit "$SRC_DIR/hourly/deploy/acnh-hourly-watchdog.service" "$SRC_DIR/hourly/deploy/acnh-hourly-watchdog.service.d"
+run sudo systemctl daemon-reload
+echo
+
 # ── 5. Restart service ──
 echo "── restart ──"
 run sudo systemctl restart "$SERVICE"

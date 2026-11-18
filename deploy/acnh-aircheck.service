@@ -1,0 +1,20 @@
+# /etc/systemd/system/acnh-aircheck.service
+[Unit]
+Description=KKFM Aircheck Radio
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/kkfm-usb
+
+[Service]
+WorkingDirectory=/mnt/kkfm-usb/kkfm
+ExecStart=/mnt/kkfm-usb/kkfm/acnh_aircheck_pi
+Restart=on-failure
+RestartSec=5
+User=jpark
+Environment=ACNH_STREAM_PORT=9000
+Environment=ACNH_LOCALHOST_ONLY=0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
