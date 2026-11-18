@@ -356,8 +356,21 @@ class WeatherAppSource(WeatherSource):
                               hours=wk2_hourly(body))
 
 
+class WeatherAlwaysSource(WeatherAppSource):
+    """The same data from Weather Always (~/Applications/Weather Always.app, an unsandboxed copy of the
+    Weather app kept running in the background), whose URL cache is written outside any container:
+    read in place, with no mirror and no Full Disk Access."""
+    name = "weather-always"
+
+    def __init__(self, cache: Optional[str] = None, latlon: Optional[str] = None) -> None:
+        super().__init__(latlon=latlon)
+        self.cache = os.path.expanduser(cache or os.environ.get(
+            "KKFM_WEATHER_ALWAYS_CACHE", "~/Library/Caches/com.apple.weather"))
+
+
 SOURCES: dict[str, type[WeatherSource]] = {
     WeatherAppSource.name: WeatherAppSource,
+    WeatherAlwaysSource.name: WeatherAlwaysSource,
 }
 
 
