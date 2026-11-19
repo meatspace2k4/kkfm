@@ -32,6 +32,7 @@ UPSTREAM_HOST = os.environ.get("SMAPI_UPSTREAM_HOST", "localhost")
 KKFM_PORT = int(os.environ.get("ACNH_STREAM_PORT", "9000"))
 AUDIO_BIND = os.environ.get("SMAPI_AUDIO_BIND", "0.0.0.0")
 AUDIO_PORT = int(os.environ.get("SMAPI_AUDIO_PORT", "8777"))
+STREAM_HOST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stream_host")
 MP3_BITRATE = os.environ.get("SMAPI_MP3_BITRATE", "192k")
 AAC_BITRATE = os.environ.get("SMAPI_AAC_BITRATE", "192k")
 ART_URL = os.environ.get("SMAPI_ART_URL", "")
@@ -128,8 +129,27 @@ def _source_ip_toward(target):
         s.close()
 
 
+def _stream_host():
+    """The address the players reach the audio port at, when it is not one of the Pi's own:
+    SMAPI_STREAM_HOST, or the first line of the file stream_host beside this script. The Pi
+    behind a second router has no address the players can reach; they reach that router's
+    outer address, where it forwards the audio port to the Pi."""
+    host = os.environ.get("SMAPI_STREAM_HOST", "").strip()
+    if host:
+        return host
+    try:
+        with open(STREAM_HOST_FILE) as f:
+            return f.readline().strip()
+    except OSError:
+        return ""
+
+
 def lan_ip():
-    """Pi address on the interface that reaches the Sonos players (cached 10 min)."""
+    """Address the players fetch the audio from: the configured one (_stream_host), else the
+    Pi's on the interface that reaches the Sonos players (cached 10 min)."""
+    host = _stream_host()
+    if host:
+        return host
     with _lan_lock:
         if _lan_cache["ip"] and time.time() - _lan_cache["at"] < 600:
             return _lan_cache["ip"]
