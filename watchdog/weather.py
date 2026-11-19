@@ -64,11 +64,11 @@ Chart = tuple[tuple[float, float], ...]
 Minutes = Chart
 Kinds = tuple[tuple[float, float, int], ...]   # (start, end, WK2 precipitation type)
 
-# The chart summary's precipitation type (WeatherKit's Precipitation, alphabetical after none:
-# 1 hail, 2 mixed, 3 rain, 4 sleet, 5 snow), as the condition the engine maps. Checked on
-# 2026-11-17 18:50: type 5 on every summary span while the app titled the chart
-# "Snow for the next hour" and the current condition was Rain.
-WK2_PRECIP_CONDITION = {1: "Hail", 2: "WintryMix", 3: "Rain", 4: "Sleet", 5: "Snow"}
+# The chart summary's precipitation type, as the condition the engine maps: 1 rain, 2 snow.
+# Checked against the app's cache: 2 on 2026-11-17 18:51 while the app titled the chart
+# "Snow for the next hour", 1 on 2026-11-19 09:44 while it showed "Light Rain Forecasted".
+# (The other next-hour vector, field 1, holds 5 at field 2 in both: it is not the type.)
+WK2_PRECIP_CONDITION = {1: "Rain", 2: "Snow"}
 
 
 def precipitation_at(minutes: Chart, end: float, now: float) -> tuple[bool, Optional[float]]:
@@ -242,9 +242,10 @@ def wk2_next_hour(b: bytes) -> tuple[Chart, float]:
     return tuple(out), end
 
 
-# Chart summary: next-hour table field 1, a vector of spans: start (0), end (1, absent on the
-# last span: it runs to the chart's end), precipitation type (2, absent when none).
-WK2_NEXT_HOUR_SUMMARY = 1
+# Chart summary: next-hour table field 2, a vector of spans: start (0), end (1, absent on the
+# last span: it runs to the chart's end), precipitation type (2, absent when none),
+# chance (3, percent), intensity (4, mm/h).
+WK2_NEXT_HOUR_SUMMARY = 2
 
 
 def wk2_next_hour_kinds(b: bytes) -> Kinds:
