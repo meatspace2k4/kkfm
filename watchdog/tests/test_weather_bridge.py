@@ -78,15 +78,15 @@ class BridgeTest(unittest.TestCase):
         t0 = 10 * HOUR
         chart = ((t0, 2.0),)
         r = WeatherReading(condition="Rain", as_of=t0, source="fake", minutes=chart, minutes_end=t0 + 3600,
-                           hours=((t0, "Rain"),), kinds=((t0, t0 + 3600, 5),))
+                           hours=((t0, "Rain"),), kinds=((t0, t0 + 3600, 2),))
         self.src.give(r)
         self.bridge.tick(t0 + 60)
         self.assertEqual(self.sent, [SNOWY])
 
     def test_a_rain_type_chart_stays_rainy(self):
         t0 = 10 * HOUR
-        r = WeatherReading(condition="Rain", as_of=t0, source="fake", minutes=((t0, 2.0),), minutes_end=t0 + 3600,
-                           hours=((t0, "Rain"),), kinds=((t0, t0 + 3600, 3),))
+        r = WeatherReading(condition="Drizzle", as_of=t0, source="fake", minutes=((t0, 0.45),), minutes_end=t0 + 3600,
+                           hours=((t0, "Snow"),), kinds=((t0, t0 + 3600, 1),))
         self.src.give(r)
         self.bridge.tick(t0 + 60)
         self.assertEqual(self.sent, [RAINY])
