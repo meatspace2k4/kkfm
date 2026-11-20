@@ -351,7 +351,7 @@ class WeatherAppSource(WeatherSource):
     def changed(self) -> bool:
         stamp = tuple(
             (os.path.basename(p), os.stat(p).st_mtime_ns)
-            for p in sorted(glob.glob(os.path.join(self.cache, "Cache.db*")))
+            for p in sorted(glob.glob(os.path.join(self.cache, "Cache.db*")) + [os.path.join(self.cache, "fsCachedData")])
             if os.path.exists(p)
         )
         if stamp == self._stamp:
@@ -391,8 +391,33 @@ class WeatherAppSource(WeatherSource):
         except OSError:
             return None
 
+    def _latest_file_body(self) -> Optional[bytes]:
+        """The newest response file for this location in fsCachedData. The app keeps writing fresh
+        responses there while the cache index can stop moving (2026-11-20: its rows stayed at
+        00:09 while new files came every few minutes, and the file the stale row named was
+        removed). Each response carries its location as float32 latitude and longitude."""
+        try:
+            lat, lon = (float(x) for x in self.latlon.split("/"))
+        except ValueError:
+            return None
+        marks = (struct.pack("<f", lat), struct.pack("<f", lon))
+        files = glob.glob(os.path.join(self.cache, "fsCachedData", "*"))
+        for p in sorted(files, key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True):
+            try:
+                with open(p, "rb") as f:
+                    b = f.read()
+            except OSError:
+                continue
+            if all(m in b for m in marks) and wk2_current_condition(b):
+                return b
+        return None
+
     def read(self) -> Optional[WeatherReading]:
-        body = self._latest_body()
+        # The index's row and the newest file for the location: whichever describes the later time.
+        bodies = [b for b in (self._latest_body(), self._latest_file_body()) if b]
+        dated = [(wk2_current_condition(b), b) for b in bodies]
+        dated = [(cc, b) for cc, b in dated if cc]
+        body = max(dated, key=lambda x: x[0][1])[1] if dated else None
         cc = wk2_current_condition(body) if body else None
         if not cc:
             return None
