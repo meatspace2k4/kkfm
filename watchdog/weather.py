@@ -153,13 +153,16 @@ class WeatherReading:
         return self.condition
 
     def hourly_at(self, now: float) -> Optional[str]:
-        """The weather at `now`: RAINY/SNOWY while the chart shows precipitation falling,
-        otherwise the state of the forecast condition for the hour `now` is in. At the top of
-        the hour that is the new hour's forecast, which the player's hour changeover picks with.
-        None when the forecast has no row for the hour: nothing is sent."""
+        """The weather at `now`: RAINY/SNOWY while the chart shows precipitation falling, SUNNY
+        while the chart covers `now` and shows nothing falling, otherwise (beyond the chart) the
+        state of the forecast condition for the hour `now` is in. None when the forecast has no
+        row for the hour: nothing is sent. (2026-11-20 12:35: the chart dry and the current
+        condition Cloudy, the 12 PM forecast row Snow: the forecast played Snowy while it was dry.)"""
         falling, _ = self.precipitation_at(now)
         if falling:
             return hourly_weather(self.falling_condition_at(now), True)
+        if self.minutes and self.minutes[0][0] <= now < self.minutes_end:
+            return SUNNY
         cond = forecast_condition_at(self.hours, now)
         return hourly_weather(cond) if cond is not None else None
 
