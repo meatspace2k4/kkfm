@@ -90,9 +90,9 @@ def get_anomalies_path():
     return out_path / "anomalies.jsonl"
 
 units = [
-    "aircheck.service",
-    "aircheck-watchdog.service",
-    "aircheck-tx-watchdog.service",
+    "acnh-aircheck.service",
+    "acnh-aircheck-watchdog.service",
+    "acnh-aircheck-tx-watchdog.service",
 ]
 
 while True:

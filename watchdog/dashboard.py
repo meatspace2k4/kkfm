@@ -4,13 +4,17 @@ import atexit
 import json
 import os
 import signal
+import struct
 import subprocess
+import threading
 import time
 import curses
 import select
 import shutil
 import sys
 import tempfile
+import urllib.request
+import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -19,6 +23,8 @@ import errno
 
 from .paths import get_runtime_status_dir
 from .health_check import WatchdogHealthMonitor, read_status_file
+from . import sonos
+from .weather import WeatherFollower, make_source
 
 
 # Track whether terminal needs restoration (for signal handlers)
@@ -41,6 +47,7 @@ def _restore_terminal() -> None:
         pass
     try:
         # Ensure cursor is visible and terminal is in normal mode
+        sys.stdout.write("\033[?1004l")  # Disable focus reporting
         sys.stdout.write("\033[?25h")  # Show cursor
         sys.stdout.write("\033[?1049l")  # Exit alternate screen buffer
         sys.stdout.write("\033[0m")  # Reset attributes
@@ -117,9 +124,55 @@ def _run_ssh(ssh_target: str, cmd: list[str], timeout_s: float = 1.0) -> str:
     )
 
 
-def _systemctl_state(unit: str, *, ssh_target: Optional[str] = None) -> ServiceState:
+@dataclass(frozen=True)
+class DashboardProfile:
+    """Which service set the dashboard watches."""
+    name: str
+    units: tuple[str, ...]
+    watchdog_unit: str           # unit whose log monitor feeds RADIO LOGIC MONITOR
+    user_units: bool             # systemctl --user instead of the system manager
+    stream_port: int
+    status_dir: Optional[str]    # remote dir holding log_status.json / tx_status.json (None: radio defaults)
+    anomalies: Optional[str]     # remote anomalies.jsonl (None: radio defaults)
+    title: str = "KKFM AIRCHECK"  # header title
+    transmitter: bool = True      # has the Arduino/Si4713 TX telemetry (tx_status.json)
+    breaks: bool = True           # plays jingles/commercials (JING/COMM lines)
+    weather_controls: bool = False  # 1/2/3 weather keys and the weather source
+
+
+PROFILES: dict[str, DashboardProfile] = {
+    "radio": DashboardProfile(
+        name="radio",
+        units=("acnh-aircheck.service", "acnh-aircheck-watchdog.service", "acnh-aircheck-tx-watchdog.service"),
+        watchdog_unit="acnh-aircheck-watchdog.service",
+        user_units=False,
+        stream_port=9000,
+        status_dir=None,
+        anomalies=None,
+    ),
+    # Hourly BGM on the Pi: system units running as svc-kkfm, packed build on the USB.
+    "hourly": DashboardProfile(
+        name="hourly",
+        units=("acnh-hourly.service", "acnh-hourly-watchdog.service"),
+        watchdog_unit="acnh-hourly-watchdog.service",
+        user_units=False,
+        stream_port=8791,
+        status_dir="/run/kkfm-hourly",
+        # The hourly watchdog writes here (drop-in --out-dir) so jpark can read it;
+        # /mnt/kkfm-usb is svc-home only.
+        anomalies="/home/jpark/Aircheck/kkfm/watchdog/out-hourly/anomalies.jsonl",
+        title="HOURLY BGM",
+        transmitter=False,
+        breaks=False,
+        weather_controls=True,
+    ),
+}
+
+
+def _systemctl_state(unit: str, *, ssh_target: Optional[str] = None, user: bool = False) -> ServiceState:
     cmd = [
         "systemctl",
+        *(["--user"] if user else []),
         "show",
         unit,
         "-p",
@@ -244,7 +297,177 @@ def _fmt_kv(label: str, val: Any, width: int) -> str:
     return s if width <= 0 else s.ljust(width)
 
 
-def run_dashboard(*, out_dir: str, refresh_s: float = 1.0, ssh_target: Optional[str] = None) -> int:
+def _stream_host(ssh_target: Optional[str]) -> str:
+    if ssh_target and "@" in ssh_target:
+        return ssh_target.split("@", 1)[1]
+    return ssh_target or "127.0.0.1"
+
+
+# The players bind loopback only (ACNH_LOCALHOST_ONLY=1), so a remote dashboard reaches
+# their HTTP port through an SSH local forward instead of the LAN.
+class _SshTunnel:
+    def __init__(self, ssh_target: str, remote_port: int) -> None:
+        import socket
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.local_port = sock.getsockname()[1]
+        self.proc = subprocess.Popen(
+            ["ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-o", "BatchMode=yes",
+             "-L", f"127.0.0.1:{self.local_port}:localhost:{remote_port}", ssh_target],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 8.0
+        while time.time() < deadline and self.proc.poll() is None:
+            try:
+                socket.create_connection(("127.0.0.1", self.local_port), timeout=0.5).close()
+                break
+            except OSError:
+                time.sleep(0.2)
+
+    @property
+    def base(self) -> str:
+        return f"http://127.0.0.1:{self.local_port}"
+
+    def close(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2.0)
+            except Exception:
+                self.proc.kill()
+
+
+# Sonos can't reach the loopback-only players either; it plays the LAN MP3 relay that the
+# Sonos SMAPI service (sonos/smapi_server.py) runs on the Pi, which carries live ICY titles.
+SONOS_RELAY_PORT = 8777
+SONOS_RELAY_PATH = {"radio": "/kkfm.mp3", "hourly": "/hourly.mp3"}
+
+
+# SAFETY - HARD LOCK, matching the jukebox's BwavPlayer (jukebox-web/lib/
+# bwavPlayer.js): corrupt or distorted audio must never reach the speaker.
+# That player owns its whole pipeline (fetch -> decode -> Web Audio graph)
+# and layers three defenses: a source integrity gate before decode, a
+# post-decode PCM sanity check, and a live output watchdog that hard-locks
+# on a sustained rail-level run (the signature of decode corruption).
+#
+# This player is a subprocess (ffplay/mpv) we don't own the decode of, so we
+# take over exactly the part we can: WE fetch /stream ourselves instead of
+# letting the player hit the URL, validate its WAV header once (the source
+# integrity gate — bad magic/format/rate/channels means the server or the
+# link is broken, refuse to play garbage), then scan every PCM sample as it
+# passes through (the output watchdog, moved upstream of the player instead
+# of downstream of it) before forwarding raw bytes into the player's stdin.
+# Any failure calls _hard_lock(): the player is killed immediately and
+# playback refuses to restart until a deliberate 'r' reset, same as the
+# jukebox's latch — fail closed, silent, and stay there.
+class StreamIntegrityError(Exception):
+    pass
+
+
+_WAV_HEADER_STRUCT = struct.Struct("<4sI4s4sIHHIIHH4sI")
+
+# Rail-run watchdog: mirrors bwavPlayer.js's RAIL_LEVEL=0.999 / RAIL_RUN_LIMIT
+# =4096 (a sustained near-full-scale run == square-wave/DC-rail == the
+# signature of corruption, not real audio, which never sits at rail for
+# long). Same order of magnitude here: 4096 interleaved int16 samples of a
+# 48kHz stereo stream is ~43ms, comparable to the web player's ~85ms of mono
+# samples.
+_RAIL_LEVEL_INT16 = 32735  # ~0.999 * 32767
+_RAIL_RUN_LIMIT = 4096
+
+
+def _validate_wav_header(header_bytes: bytes) -> None:
+    if len(header_bytes) != _WAV_HEADER_STRUCT.size:
+        raise StreamIntegrityError(f"short WAV header ({len(header_bytes)} bytes)")
+    (riff, _file_size, wave, fmt, fmt_size, fmt_tag, channels,
+     sample_rate, _byte_rate, _block_align, bits, data, _data_size) = _WAV_HEADER_STRUCT.unpack(header_bytes)
+    if riff != b"RIFF" or wave != b"WAVE" or fmt != b"fmt " or data != b"data":
+        raise StreamIntegrityError("bad WAV magic")
+    if fmt_size != 16 or fmt_tag != 1:
+        raise StreamIntegrityError(f"unsupported format tag {fmt_tag}")
+    if channels != 2 or sample_rate != 48000 or bits != 16:
+        raise StreamIntegrityError(f"unexpected format {channels}ch/{sample_rate}Hz/{bits}bit")
+
+
+def _stream_relay(url: str, stdin_pipe: Any, stop_flag: dict, lock_holder: dict) -> None:
+    """Runs on a background thread. Owns the network fetch so the player
+    subprocess never talks to the server directly; forwards validated raw
+    PCM to its stdin. Any integrity-gate failure sets lock_holder and stops
+    forwarding; a plain network hiccup just ends the thread (the player then
+    exits on stdin EOF and the main loop reports that the normal way)."""
+    rail_run = 0
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url), timeout=10) as resp:
+            _validate_wav_header(resp.read(_WAV_HEADER_STRUCT.size))
+            while not stop_flag["stop"]:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                n = len(chunk) - (len(chunk) % 2)
+                if n:
+                    for s in struct.unpack(f"<{n // 2}h", chunk[:n]):
+                        if abs(s) >= _RAIL_LEVEL_INT16:
+                            rail_run += 1
+                            if rail_run >= _RAIL_RUN_LIMIT:
+                                raise StreamIntegrityError(
+                                    f"sustained rail-level run ({_RAIL_RUN_LIMIT} samples): "
+                                    "corrupt/distorted stream"
+                                )
+                        else:
+                            rail_run = 0
+                try:
+                    stdin_pipe.write(chunk)
+                    stdin_pipe.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    break
+    except StreamIntegrityError as e:
+        lock_holder["locked"] = True
+        lock_holder["reason"] = str(e)
+    except Exception as e:
+        stop_flag["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        # Tell the main loop the feed is gone (server exited, connection dropped).
+        # ffplay/mpv do not exit on stdin EOF by themselves, so without this the
+        # dashboard would keep showing PLAYING with nothing coming out.
+        stop_flag["ended"] = True
+        try:
+            stdin_pipe.close()
+        except Exception:
+            pass
+
+
+def _player_cmd(bin_path: str) -> list[str]:
+    """Raw s16le PCM from stdin: matches the web player, which pushes raw
+    PCM straight into an AudioWorklet with no buffering, no format probing,
+    and (since the player never opens the URL) none of the seek/Range
+    handling that /stream's infinite-length WAV framing can't support."""
+    name = os.path.basename(bin_path)
+    if name.startswith("mpv"):
+        return [
+            bin_path, "--no-video", "--really-quiet", "--no-terminal",
+            "--demuxer=rawaudio", "--demuxer-rawaudio-format=s16le",
+            "--demuxer-rawaudio-rate=48000", "--demuxer-rawaudio-channels=2",
+            "-",
+        ]
+    return [
+        # -sample_rate/-ch_layout, not -ar/-ac: those are demuxer-private
+        # AVOptions on the s16le demuxer (`ffmpeg -h demuxer=s16le`), the
+        # -ar/-ac CLI aliases don't route to it as an input option here.
+        bin_path, "-nodisp", "-loglevel", "error",
+        "-f", "s16le", "-sample_rate", "48000", "-ch_layout", "stereo",
+        "-fflags", "nobuffer", "-flags", "low_delay",
+        "-i", "-",
+    ]
+
+
+def run_dashboard(
+    *,
+    out_dir: str,
+    refresh_s: float = 1.0,
+    ssh_target: Optional[str] = None,
+    stream_port: Optional[int] = None,
+    profile: str = "radio",
+    weather_source: Optional[str] = None,
+) -> int:
     global _terminal_active, _original_terminal_settings
 
     # Set up signal handlers for graceful terminal restoration
@@ -266,6 +489,9 @@ def run_dashboard(*, out_dir: str, refresh_s: float = 1.0, ssh_target: Optional[
             out_dir=out_dir,
             refresh_s=refresh_s,
             ssh_target=ssh_target,
+            stream_port=stream_port,
+            profile=profile,
+            weather_source=weather_source,
         )
     finally:
         _restore_terminal()
@@ -274,8 +500,25 @@ def run_dashboard(*, out_dir: str, refresh_s: float = 1.0, ssh_target: Optional[
         signal.signal(signal.SIGINT, old_sigint)
 
 
-def _run_dashboard_impl(*, out_dir: str, refresh_s: float, ssh_target: Optional[str]) -> int:
+def _run_dashboard_impl(
+    *, out_dir: str, refresh_s: float, ssh_target: Optional[str], stream_port: Optional[int] = None,
+    profile: str = "radio", weather_source: Optional[str] = None,
+) -> int:
+    prof = PROFILES[profile]
+    # Hourly: the weather source picks the player's weather (Clear/Rain/Snow) when it changes.
+    weather_src = make_source(weather_source) if prof.weather_controls else None
+    if stream_port is None:
+        stream_port = prof.stream_port
     out_path = Path(out_dir)
+    tunnel = _SshTunnel(ssh_target, stream_port) if ssh_target else None
+    player_base = tunnel.base if tunnel else f"http://127.0.0.1:{stream_port}"
+    stream_url = f"{player_base}/stream"
+    player_bin = shutil.which("ffplay") or shutil.which("mpv")
+    player_proc_holder: dict[str, Any] = {"proc": None, "stop_flag": None}
+    # Set by _stream_relay's integrity gate; a background thread writes this,
+    # the main loop reads it once per tick (plain dict assignment is atomic
+    # enough under the GIL for this - worst case a one-tick-stale read).
+    player_lock_holder: dict[str, Any] = {"locked": False, "reason": None}
     tx_status: Path = out_path / "tx_status.json"
     log_status: Path = out_path / "log_status.json"
 
@@ -309,11 +552,7 @@ def _run_dashboard_impl(*, out_dir: str, refresh_s: float, ssh_target: Optional[
         if anoms is not None:
             anomalies_jsonl = anoms
 
-    units = [
-        "aircheck.service",
-        "aircheck-watchdog.service",
-        "aircheck-tx-watchdog.service",
-    ]
+    units = list(prof.units)
 
     if not ssh_target:
         allow_local = os.environ.get("WATCHDOG_ALLOW_LOCAL_DASHBOARD") == "1"
@@ -354,6 +593,7 @@ def _run_dashboard_impl(*, out_dir: str, refresh_s: float, ssh_target: Optional[
     class _RemoteStream:
         def __init__(self, target: str, out_dir_s: str, refresh: float) -> None:
             self.target = target
+            self.profile = prof
             self.out_dir_s = out_dir_s
             self.refresh = float(refresh)
             self.proc: subprocess.Popen[str] | None = None
@@ -461,6 +701,11 @@ def _run_dashboard_impl(*, out_dir: str, refresh_s: float, ssh_target: Optional[
                 self.out_dir_s,
                 "--refresh",
                 str(self.refresh),
+                "--units",
+                ",".join(self.profile.units),
+                *(["--user-units"] if self.profile.user_units else []),
+                *(["--status-dir", self.profile.status_dir] if self.profile.status_dir else []),
+                *(["--anomalies", self.profile.anomalies] if self.profile.anomalies else []),
             ]
 
             try:
@@ -491,7 +736,7 @@ def run(cmd, timeout_s=1.0):
 
 def systemctl_state(unit: str):
     out = run([
-        "systemctl","show",unit,
+        "systemctl",*(["--user"] if USER_UNITS else []),"show",unit,
         "-p","ActiveState","-p","SubState","-p","ActiveEnterTimestamp",
         "--no-pager",
     ], timeout_s=1.0)
@@ -534,11 +779,20 @@ def tail_jsonl(p: Path, n: int):
 ap = argparse.ArgumentParser()
 ap.add_argument("--out-dir", required=True)
 ap.add_argument("--refresh", type=float, default=1.0)
+ap.add_argument("--units", default="acnh-aircheck.service,acnh-aircheck-watchdog.service,acnh-aircheck-tx-watchdog.service")
+ap.add_argument("--user-units", action="store_true")
+ap.add_argument("--status-dir", default="")
+ap.add_argument("--anomalies", default="")
 args = ap.parse_args()
 
 out_path = Path(args.out_dir)
+USER_UNITS = bool(args.user_units)
+STATUS_DIR = Path(args.status_dir.format(uid=os.getuid())) if args.status_dir else None
+ANOMALIES = Path(args.anomalies.format(uid=os.getuid())) if args.anomalies else None
 
 def get_status_path(filename):
+    if STATUS_DIR is not None:
+        return STATUS_DIR / filename
     uid = os.getuid()
     cands = [
         Path("/run/kkfm-watchdog") / filename,
@@ -555,6 +809,8 @@ def get_status_path(filename):
     return out_path / filename
 
 def get_anomalies_path():
+    if ANOMALIES is not None:
+        return ANOMALIES
     uid = os.getuid()
     cands = [
         Path("/run/kkfm-watchdog") / "anomalies.jsonl",
@@ -570,11 +826,7 @@ def get_anomalies_path():
             continue
     return out_path / "anomalies.jsonl"
 
-units = [
-    "aircheck.service",
-    "aircheck-watchdog.service",
-    "aircheck-tx-watchdog.service",
-]
+units = [u for u in args.units.split(",") if u]
 
 while True:
     snap = {
@@ -795,7 +1047,23 @@ while True:
         curses.init_pair(7, orange, -1)
         curses.init_pair(13, curses.COLOR_MAGENTA, -1)  # Purple for CRITICAL
         curses.curs_set(0)
-        stdscr.nodelay(True)
+        stdscr.timeout(max(100, int(refresh_s * 1000)))
+
+        # Enable terminal focus reporting so we get ESC[I / ESC[O on
+        # tab focus-in / focus-out.  This lets us force a full repaint the
+        # instant the user switches back to this tab.
+        try:
+            sys.stdout.write("\033[?1004h")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+        # Also handle SIGCONT for terminals that send it on resume.
+        _need_full_repaint = False
+        def _on_sigcont(signum: int, frame: Any) -> None:
+            nonlocal _need_full_repaint
+            _need_full_repaint = True
+        signal.signal(signal.SIGCONT, _on_sigcont)
 
         last_tx_label: str = "WAIT"
         last_tx_color = curses.color_pair(3)
@@ -808,6 +1076,257 @@ while True:
         last_comm_state: Optional[str] = None
         last_bwav_name: Optional[str] = None
         last_bwav_src: Optional[str] = None
+        last_song_name: Optional[str] = None
+        jingle_playing_now: bool = False
+        comm_playing_now: bool = False
+
+        player_state: str = "idle"  # "idle" | "playing" | "locked"
+        player_err: Optional[str] = None
+
+        # STREAM chip ('s'): hand the /stream URL to the Sonos zone-group
+        # coordinator (SetAVTransportURI + Play) and show its transport state.
+        sonos_state: str = "idle"  # "idle" | "streaming"
+        sonos_room: Optional[str] = None
+        sonos_ip: Optional[str] = None
+        sonos_err: Optional[str] = None
+        sonos_transport: Optional[str] = None
+        sonos_last_poll: float = 0.0
+
+        def _stream_url_for_sonos(coord_ip: str) -> str:
+            host = _stream_host(ssh_target)
+            if host in ("127.0.0.1", "localhost", "::1"):
+                host = sonos.local_ip_towards(coord_ip)
+            return f"http://{host}:{SONOS_RELAY_PORT}{SONOS_RELAY_PATH[prof.name]}"
+
+        # Both players go to the Sonos as an internet-radio station through the relay:
+        # live ICY titles, no length cap.
+        sonos_radio: bool = True
+
+        def _hand_to_sonos(coord_ip: str) -> None:
+            station = "Hourly BGM" if prof.name == "hourly" else "KKFM"
+            sonos.set_radio_and_play(coord_ip, _stream_url_for_sonos(coord_ip), station=station)
+
+        sonos_title: Optional[str] = None
+
+        def _sonos_track_title() -> str:
+            # What the Sonos shows as the track: the BWAV file name the service is
+            # playing (from the log monitor's status), until source names exist.
+            if isinstance(last_bwav_name, str) and last_bwav_name:
+                return _pretty_bwav_label(last_bwav_name)
+            return "KKFM Aircheck"
+
+        def _start_sonos() -> None:
+            nonlocal sonos_state, sonos_room, sonos_ip, sonos_err, sonos_transport, sonos_last_poll, sonos_title, sonos_handoff_ts, sonos_stopped_polls
+            sonos_err = None
+            try:
+                coord = sonos.find_coordinator()
+                url = _stream_url_for_sonos(coord.ip)
+                sonos_title = _sonos_track_title()
+                _hand_to_sonos(coord.ip)
+                sonos_handoff_ts = time.time()
+                sonos_room, sonos_ip = coord.room, coord.ip
+                sonos_state = "streaming"
+                sonos_transport = None
+                # First poll after the player has had time to open the stream
+                # (it reports TRANSITIONING/STOPPED while connecting).
+                sonos_last_poll = time.time() + 3.0
+                sonos_stopped_polls = 0
+            except sonos.SonosError as e:
+                sonos_err = str(e)
+                sonos_state = "idle"
+
+        def _adopt_sonos() -> None:
+            """On startup: if a Sonos coordinator is already playing this stream
+            (radio or WAV URI for this host/port), take it over as STREAMING."""
+            nonlocal sonos_state, sonos_room, sonos_ip, sonos_transport, sonos_last_poll, sonos_handoff_ts, sonos_radio, sonos_title
+            try:
+                coord = sonos.find_coordinator()
+                cur = sonos.current_uri(coord.ip) or ""
+                radio = sonos.radio_uri(_stream_url_for_sonos(coord.ip))
+                if cur != radio:
+                    return
+                if sonos_state != "idle":
+                    return   # 's' was pressed meanwhile
+                sonos_room, sonos_ip = coord.room, coord.ip
+                sonos_radio = True
+                sonos_title = _sonos_track_title()
+                sonos_transport = sonos.transport_state(coord.ip)
+                sonos_handoff_ts = time.time()
+                sonos_last_poll = time.time()
+                sonos_state = "streaming"
+            except Exception:
+                return
+
+        def _stop_sonos() -> None:
+            nonlocal sonos_state, sonos_err, sonos_transport
+            if sonos_ip:
+                try:
+                    sonos.stop(sonos_ip)
+                except sonos.SonosError as e:
+                    sonos_err = str(e)
+            sonos_state = "idle"
+            sonos_transport = None
+
+        sonos_stopped_polls: int = 0
+        sonos_resumes: int = 0
+        # The stream declares 0xFFFFFFFF bytes (WAV header + Content-Length): at 48 kHz
+        # stereo 16-bit that is 6 h 12 m 49 s, after which the Sonos treats it as ended.
+        # Hand it over again a little before that.
+        SONOS_REFRESH_S = 6 * 3600 + 10 * 60
+        sonos_handoff_ts: float = 0.0
+
+        # Player controls over HTTP (hourly player: /control/weather/<w>, /control/skip).
+        control_msg: dict[str, Any] = {"text": None}
+
+        def _send_control(path: str, label: str) -> None:
+            url = f"{player_base}{path}"
+            control_msg["text"] = f"{label}: sending..."
+
+            def _go() -> None:
+                try:
+                    with urllib.request.urlopen(url, timeout=4) as resp:
+                        body = resp.read().decode("utf-8", errors="replace").strip()
+                    control_msg["text"] = f"{label}: {body}"
+                except urllib.error.HTTPError as e:
+                    control_msg["text"] = f"{label}: not supported by this player (HTTP {e.code})"
+                except Exception as e:
+                    control_msg["text"] = f"{label}: failed ({e})"
+
+            threading.Thread(target=_go, daemon=True).start()
+
+        # The player's weather follows the source; see WeatherFollower for the skip/retry rules.
+        weather_state: dict[str, Any] = {"reading": None}
+        follower = WeatherFollower()
+
+        def _push_weather(w: str, label: str) -> None:
+            follower.started()
+            url = f"{player_base}/control/weather/{w}"
+
+            def _go() -> None:
+                ok = False
+                try:
+                    with urllib.request.urlopen(url, timeout=4) as resp:
+                        body = resp.read().decode("utf-8", errors="replace").strip()
+                    ok = body.startswith("ok")
+                    control_msg["text"] = f"{label}: {body}"
+                except Exception as e:
+                    control_msg["text"] = f"{label}: failed ({e}); retrying"
+                follower.finished(w, ok, time.time())
+
+            threading.Thread(target=_go, daemon=True).start()
+
+        def _poll_weather() -> None:
+            # changed() is a cheap stamp check; the source is only read when its data moved.
+            if weather_src is not None and weather_src.changed():
+                weather_state["reading"] = weather_src.read()
+            # The state is re-evaluated at the current time every tick: precipitation falling per
+            # the app's chart, otherwise the next hour's forecast. It is pushed when it differs
+            # from what the player acknowledged; the player applies it at its hour changeover.
+            r = weather_state["reading"]
+            if r is not None:
+                follower.on_reading(r.hourly_at(time.time()))
+            w = follower.due(time.time())
+            if w is not None:
+                r = weather_state["reading"]
+                _push_weather(w, f"{r.source} {r.condition}" if r is not None else f"weather {w}")
+
+        def _poll_sonos() -> None:
+            nonlocal sonos_transport, sonos_err, sonos_state, sonos_last_poll, sonos_stopped_polls, sonos_title, sonos_resumes, sonos_handoff_ts
+            if sonos_state != "streaming" or not sonos_ip:
+                return
+            if not sonos_radio and sonos_handoff_ts and time.time() - sonos_handoff_ts >= SONOS_REFRESH_S:
+                try:
+                    _hand_to_sonos(sonos_ip)
+                    sonos_handoff_ts = time.time()
+                    sonos_resumes += 1
+                    sonos_stopped_polls = 0
+                    sonos_last_poll = time.time() + 3.0
+                except sonos.SonosError as e:
+                    sonos_err = str(e)
+                return
+            if time.time() - sonos_last_poll < 3.0:
+                return
+            sonos_last_poll = time.time()
+            try:
+                sonos_transport = sonos.transport_state(sonos_ip)
+                if sonos_transport in ("STOPPED", "NO_MEDIA_PRESENT"):
+                    sonos_stopped_polls += 1
+                    if sonos_stopped_polls >= 2:
+                        url = _stream_url_for_sonos(sonos_ip)
+                        radio_url = sonos.radio_uri(url)
+                        cur = sonos.current_uri(sonos_ip)
+                        if cur not in (None, "", url, radio_url):
+                            # Someone switched the Sonos to another source: hand it back to them.
+                            sonos_err = f"Sonos {sonos_room}: switched to another source; stream released"
+                            sonos_state = "idle"
+                        else:
+                            # The Sonos dropped our stream (it ends it on its own): put it straight
+                            # back, same as pressing play in the Sonos app.
+                            _hand_to_sonos(sonos_ip)
+                            sonos_handoff_ts = time.time()
+                            sonos_resumes += 1
+                            sonos_err = None
+                            sonos_stopped_polls = 0
+                            sonos_last_poll = time.time() + 3.0
+                else:
+                    sonos_stopped_polls = 0
+            except sonos.SonosError as e:
+                # Keep the intent and retry on the next poll; show the error meanwhile.
+                sonos_err = str(e)
+
+        def _stop_player() -> None:
+            nonlocal player_state, player_err
+            stop_flag = player_proc_holder["stop_flag"]
+            if stop_flag is not None:
+                stop_flag["stop"] = True
+            proc = player_proc_holder["proc"]
+            player_proc_holder["proc"] = None
+            player_proc_holder["stop_flag"] = None
+            player_state = "idle"
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        proc.kill()
+                except Exception:
+                    pass
+
+        def _reset_player_lock() -> None:
+            nonlocal player_state, player_err
+            player_lock_holder["locked"] = False
+            player_lock_holder["reason"] = None
+            player_state = "idle"
+            player_err = None
+
+        def _start_player() -> None:
+            nonlocal player_state, player_err
+            if not player_bin:
+                player_err = "no audio player found (install ffplay or mpv)"
+                return
+            try:
+                proc = subprocess.Popen(
+                    _player_cmd(player_bin),
+                    stdin=subprocess.PIPE,      # we feed this ourselves (see
+                    stdout=subprocess.DEVNULL,  # _stream_relay) - the player
+                    stderr=subprocess.PIPE,     # never touches the network
+                )
+                if proc.stderr is not None:
+                    os.set_blocking(proc.stderr.fileno(), False)
+                player_proc_holder["proc"] = proc
+                stop_flag = {"stop": False}
+                player_proc_holder["stop_flag"] = stop_flag
+                player_state = "playing"
+                player_err = None
+                threading.Thread(
+                    target=_stream_relay,
+                    args=(stream_url, proc.stdin, stop_flag, player_lock_holder),
+                    daemon=True,
+                ).start()
+            except Exception as e:
+                player_err = f"player launch failed: {e}"
+                player_state = "idle"
 
         last_log_epoch: Optional[str] = None
         last_tx_epoch: Optional[str] = None
@@ -836,15 +1355,84 @@ while True:
         health_check_interval_s = 10.0  # Check every 10s
         watchdog_status_display: dict = {}
 
+        threading.Thread(target=_adopt_sonos, daemon=True).start()
+
+        ch = -1
         while True:
-            try:
-                ch = stdscr.getch()
-            except curses.error:
-                ch = -1
+            # ch was read at the bottom of the previous pass (getch waits up to the
+            # refresh interval there and also catches focus-in reports).
             if ch in (ord("q"), ord("Q")):
                 return
+            if ch in (ord("r"), ord("R")):
+                if player_state == "locked":
+                    _reset_player_lock()
+                else:
+                    _send_control("/control/skip", "next track")
+            if prof.weather_controls and ch in (ord("1"), ord("2"), ord("3")):
+                w = {ord("1"): "sunny", ord("2"): "rainy", ord("3"): "snowy"}[ch]
+                follower.on_manual()
+                _push_weather(w, f"weather {w}")
+            if ch in (ord("p"), ord("P")) and player_state != "locked":
+                if player_state == "idle":
+                    _start_player()
+                else:
+                    _stop_player()
+            if ch in (ord("s"), ord("S")):
+                if sonos_state == "idle":
+                    _start_sonos()
+                else:
+                    _stop_sonos()
+            _poll_sonos()
+            _poll_weather()
+
+            if player_lock_holder["locked"] and player_state != "locked":
+                # The relay thread's integrity gate tripped: kill playback
+                # outright and latch. Only an explicit 'r' clears this, same
+                # as the jukebox's hardLock()/reset() - a bad stream can't
+                # quietly "recover" into noise.
+                proc = player_proc_holder["proc"]
+                player_proc_holder["proc"] = None
+                player_proc_holder["stop_flag"] = None
+                if proc is not None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                player_state = "locked"
+                player_err = player_lock_holder["reason"] or "stream-integrity hard-lock"
+            elif player_state != "locked":
+                proc = player_proc_holder["proc"]
+                sf = player_proc_holder.get("stop_flag")
+                if proc is not None and proc.poll() is None and isinstance(sf, dict) and sf.get("ended") and not sf.get("stop"):
+                    # Stream feed ended while the player is still alive: stop it and say so.
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    player_proc_holder["proc"] = None
+                    player_proc_holder["stop_flag"] = None
+                    player_state = "idle"
+                    player_err = "stream ended: " + (sf.get("error") or "server closed the connection")
+                    proc = None
+                if proc is not None and proc.poll() is not None:
+                    rc = proc.returncode
+                    player_proc_holder["proc"] = None
+                    player_proc_holder["stop_flag"] = None
+                    player_state = "idle"
+                    tail = ""
+                    if proc.stderr is not None:
+                        try:
+                            tail = proc.stderr.read().decode("utf-8", errors="ignore").strip()
+                        except Exception:
+                            tail = ""
+                        tail = tail.splitlines()[-1] if tail else ""
+                    player_err = tail if tail else f"player exited (code {rc})"
+            ch = -1
 
             try:
+                if _need_full_repaint:
+                    _need_full_repaint = False
+                    stdscr.clearok(True)   # repaint the whole screen on the next refresh
                 stdscr.erase()
                 max_y, max_x = stdscr.getmaxyx()
 
@@ -886,8 +1474,10 @@ while True:
                                 level = max(level, 2)
                                 break
 
+                onair_flag = False
+                onair_flag = False
                 tx_snap = remote.get("tx") if isinstance(remote, dict) else None
-                if isinstance(tx_snap, dict):
+                if prof.transmitter and isinstance(tx_snap, dict):
                     now_ts = time.time()
                     try:
                         age_s = now_ts - float(tx_snap.get("ts", 0))
@@ -929,6 +1519,7 @@ while True:
                             audio_present = False
 
                     if telemetry_fresh and isinstance(audio_present, bool):
+                        onair_flag = audio_present
                         if audio_present:
                             tx_silence_since_ts = None
                         else:
@@ -938,7 +1529,8 @@ while True:
                                 level = max(level, 1)
 
                 if (
-                    ssh_target
+                    prof.transmitter
+                    and ssh_target
                     and remote_stream
                     and ssh_level == "ok"
                     and isinstance(remote, dict)
@@ -957,9 +1549,9 @@ while True:
                 if ssh_status:
                     suffix = f" | {ssh_status} "
                 if max_x > 60:
-                    header = f" KKFM AIRCHECK DASHBOARD | {ts_str}{suffix}"
+                    header = f" {prof.title} DASHBOARD | {ts_str}{suffix}"
                 elif max_x > 30:
-                    header = f" KKFM DASHBOARD{suffix}"
+                    header = f" {prof.title.split()[0]} DASHBOARD{suffix}"
                 else:
                     header = " KKFM "
                 
@@ -967,7 +1559,97 @@ while True:
                 stdscr.addnstr(0, 0, header.center(max_x), max(0, max_x - 1))
                 stdscr.attroff(header_color | curses.A_BOLD)
 
+                # PLAY CHIP: station on-air state, plus what's on air (song title,
+                # or a bare "Jingle"/"Commercial" hint while those play). Toggled
+                # with 'p', which spawns a real player (ffplay/mpv) against the
+                # stream endpoint, same on-air source of truth as the header level.
                 y = 2
+                if y < max_y:
+                    locked = player_state == "locked"
+                    listening = player_state == "playing"
+                    chip_attr = curses.color_pair(8) | curses.A_BOLD
+                    if locked:
+                        chip = "  ✕ LOCKED  "
+                        chip_attr = curses.color_pair(13) | curses.A_BOLD  # magenta, matches CRITICAL
+                    elif listening:
+                        chip = "  PLAYING...  "
+                    elif onair_flag:
+                        chip = "  ● LIVE  "
+                    else:
+                        chip = "  ▶ PLAY  "
+                    stdscr.attron(chip_attr)
+                    stdscr.addnstr(y, 2, chip, max(0, max_x - 3))
+                    stdscr.attroff(chip_attr)
+                    hint_col = 2 + len(chip) + 1
+                    if hint_col < max_x:
+                        if locked:
+                            stdscr.attron(curses.color_pair(13) | curses.A_BOLD)
+                            hint = f"{player_err or 'stream-integrity hard-lock'} (press 'r' to reset)"
+                            stdscr.addnstr(y, hint_col, hint[:70], max(0, max_x - hint_col - 1))
+                            stdscr.attroff(curses.color_pair(13) | curses.A_BOLD)
+                        elif player_err:
+                            stdscr.attron(curses.color_pair(2))
+                            stdscr.addnstr(y, hint_col, player_err[:70], max(0, max_x - hint_col - 1))
+                            stdscr.attroff(curses.color_pair(2))
+                        elif listening:
+                            onair_title = (
+                                last_song_name
+                                if (not jingle_playing_now and not comm_playing_now and last_song_name)
+                                else None
+                            )
+                            if onair_title:
+                                stdscr.attron(title_text_attr)
+                                stdscr.addnstr(y, hint_col, onair_title, max(0, max_x - hint_col - 1))
+                                stdscr.attroff(title_text_attr)
+                        else:
+                            stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+                            stdscr.addnstr(y, hint_col, "<-- press 'p' to LISTEN!", max(0, max_x - hint_col - 1))
+                            stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
+
+                # CONTROLS: 1/2/3 set the player's weather, 'r' queues the next track.
+                y = 4
+                if y < max_y:
+                    ctl = ("1 Sunny  2 Rainy  3 Snowy  " if prof.weather_controls else "") + "r next track"
+                    if weather_src is not None:
+                        r = weather_state["reading"]
+                        if r:
+                            falling, until = r.precipitation_at(time.time())
+                            precip = (f", precip until {time.strftime('%H:%M', time.localtime(until))}"
+                                      if falling and until else "")
+                            ctl += f"   |  {weather_src.name}: {r.condition}{precip} ({time.strftime('%H:%M', time.localtime(r.as_of))})"
+                        else:
+                            ctl += f"   |  {weather_src.name}: no data"
+                    if control_msg["text"]:
+                        ctl += "   |  " + str(control_msg["text"])
+                    stdscr.attron(curses.color_pair(3))
+                    stdscr.addnstr(y, 4, ctl, max(0, max_x - 5))
+                    stdscr.attroff(curses.color_pair(3))
+
+                # STREAM CHIP: 's' sends the stream URL to the Sonos group coordinator.
+                y = 3
+                if y < max_y:
+                    streaming = sonos_state == "streaming"
+                    chip_attr = curses.color_pair(8) | curses.A_BOLD
+                    chip = "  STREAMING...  " if streaming else "  ⇢ STREAM  "
+                    stdscr.attron(chip_attr)
+                    stdscr.addnstr(y, 2, chip, max(0, max_x - 3))
+                    stdscr.attroff(chip_attr)
+                    hint_col = 2 + len(chip) + 1
+                    if hint_col < max_x:
+                        if sonos_err:
+                            stdscr.attron(curses.color_pair(2))
+                            stdscr.addnstr(y, hint_col, sonos_err[:90], max(0, max_x - hint_col - 1))
+                            stdscr.attroff(curses.color_pair(2))
+                        elif streaming:
+                            stdscr.attron(title_text_attr)
+                            stdscr.addnstr(y, hint_col, f"Sonos {sonos_room} ({sonos_ip})  {sonos_transport or 'starting'}" + (f"  (auto-resumed {sonos_resumes}x)" if sonos_resumes else ""), max(0, max_x - hint_col - 1))
+                            stdscr.attroff(title_text_attr)
+                        else:
+                            stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+                            stdscr.addnstr(y, hint_col, "<-- press 's' to STREAM to Sonos", max(0, max_x - hint_col - 1))
+                            stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
+
+                y = 6
                 if y < max_y:
                     stdscr.attron(section_title_attr)
                     stdscr.addnstr(y, 2, "SYSTEM SERVICES", max(0, max_x - 3))
@@ -993,7 +1675,7 @@ while True:
                             else:
                                 st = ServiceState(name=u, active="CONNECT", sub="-", since="")
                         else:
-                            st = _systemctl_state(u, ssh_target=ssh_target)
+                            st = _systemctl_state(u, ssh_target=ssh_target, user=prof.user_units)
                     
                     u_disp = u
                     if max_x < 50:
@@ -1015,8 +1697,9 @@ while True:
                     stdscr.attroff(color | curses.A_BOLD)
                     y += 1
 
-                y += 1
-                if y < max_y:
+                if prof.transmitter:
+                    y += 1
+                if prof.transmitter and y < max_y:
                     stdscr.attron(section_title_attr)
                     stdscr.addnstr(y, 2, "TRANSMITTER (Arduino/Si4713)", max(0, max_x - 3))
                     stdscr.attroff(section_title_attr)
@@ -1190,6 +1873,7 @@ while True:
                                 last_comm_state = None
                                 last_bwav_name = None
                                 last_bwav_src = None
+                                last_song_name = None
                                 prev_jingle_playing = False
                                 prev_comm_playing = False
 
@@ -1201,25 +1885,37 @@ while True:
                             last_comm_state = None
                             last_bwav_name = None
                             last_bwav_src = None
+                            last_song_name = None
                             prev_jingle_playing = False
                             prev_comm_playing = False
 
                         wd = None
                         if isinstance(remote, dict) and isinstance(remote.get("services"), dict):
-                            rst = remote["services"].get("aircheck-watchdog.service")
+                            rst = remote["services"].get(prof.watchdog_unit)
                             if isinstance(rst, dict):
                                 wd = ServiceState(
-                                    name="aircheck-watchdog.service",
+                                    name=prof.watchdog_unit,
                                     active=str(rst.get("active") or "?"),
                                     sub=str(rst.get("sub") or "?"),
                                     since=str(rst.get("since") or ""),
                                 )
                         if wd is None:
                             if ssh_target and remote_stream:
-                                wd = ServiceState(name="aircheck-watchdog.service", active="CONNECT", sub="-", since="")
+                                wd = ServiceState(name=prof.watchdog_unit, active="CONNECT", sub="-", since="")
                             else:
-                                wd = _systemctl_state("aircheck-watchdog.service", ssh_target=ssh_target)
+                                wd = _systemctl_state(prof.watchdog_unit, ssh_target=ssh_target, user=prof.user_units)
                         wd_active = wd.active == "active"
+                        # No systemd (local run, e.g. macOS): the log monitor is up when its
+                        # status file is fresh and the PID it recorded is alive.
+                        if not wd_active and not ssh_target and not log_stale:
+                            try:
+                                mon_pid = int(ls.get("pid") or 0)
+                                if mon_pid > 0:
+                                    os.kill(mon_pid, 0)
+                                    wd = ServiceState(name=wd.name, active="active", sub=f"pid {mon_pid}", since="")
+                                    wd_active = True
+                            except Exception:
+                                pass
 
                         le = ls.get("last_event") or {}
                         bwav = ls.get("last_bwav") or {}
@@ -1248,6 +1944,8 @@ while True:
                             elif etype == "commercial_end":
                                 last_comm_name = ename
                                 last_comm_state = "ENDED"
+                            elif etype == "now_playing":
+                                last_song_name = ename
 
                         jingle_playing_now = bool(jing.get("started_name"))
                         comm_playing_now = bool(com.get("started_name"))
@@ -1422,7 +2120,7 @@ while True:
                                     stdscr.addnstr(y, status_col, "IDLE", max(0, max_x - status_col - 1))
                             y += 1
                         
-                        for kind, data in [("JING", jing), ("COMM", com)]:
+                        for kind, data in ([("JING", jing), ("COMM", com)] if prof.breaks else []):
                             if y >= max_y: break
                             # Fixed column positions for alignment
                             label_col = 4
@@ -1604,11 +2302,51 @@ while True:
                         y += 1
 
                 stdscr.refresh()
-                time.sleep(max(0.1, float(refresh_s)))
+
+                # Read input; getch blocks up to timeout ms.
+                # Detect focus-in sequence ESC [ I (27, 91, 73).
+                try:
+                    ch = stdscr.getch()
+                except curses.error:
+                    ch = -1
+                if ch in (ord("q"), ord("Q")):
+                    return
+                if ch == 27:  # ESC - might be focus report
+                    stdscr.nodelay(True)
+                    try:
+                        c2 = stdscr.getch()
+                        c3 = stdscr.getch()
+                    except curses.error:
+                        c2 = c3 = -1
+                    stdscr.timeout(max(100, int(refresh_s * 1000)))
+                    if c2 == ord("[") and c3 == ord("I"):
+                        # Focus-in: force full repaint on next iteration
+                        _need_full_repaint = True
 
             except curses.error:
-                time.sleep(0.05)
+                curses.napms(50)
                 continue
 
-    curses.wrapper(draw)
+        # Disable focus reporting on exit
+        try:
+            sys.stdout.write("\033[?1004l")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    try:
+        curses.wrapper(draw)
+    finally:
+        if tunnel is not None:
+            tunnel.close()
+        proc = player_proc_holder["proc"]
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
     return 0

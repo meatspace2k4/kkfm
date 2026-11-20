@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+import tempfile
 import sys
 import time
 import json
@@ -55,6 +56,13 @@ def _event_level(ev: Event) -> str:
     if et in (EventType.JINGLE_FAILED, EventType.COMM_FAILED):
         return "ERROR"
 
+    if et in (EventType.BGM_PICKED, EventType.BGM_CHANGEOVER, EventType.BGM_END, EventType.WEATHER_FETCHED):
+        return "INFO"
+    if et == EventType.WEATHER_FAILED:
+        return "WARN"
+    if et == EventType.BGM_FAILED:
+        return "ERROR"
+
     if et in (EventType.DAC_THROTTLE,):
         return "WARN"
 
@@ -92,6 +100,12 @@ def _maybe_redirect_status_path(p: Path) -> Path:
     s = str(p)
     if s.startswith("/run/") or s.startswith("/dev/shm/") or s.startswith("/tmp/"):
         return p
+    # The OS temp dir (macOS: /var/folders/...) is not the SD card either.
+    try:
+        if Path(tempfile.gettempdir()).resolve() in p.resolve().parents:
+            return p
+    except Exception:
+        pass
 
     # Otherwise, push to runtime tmpfs.
     return get_runtime_status_dir() / p.name
@@ -170,6 +184,36 @@ def _clear_all_runtime_state_for_uid(*, clear_status: bool, clear_anomalies: boo
             clear_anomalies=clear_anomalies,
             clear_flags=clear_flags,
         )
+
+
+def _unit_journal_since_start(unit: str, *, max_lines: int = 20000) -> list[tuple[str, float | None]]:
+    """(message, ts) for every journal line of `unit` since it last became active.
+
+    Empty when systemd/journalctl is unavailable or the unit is not active.
+    """
+    try:
+        out = subprocess.run(
+            ["systemctl", "show", "-p", "ActiveEnterTimestamp", "--timestamp=unix", "--value", unit],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except Exception:
+        return []
+    if not out.startswith("@"):
+        return []
+    try:
+        res = subprocess.run(
+            ["journalctl", "--no-pager", "-u", unit, "--since", out, "-n", str(int(max_lines)),
+             "-o", "json", "--output-fields=MESSAGE,__REALTIME_TIMESTAMP"],
+            capture_output=True, timeout=30,
+        )
+    except Exception:
+        return []
+    lines: list[tuple[str, float | None]] = []
+    for raw in res.stdout.decode("utf-8", errors="replace").splitlines():
+        msg, ts = _journal_json_to_message_and_ts(raw)
+        if msg is not None:
+            lines.append((msg, ts))
+    return lines
 
 
 def _journal_json_to_message_and_ts(raw: str) -> tuple[str | None, float | None]:
@@ -316,6 +360,20 @@ def cmd_monitor_logs(args: argparse.Namespace) -> int:
         tmp.write_text(json.dumps(snap, ensure_ascii=False) + "\n", encoding="utf-8")
         tmp.replace(status_p)
 
+    def seed_from_journal() -> None:
+        """Rebuild the detector and status from the unit's current run, so a watchdog
+        restart shows what is playing now. Anomalies from the replay are not re-reported."""
+        nonlocal last_ev
+        for msg, ts in _unit_journal_since_start(str(args.unit)):
+            t = ts if ts is not None else time.time()
+            maybe_note_bwav(msg, t)
+            ev = parse_event(msg, default_ts=t)
+            if not ev:
+                continue
+            last_ev = ev
+            det.feed(ev)
+        maybe_write_status(time.time(), force=True)
+
     if args.input_file:
         src = Path(args.input_file).read_text(errors="ignore").splitlines()
         base_ts = time.time()
@@ -339,19 +397,70 @@ def cmd_monitor_logs(args: argparse.Namespace) -> int:
         return 0
 
     if args.stdin:
-        for raw in sys.stdin:
+        # Same shape as the journalctl loop below: wake up at least once a second so the
+        # detector's timeout checks (dead air, BGM changeover/pick timeouts, weather
+        # staleness) run and the status file stays fresh even when the player is quiet
+        # for minutes (the hourly BGM fork logs only on the hour plus a heartbeat).
+        seed_from_journal()
+        sfd = sys.stdin.fileno()
+        os.set_blocking(sfd, False)
+        buf = b""
+        eof = False
+        while True:
+            if eof:
+                time.sleep(1.0)
+                r = []
+            else:
+                r, _, _ = select.select([sfd], [], [], 1.0)
             now = time.time()
-            if maybe_note_bwav(raw, now):
-                maybe_write_status(now, force=True)
-            ev = parse_event(raw, default_ts=now)
-            if not ev:
-                maybe_write_status(now)
-                continue
-            last_ev = ev
-            for a in det.feed(ev):
+            if r:
+                while True:
+                    try:
+                        chunk = os.read(sfd, 65536)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        # The player's stdout closed: the process is gone. Report it the
+                        # same way systemd's "Stopped" line would, plus a critical anomaly,
+                        # then keep polling so dead-air keeps being reported until we are stopped.
+                        eof = True
+                        stop_ev = Event(EventType.UNIT_STOPPED, ts=now, raw="Stopped player (log stream closed)", name=None)
+                        last_ev = stop_ev
+                        for a in det.feed(stop_ev):
+                            rep.emit(a)
+                        rep.emit(Anomaly(
+                            code=AnomalyCode.RADIO_OFFLINE,
+                            severity=Severity.CRITICAL,
+                            ts=now,
+                            message="player process exited (log stream closed)",
+                        ))
+                        maybe_write_status(now, force=True)
+                        break
+                    buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    raw = line.decode("utf-8", errors="replace")
+                    if maybe_note_bwav(raw, now):
+                        maybe_write_status(now, force=True)
+                    ev = parse_event(raw, default_ts=now)
+                    if not ev:
+                        continue
+                    last_ev = ev
+                    for a in det.feed(ev):
+                        rep.emit(a)
+                        action = auto_restarter.consider(a)
+                        if action is not None:
+                            rep.emit(action)
+            for a in det.poll(now):
                 rep.emit(a)
+                action = auto_restarter.consider(a)
+                if action is not None:
+                    rep.emit(action)
             maybe_write_status(now)
         return 0
+
+    if str(args.since) == "now":
+        seed_from_journal()
 
     # Live journalctl
     # Use JSON output so we never get hard-wrapped lines and we can use the
@@ -510,7 +619,10 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     
     # Clear anomalies first if requested
     if getattr(args, "clear_anomalies", False):
-        clear_args = argparse.Namespace(ssh=ssh_target, out_dir=args.out_dir)
+        clear_args = argparse.Namespace(
+            ssh=ssh_target, out_dir=args.out_dir, profile=str(getattr(args, "profile", "radio"))
+        )
+        # A failed clear is reported and the dashboard starts anyway.
         cmd_clear_anomalies(clear_args)
     
     return int(
@@ -518,65 +630,94 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             out_dir=args.out_dir,
             refresh_s=float(args.refresh),
             ssh_target=ssh_target,
+            stream_port=getattr(args, "stream_port", None),
+            profile=str(getattr(args, "profile", "radio")),
+            weather_source=getattr(args, "weather_source", None),
         )
     )
 
 
+_CLEAR_REMOTE_SCRIPT = r'''
+import os, sys
+from pathlib import Path
+uid = os.getuid()
+paths = [Path(a.format(uid=uid)).expanduser() for a in sys.argv[1:]]
+rc = 0
+found = False
+for p in paths:
+    if not p.exists():
+        continue
+    found = True
+    try:
+        with open(p, "r+") as f:
+            f.truncate(0)
+        print(f"cleared {p}")
+    except Exception as e:
+        print(f"failed {p}: {e}")
+        rc = 1
+if not found:
+    print("no anomalies.jsonl at " + ", ".join(str(p) for p in paths))
+sys.exit(rc)
+'''
+
+
+def _anomalies_targets(profile: str, *, remote: bool, out_dir: str) -> list[str]:
+    """Every anomalies.jsonl the dashboard may read for `profile`, so a clear empties the file it shows."""
+    from .dashboard import PROFILES
+
+    prof = PROFILES.get(profile) or PROFILES["radio"]
+    if prof.anomalies:
+        return [prof.anomalies]
+    return [
+        "/run/kkfm-watchdog/anomalies.jsonl",
+        "/run/user/{uid}/kkfm-watchdog/anomalies.jsonl",
+        "/dev/shm/kkfm-watchdog-{uid}/anomalies.jsonl",
+        # The radio watchdog's --out-dir on the Pi.
+        *(["~/Aircheck/kkfm/watchdog/out/anomalies.jsonl"] if remote else []),
+        str(Path(out_dir) / "anomalies.jsonl"),
+    ]
+
+
 def cmd_clear_anomalies(args: argparse.Namespace) -> int:
-    """Clear the anomalies.jsonl log file (local or remote via SSH)."""
+    """Truncate the anomalies.jsonl log the watchdog writes (local, or on the Pi via ssh)."""
     ssh_target = getattr(args, "ssh", None) or None
-    
+    profile = str(getattr(args, "profile", "radio") or "radio")
+    targets = _anomalies_targets(profile, remote=bool(ssh_target), out_dir=str(args.out_dir))
+
     if ssh_target:
-        # Remote clear via SSH - truncate the known location
-        cmd = ["ssh", "-o", "ConnectTimeout=5", ssh_target, 
-               "truncate", "-s", "0", "/run/kkfm-watchdog/anomalies.jsonl"]
+        cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh_target,
+               "--", "python3", "-", *targets]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
-                print(f"Cleared anomalies on {ssh_target}")
-            else:
-                print(f"Note: {result.stderr.strip() or 'file may not exist'}")
-            return 0
+            result = subprocess.run(cmd, input=_CLEAR_REMOTE_SCRIPT, capture_output=True, text=True, timeout=15)
         except subprocess.TimeoutExpired:
-            print("SSH command timed out", file=sys.stderr)
+            print(f"clear-anomalies: ssh to {ssh_target} timed out", file=sys.stderr)
             return 1
         except Exception as e:
-            print(f"SSH error: {e}", file=sys.stderr)
+            print(f"clear-anomalies: ssh error: {e}", file=sys.stderr)
             return 1
-    else:
-        # Local clear
-        from .paths import get_runtime_status_dir
-        
-        uid = os.getuid()
-        candidates = [
-            Path("/run/kkfm-watchdog") / "anomalies.jsonl",
-            Path(f"/run/user/{uid}/kkfm-watchdog") / "anomalies.jsonl",
-            Path(f"/dev/shm/kkfm-watchdog-{uid}") / "anomalies.jsonl",
-            Path(args.out_dir) / "anomalies.jsonl",
-        ]
-        
-        # Also check runtime dir
+        out = (result.stdout + result.stderr).strip()
+        if out:
+            print(f"{ssh_target}: {out}", file=sys.stdout if result.returncode == 0 else sys.stderr)
+        return 0 if result.returncode == 0 else 1
+
+    uid = os.getuid()
+    rc = 0
+    found = False
+    for t in targets:
+        p = Path(t.format(uid=uid)).expanduser()
+        if not p.exists():
+            continue
+        found = True
         try:
-            runtime_dir = get_runtime_status_dir()
-            candidates.insert(0, runtime_dir / "anomalies.jsonl")
-        except Exception:
-            pass
-        
-        cleared = []
-        for p in candidates:
-            try:
-                if p.exists():
-                    p.write_text("")
-                    cleared.append(str(p))
-            except Exception as e:
-                print(f"Failed to clear {p}: {e}", file=sys.stderr)
-        
-        if cleared:
-            print(f"Cleared: {', '.join(cleared)}")
-        else:
-            print("No anomalies.jsonl files found to clear")
-        
-        return 0
+            with open(p, "r+") as f:
+                f.truncate(0)
+            print(f"cleared {p}")
+        except Exception as e:
+            print(f"failed {p}: {e}", file=sys.stderr)
+            rc = 1
+    if not found:
+        print("no anomalies.jsonl found to clear")
+    return rc
 
 
 def main() -> int:
@@ -596,7 +737,7 @@ def main() -> int:
 
     p = sub.add_parser("monitor-logs")
     p.add_argument("--out-dir", default=default_out_dir)
-    p.add_argument("--unit", default="aircheck.service")
+    p.add_argument("--unit", default="acnh-aircheck.service")
     p.add_argument("--since", default="now")
     p.add_argument("--start-timeout", type=float, default=300.0)
     p.add_argument("--end-timeout", type=float, default=45.0)
@@ -649,10 +790,28 @@ def main() -> int:
         help="Run dashboard locally but read Pi data via ssh (e.g. pi@raspberrypi)",
     )
     p.add_argument(
-        "--clear-anomalies", "-c",
+        "--clear", "--clear-anomalies", "-c",
         action="store_true",
         dest="clear_anomalies",
-        help="Clear the anomalies log before starting the dashboard",
+        help="Truncate the anomalies log (on the --ssh host when given) before starting the dashboard",
+    )
+    p.add_argument(
+        "--stream-port",
+        type=int,
+        default=None,
+        help="Port of the stream server for the 'p'/'s' chips (default: the profile's port)",
+    )
+    p.add_argument(
+        "--profile",
+        choices=["radio", "hourly"],
+        default="radio",
+        help="Service set to watch: radio (acnh-aircheck*, port 9000) or hourly (acnh-hourly* system units, port 8791)",
+    )
+    p.add_argument(
+        "--weather-source",
+        default="weather-app",
+        help="Hourly profile: where the player's weather comes from (weather-app: the macOS Weather "
+             "app via hourly/mac/WeatherWatch; none: only the 1/2/3 keys)",
     )
     p.set_defaults(func=cmd_dashboard)
 
@@ -663,6 +822,7 @@ def main() -> int:
         default="",
         help="Clear anomalies on remote host via ssh (e.g. pi@raspberrypi)",
     )
+    p.add_argument("--profile", choices=["radio", "hourly"], default="radio")
     p.set_defaults(func=cmd_clear_anomalies)
 
     args = ap.parse_args()
