@@ -165,16 +165,16 @@ class TestWeather(unittest.TestCase):
     def test_state_follows_the_hours_forecast_and_flips_at_the_top_of_the_hour(self):
         # 12 PM Cloudy, 1 PM Drizzle, 2 PM Windy; the chart shows rain 1:38-2:11.
         h12 = 1791741600.0
-        r = WeatherReading("Cloudy", h12 + 48 * 60, "t",
+        r = WeatherReading("Cloudy", h12 + 48 * 60, "t",  # (chart 12:48-2:12)
                            minutes=((h12 + 48 * 60, 0.0), (h12 + 98 * 60, 0.5), (h12 + 131 * 60, 0.0)),
                            minutes_end=h12 + 132 * 60,
                            hours=((h12, "Cloudy"), (h12 + 3600, "Drizzle"), (h12 + 7200, "Windy")))
-        # The whole 12 PM hour, 12:59 included: 12 PM's Cloudy. The 12:00 track is left alone.
+        # Before the chart: 12 PM's Cloudy. In the chart and dry: nothing falling, whatever the
+        # forecast says (1 PM's Drizzle does not make 1:00 rainy while the chart is dry).
         self.assertEqual(r.hourly_at(h12 + 5 * 60), SUNNY)
         self.assertEqual(r.hourly_at(h12 + 48 * 60), SUNNY)
         self.assertEqual(r.hourly_at(h12 + 59 * 60 + 59), SUNNY)
-        # 1:00:00: 1 PM's Drizzle. The player's hour changeover is already armed and picks 13 Rainy.
-        self.assertEqual(r.hourly_at(h12 + 3600), RAINY)
+        self.assertEqual(r.hourly_at(h12 + 3600), SUNNY)
         self.assertEqual(r.hourly_at(h12 + 98 * 60), RAINY)      # raining per the chart
         self.assertEqual(r.hourly_at(h12 + 7200 - 60), RAINY)    # still raining at 1:59
         self.assertEqual(r.hourly_at(h12 + 7200), RAINY)         # 2:00, still raining: 14 Rainy
