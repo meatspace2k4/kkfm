@@ -48,7 +48,7 @@ class Radar:
     over ssh (the script piped to its python3) or here without one, every `every` seconds.
     latest(now) -> "snow" | "rain" | "none", or None with no reading from the last 15 minutes."""
 
-    def __init__(self, latlon: str, ssh_target: Optional[str] = None, radius: int = 2,
+    def __init__(self, latlon: str, ssh_target: Optional[str] = None, radius: int = 0,
                  every: float = 120.0, say: Optional[Callable[[str], None]] = None,
                  run: Optional[Callable[[list[str]], str]] = None) -> None:
         self.lat, self.lon = latlon.split("/")
@@ -200,8 +200,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--weather-source", default="weather-app")
     ap.add_argument("--interval", type=float, default=2.0, help="seconds between ticks")
     ap.add_argument("--no-radar", action="store_true", help="the app alone, no MRMS radar")
-    ap.add_argument("--radar-radius", type=int, default=2,
-                    help="MRMS cells around the location that count (2: a 5x5 box, about 4 km)")
+    # (0: the location's own ~1 km cell. A 5x5 box took snow 4 km up the hill as snow here while it
+    # rained at 37 F, 2026-11-20 14:56)
+    ap.add_argument("--radar-radius", type=int, default=0,
+                    help="MRMS cells around the location that count (0: its own cell only)")
     args = ap.parse_args(argv)
     source = make_source(args.weather_source)
     if source is None:
