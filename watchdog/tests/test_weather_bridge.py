@@ -99,6 +99,28 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
 
+class HoldTest(unittest.TestCase):
+    def setUp(self):
+        self.src, self.sent = FakeSource(), []
+        self.bridge = Bridge(self.src, lambda w: (self.sent.append(w) or (True, "ok")), lambda s: None)
+
+    def test_rainy_holds_through_a_dry_gap_with_rain_ahead(self):
+        t0 = 10 * HOUR
+        self.src.give(reading(t0, ((t0, "Cloudy"),), ((t0, 1.0), (t0 + 600, 0.0), (t0 + 1800, 1.0)), t0 + 3600))
+        self.bridge.tick(t0 + 60)                      # raining
+        self.bridge.tick(t0 + 900)                     # dry, rain again from minute 30: stays rainy
+        self.assertEqual(self.sent, [RAINY])
+        self.src.give(reading(t0 + 2400, ((t0, "Cloudy"),), ((t0 + 2400, 0.0),), t0 + 6000))
+        self.bridge.tick(t0 + 2460)                    # dry with nothing ahead: sunny
+        self.assertEqual(self.sent, [RAINY, SUNNY])
+
+    def test_sunny_does_not_turn_rainy_before_the_rain(self):
+        t0 = 10 * HOUR
+        self.src.give(reading(t0, ((t0, "Cloudy"),), ((t0, 0.0), (t0 + 1800, 1.0)), t0 + 3600))
+        self.bridge.tick(t0 + 60)
+        self.assertEqual(self.sent, [SUNNY])
+
+
 class RadarBridgeTest(unittest.TestCase):
     """MRMS radar (Radar): snow supersedes the app; with no current app reading it decides."""
 
