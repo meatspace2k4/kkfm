@@ -1,7 +1,8 @@
+import json
 import unittest
 
 from watchdog.weather import RAINY, SNOWY, SUNNY, WeatherReading, WeatherSource
-from watchdog.weather_bridge import Bridge
+from watchdog.weather_bridge import Bridge, Radar
 
 HOUR = 3600.0
 
@@ -96,6 +97,61 @@ class BridgeTest(unittest.TestCase):
         self.src.give(reading(t0, ((t0, "Rain"),)))
         self.bridge.tick(t0 + 30 * HOUR)               # a stale mirror: no row for this hour
         self.assertEqual(self.sent, [])
+
+
+class RadarBridgeTest(unittest.TestCase):
+    """MRMS radar (Radar): snow supersedes the app; with no current app reading it decides."""
+
+    def setUp(self):
+        self.src, self.sent, self.said = FakeSource(), [], []
+        self.radar_answer = {"time": 0.0, "flag": 0, "kinds": [0], "precip": "none"}
+
+        def push(w):
+            self.sent.append(w)
+            return True, "ok"
+
+        def run(args):
+            return json.dumps(self.radar_answer)
+        self.radar = Radar("40.782/-111.872", say=self.said.append, run=run, every=60.0)
+        self.bridge = Bridge(self.src, push, self.said.append, radar=self.radar)
+
+    def radar_says(self, precip, at):
+        self.radar_answer = {"time": at, "flag": 3 if precip == "snow" else 10, "kinds": [], "precip": precip}
+        self.radar.next = 0.0
+
+    def test_radar_snow_supersedes_the_apps_rain(self):
+        t0 = 10 * HOUR
+        self.src.give(reading(t0, ((t0, "Rain"),), condition="Rain"))
+        self.radar_says("snow", t0)
+        self.bridge.tick(t0 + 60)
+        self.assertEqual(self.sent, [SNOWY])
+
+    def test_radar_rain_leaves_the_app_in_charge(self):
+        t0 = 10 * HOUR
+        self.src.give(reading(t0, ((t0, "Clear"),)))
+        self.radar_says("rain", t0)
+        self.bridge.tick(t0 + 60)
+        self.assertEqual(self.sent, [SUNNY])
+
+    def test_radar_decides_when_the_apps_reading_is_stale(self):
+        t0 = 10 * HOUR
+        self.src.give(reading(t0, tuple((t0 + h * HOUR, "Clear") for h in range(12))))
+        self.radar_says("rain", t0 + 9 * HOUR)
+        self.bridge.tick(t0 + 9 * HOUR)                # the app's data is nine hours old
+        self.assertEqual(self.sent, [RAINY])
+
+    def test_radar_decides_with_no_app_data(self):
+        t0 = 10 * HOUR
+        self.radar_says("none", t0)
+        self.bridge.tick(t0 + 60)
+        self.assertEqual(self.sent, [SUNNY])
+
+    def test_a_stale_radar_reading_does_not_count(self):
+        t0 = 10 * HOUR
+        self.src.give(reading(t0, ((t0, "Rain"),), condition="Rain"))
+        self.radar_says("snow", t0 - HOUR)              # an hour old
+        self.bridge.tick(t0 + 60)
+        self.assertEqual(self.sent, [RAINY])
 
 
 if __name__ == "__main__":
