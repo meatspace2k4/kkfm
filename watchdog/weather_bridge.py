@@ -160,6 +160,10 @@ class Bridge:
             self.reading = r if r is not None else self.reading
         r = self.reading
         app = r.hourly_at(now) if r is not None and now - r.as_of <= APP_STALE_S else None
+        # Already Rainy or Snowy: a dry minute does not end it while the chart still shows
+        # precipitation ahead (2026-11-20 15:31: Rainy went Sunny with rain charted from 16:00).
+        if app == SUNNY and self.state in (RAINY, SNOWY) and r.precipitation_ahead(now):
+            app = self.state
         radar = self.radar.latest(now) if self.radar else None
         # Radar snow supersedes the app (it rains at the airport while it snows up the hill, and
         # the app follows the valley); otherwise the app; with no current app reading, the radar.

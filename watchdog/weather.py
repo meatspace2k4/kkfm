@@ -144,6 +144,10 @@ class WeatherReading:
     def precipitation_at(self, now: float) -> tuple[bool, Optional[float]]:
         return precipitation_at(self.minutes, self.minutes_end, now)
 
+    def precipitation_ahead(self, now: float) -> bool:
+        """Whether the chart shows precipitation anywhere after `now` (within its span)."""
+        return now < self.minutes_end and any(start > now and intensity > 0.0 for start, intensity in self.minutes)
+
     def falling_condition_at(self, now: float) -> str:
         """The condition while the chart shows precipitation: the chart's own type for `now`
         (what the app titles "Snow for the next hour"), else the current condition."""
