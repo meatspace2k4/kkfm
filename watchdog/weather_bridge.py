@@ -4,6 +4,8 @@ The dashboard's hourly profile does the same while it is on screen (dashboard.py
 this is that loop alone, for a LaunchAgent on the Mac that has the Weather app:
 
   the source (weather.py: the macOS Weather app's data, mirrored by hourly/mac/WeatherWatch.swift)
+    + NOAA MRMS radar precipitation type (mrms.py, run on the player's machine over ssh): radar
+      snow overrides the app's state; with no app reading from the last two hours, the radar alone
     -> WeatherFollower (which state to send, and when: only one the player is not already in)
     -> GET /control/weather/<sunny|rainy|snowy> on the player
 
@@ -18,6 +20,8 @@ changes with no new data from the app.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import socket
 import subprocess
 import sys
@@ -26,9 +30,63 @@ import urllib.request
 from typing import Callable, Optional
 
 try:
-    from .weather import WeatherFollower, WeatherSource, make_source
+    from .weather import RAINY, SNOWY, SUNNY, WeatherFollower, WeatherSource, make_source
 except ImportError:   # run as a script beside weather.py
-    from weather import WeatherFollower, WeatherSource, make_source  # type: ignore[no-redef]
+    from weather import RAINY, SNOWY, SUNNY, WeatherFollower, WeatherSource, make_source  # type: ignore[no-redef]
+
+# The app's reading counts for two hours (its hourly forecast carries the next hour's changeover
+# with no new data); older (the app's cache stuck, as on 2026-11-20 when it sat at 00:09 for ten
+# hours) it is not available and the radar decides.
+APP_STALE_S = 7200.0
+# A radar reading counts for 15 minutes (MRMS publishes every 2).
+RADAR_STALE_S = 900.0
+MRMS_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mrms.py")
+
+
+class Radar:
+    """NOAA MRMS precipitation type at the location (mrms.py), fetched on the player's machine
+    over ssh (the script piped to its python3) or here without one, every `every` seconds.
+    latest(now) -> "snow" | "rain" | "none", or None with no reading from the last 15 minutes."""
+
+    def __init__(self, latlon: str, ssh_target: Optional[str] = None, radius: int = 2,
+                 every: float = 120.0, say: Optional[Callable[[str], None]] = None,
+                 run: Optional[Callable[[list[str]], str]] = None) -> None:
+        self.lat, self.lon = latlon.split("/")
+        self.ssh_target, self.radius, self.every = ssh_target, radius, every
+        self.say = say or log
+        self.run = run or self._run
+        self.next = 0.0
+        self.reading: Optional[dict] = None
+        self.error: Optional[str] = None
+
+    def _run(self, args: list[str]) -> str:
+        if self.ssh_target:
+            cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", self.ssh_target,
+                   "nice", "-n", "19", "python3", "-", *args]
+        else:
+            cmd = [sys.executable, MRMS_SCRIPT, *args]
+        with open(MRMS_SCRIPT, "rb") as script:
+            return subprocess.run(cmd, stdin=script, capture_output=True, timeout=90).stdout.decode()
+
+    def latest(self, now: float) -> Optional[str]:
+        if now >= self.next:
+            self.next = now + self.every
+            try:
+                r = json.loads(self.run([self.lat, self.lon, str(self.radius)]).strip().splitlines()[-1])
+            except Exception as e:   # ssh down, a timeout, no output
+                r = {"error": f"{type(e).__name__}: {e}"}
+            if "error" in r:
+                if r["error"] != self.error:
+                    self.say(f"radar: {r['error']}")
+                    self.error = r["error"]
+            else:
+                if self.reading is None or r["precip"] != self.reading["precip"]:
+                    self.say(f"radar: {r['precip']} as of {time.strftime('%Y-%m-%d %H:%M', time.localtime(r['time']))}"
+                             f" (codes {r['kinds']})")
+                self.reading, self.error = r, None
+        if self.reading is None or now - self.reading["time"] > RADAR_STALE_S:
+            return None
+        return self.reading["precip"]
 
 
 def log(text: str) -> None:
@@ -85,8 +143,8 @@ class Bridge:
     player has not acknowledged it. What it reads and sends is logged as it changes."""
 
     def __init__(self, source: WeatherSource, push: Callable[[str], tuple[bool, str]],
-                 say: Callable[[str], None] = log) -> None:
-        self.source, self.push, self.say = source, push, say
+                 say: Callable[[str], None] = log, radar: Optional[Radar] = None) -> None:
+        self.source, self.push, self.say, self.radar = source, push, say, radar
         self.follower = WeatherFollower()
         self.reading = None
         self.state: Optional[str] = None
@@ -101,11 +159,22 @@ class Bridge:
                 self.say(f"{r.source}: {r.condition} as of {time.strftime('%Y-%m-%d %H:%M', time.localtime(r.as_of))}")
             self.reading = r if r is not None else self.reading
         r = self.reading
-        if r is None:
+        app = r.hourly_at(now) if r is not None and now - r.as_of <= APP_STALE_S else None
+        radar = self.radar.latest(now) if self.radar else None
+        # Radar snow supersedes the app (it rains at the airport while it snows up the hill, and
+        # the app follows the valley); otherwise the app; with no current app reading, the radar.
+        if radar == "snow":
+            state, why = SNOWY, "radar snow"
+        elif app is not None:
+            state, why = app, "app"
+        elif radar is not None:
+            state, why = (RAINY if radar == "rain" else SUNNY), f"radar {radar}, no current app reading"
+        else:
+            state, why = None, "no current app or radar reading"
+        if state is None and r is None:
             return
-        state = r.hourly_at(now)
         if state != self.state:
-            self.say(f"state now: {state if state is not None else 'unknown (the data does not cover this hour)'}")
+            self.say(f"state now: {state if state is not None else 'unknown'} ({why})")
             self.state = state
         # (a state already pending is left to its retry time: on_reading starts the wait over)
         if state != self.follower.pending:
@@ -130,13 +199,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--port", type=int, default=8791, help="the hourly player's HTTP port")
     ap.add_argument("--weather-source", default="weather-app")
     ap.add_argument("--interval", type=float, default=2.0, help="seconds between ticks")
+    ap.add_argument("--no-radar", action="store_true", help="the app alone, no MRMS radar")
+    ap.add_argument("--radar-radius", type=int, default=2,
+                    help="MRMS cells around the location that count (2: a 5x5 box, about 4 km)")
     args = ap.parse_args(argv)
     source = make_source(args.weather_source)
     if source is None:
         print("no weather source", file=sys.stderr)
         return 2
     tunnel = Tunnel(args.ssh, args.port) if args.ssh else None
-    bridge = Bridge(source, http_push(tunnel.base if tunnel else (lambda: f"http://127.0.0.1:{args.port}")))
+    latlon = getattr(source, "latlon", None)
+    radar = None if args.no_radar or not latlon else Radar(latlon, args.ssh, args.radar_radius)
+    bridge = Bridge(source, http_push(tunnel.base if tunnel else (lambda: f"http://127.0.0.1:{args.port}")),
+                    radar=radar)
     log(f"weather bridge: {source.name} -> the player at {args.ssh or 'this machine'} port {args.port}")
     try:
         while True:
