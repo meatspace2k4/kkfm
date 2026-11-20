@@ -1,7 +1,7 @@
 # KKFM Aircheck - AI Agent Instructions
 
 ## Big picture
-- C++ player in aircheck_pi.cpp handles decoding/mixing (Decoder/Mixer/Track), scheduling (Radio/CalendarManager), and overlays via plan_overlay().
+- C++ player in acnh_aircheck_pi.cpp handles decoding/mixing (Decoder/Mixer/Track), scheduling (Radio/CalendarManager), and overlays via plan_overlay().
 - Python watchdog in watchdog/ monitors player logs and assets; log lines are the interface between C++ and watchdog.
 - Asset pipeline: CSV schedule data in radio/data/*.csv + BWAV files are packed by radio/packer.py into assets.h/assets_blob.bin used by the C++ player.
 
@@ -12,7 +12,7 @@
 
 ## Workflows (non-obvious)
 - C++ tests (mocked hardware): g++ -DKKFM_TEST_MODE tests_cpp.cpp -o tests_cpp && ./tests_cpp
-- Build player: g++ -O2 -pthread aircheck_pi.cpp -o aircheck_pi -lasound
+- Build player: g++ -O2 -pthread acnh_aircheck_pi.cpp -o acnh_aircheck_pi -lasound
 - Watchdog tests: python3 -m pytest watchdog/tests/
 - Radio/packer tests: python3 -m pytest radio/tests/
 - Watchdog self-test: python3 watchdog_run.py selftest
@@ -25,6 +25,6 @@
 - Low-RAM target (Pi). Avoid heavy runtime dependencies; see .vscode/settings.json exclusions.
 
 ## Ops & integration points
-- Systemd: aircheck.service is the player; watchdog can auto-restart it (see watchdog_run.py and watchdog/README.md). Polkit rule helper: watchdog/setup_restart_without_sudo.sh.
-- Env vars used by player: AIRCHECK_DEBUG, AIRCHECK_STREAM_PORT, AIRCHECK_AUDIO_DEVICE, AIRCHECK_DISABLE_DAC.
+- Systemd: acnh-aircheck.service is the player; watchdog can auto-restart it (see watchdog_run.py and watchdog/README.md). Polkit rule helper: watchdog/setup_restart_without_sudo.sh.
+- Env vars used by player: ACNH_DEBUG, ACNH_STREAM_PORT, ACNH_AUDIO_DEVICE, ACNH_DISABLE_DAC.
 - FM transmitter integration: Arduino sketch in radio/si4713_sketch/ and watchdog tx monitor.

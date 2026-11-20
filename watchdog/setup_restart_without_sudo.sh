@@ -4,17 +4,17 @@ set -euo pipefail
 # Allow a specific user to restart the watchdog services without sudo.
 #
 # This installs a Polkit rule for systemd's "manage-units" action limited to:
-#   - aircheck-watchdog.service
-#   - aircheck-tx-watchdog.service
+#   - acnh-aircheck-watchdog.service
+#   - acnh-aircheck-tx-watchdog.service
 #
 # Usage:
 #   sudo ./watchdog/setup_restart_without_sudo.sh <username>
-#   sudo ./watchdog/setup_restart_without_sudo.sh <username> 1   # also allow restarting aircheck.service
+#   sudo ./watchdog/setup_restart_without_sudo.sh <username> 1   # also allow restarting acnh-aircheck.service
 #
 # After installation, the user can run:
-#   systemctl restart aircheck-watchdog.service
-#   systemctl restart aircheck-tx-watchdog.service
-# If you pass a second arg of "1", it also allows: aircheck.service
+#   systemctl restart acnh-aircheck-watchdog.service
+#   systemctl restart acnh-aircheck-tx-watchdog.service
+# If you pass a second arg of "1", it also allows: acnh-aircheck.service
 
 if [[ ${EUID:-0} -ne 0 ]]; then
   echo "ERROR: run as root (use sudo)" >&2
@@ -37,7 +37,7 @@ RULE_PATH="/etc/polkit-1/rules.d/49-kkfm-watchdog-restart.rules"
 
 EXTRA_UNIT_JS=""
 if [[ "$ALLOW_MAIN" == "1" ]]; then
-  EXTRA_UNIT_JS=' || unit === "aircheck.service"'
+  EXTRA_UNIT_JS=' || unit === "acnh-aircheck.service"'
 fi
 
 cat >"$RULE_PATH" <<EOF
@@ -45,7 +45,7 @@ cat >"$RULE_PATH" <<EOF
 polkit.addRule(function(action, subject) {
   if (action.id === "org.freedesktop.systemd1.manage-units" && subject.user === "$TARGET_USER") {
     var unit = action.lookup("unit");
-    if (unit === "aircheck-watchdog.service" || unit === "aircheck-tx-watchdog.service"$EXTRA_UNIT_JS) {
+    if (unit === "acnh-aircheck-watchdog.service" || unit === "acnh-aircheck-tx-watchdog.service"$EXTRA_UNIT_JS) {
       return polkit.Result.YES;
     }
   }
@@ -58,8 +58,8 @@ echo "Installed polkit rule: $RULE_PATH"
 echo "You may need to restart polkit: systemctl restart polkit (usually not required)"
 
 echo "Test (as $TARGET_USER):"
-echo "  systemctl restart aircheck-watchdog.service"
-echo "  systemctl restart aircheck-tx-watchdog.service"
+echo "  systemctl restart acnh-aircheck-watchdog.service"
+echo "  systemctl restart acnh-aircheck-tx-watchdog.service"
 if [[ "$ALLOW_MAIN" == "1" ]]; then
-  echo "  systemctl restart aircheck.service"
+  echo "  systemctl restart acnh-aircheck.service"
 fi

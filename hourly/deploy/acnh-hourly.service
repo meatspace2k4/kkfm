@@ -1,0 +1,34 @@
+# /etc/systemd/system/acnh-hourly.service
+[Unit]
+Description=KKFM hourly BGM (stream only, port 8791)
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/kkfm-usb
+[Service]
+Type=simple
+User=svc-kkfm
+Group=svc-kkfm
+SupplementaryGroups=svc-home
+WorkingDirectory=/mnt/kkfm-usb/kkfm/hourly-build
+ExecStart=/mnt/kkfm-usb/kkfm/hourly-build/hourly_bgm
+Environment=ACNH_STREAM_PORT=8791
+Environment=ACNH_LOCALHOST_ONLY=1
+Environment=ACNH_DISABLE_DAC=1
+Environment=ACNH_STREAM_PREBUFFER_MS=4000
+# Weather only changes through /control/weather (pushed by the dashboard weather source).
+Environment=HOURLY_WEATHER_SOURCE=none
+# Audio first: other services yield to the player. svc-kkfm cannot raise its own threads to
+# realtime, so systemd sets it before dropping to the account.
+Nice=-10
+IOSchedulingClass=realtime
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+LimitRTPRIO=95
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal
+[Install]
+WantedBy=multi-user.target

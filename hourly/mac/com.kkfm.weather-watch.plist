@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent for kkfm-weather-watch (Full Disk Access is granted to that binary). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.kkfm.weather-watch</string>
+  <key>Program</key><string>/Users/johusha/.local/bin/kkfm-weather-watch</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/tmp/kkfm-weather-watch.log</string>
+  <key>StandardErrorPath</key><string>/tmp/kkfm-weather-watch.log</string>
+</dict>
+</plist>

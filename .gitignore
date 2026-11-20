@@ -5,17 +5,24 @@
 *.dylib
 *.bin
 aircheck_pi
+acnh_aircheck_pi
+acnh_aircheck_pi.new
+hourly_bgm
 
 # generated assets (proprietary-derived; never commit)
 assets.h
 assets.S
 assets_blob.bin
+hourly_assets_blob.bin
+hourly_assets.S
+hourly/hourly_assets.h
 
 # packer tooling and its inputs (supplied out of band)
 radio/packer.py
 radio/data/
 radio/Sound/
 *.bwav
+hourly/Stream
 
 # tests (kept on disk, not shipped)
 radio/tests/
@@ -23,16 +30,49 @@ watchdog/tests/
 watchdog/test_runner.py
 tests_cpp.cpp
 test_mocks.h
+hourly/out/
+
+# backups
+bkp_*.cpp
+bkp_*.py
+bkp_*.h
+*.bak
+*.backup
+
+# dev tools (private, not for distribution)
+sitecustomize.py
+
+# runtime outputs & logs
+watchdog/out/
+watchdog/out-hourly/
+watchdog/out_scan_check/
+*.jsonl
+*.log
 
 # python
 __pycache__/
 *.py[cod]
+*$py.class
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 *.egg-info/
+*.egg
+dist/
+build/
+
+# environment & secrets
+.env
+.env.*
+*.pem
+*.key
+secrets/
 
 # editors / os
 *.swp
+*.swo
 *~
 .vscode/
 .idea/
 .DS_Store
+._*

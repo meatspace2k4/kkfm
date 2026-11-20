@@ -26,7 +26,7 @@ except Exception:  # pragma: no cover
 # The TX watchdog should not attempt Arduino recovery if the main audio service
 # is intentionally stopped for maintenance. This prevents false positives.
 
-MAIN_SERVICE_UNIT = os.environ.get("WATCHDOG_MAIN_SERVICE_UNIT", "aircheck.service")
+MAIN_SERVICE_UNIT = os.environ.get("WATCHDOG_MAIN_SERVICE_UNIT", "acnh-aircheck.service")
 
 
 def _is_main_service_running() -> bool:
