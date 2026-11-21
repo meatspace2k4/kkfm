@@ -809,9 +809,11 @@ def main() -> int:
     )
     p.add_argument(
         "--weather-source",
-        default="weather-app",
-        help="Hourly profile: where the player's weather comes from (weather-app: the macOS Weather "
-             "app via hourly/mac/WeatherWatch; none: only the 1/2/3 keys)",
+        default="none",
+        help="Hourly profile: where the dashboard takes the player's weather from. Default none: only "
+             "the 1/2/3 keys; the weather bridge (com.kkfm.weather-bridge) keeps the player's weather. "
+             "A dashboard following a source as well pushed its own state over the bridge's "
+             "(2026-11-20: Sunny from the stale weather-app mirror while it rained)",
     )
     p.set_defaults(func=cmd_dashboard)
 
