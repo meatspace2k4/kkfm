@@ -131,8 +131,21 @@ public:
         std::unique_lock<std::mutex> l(mut);
         cv.wait_for(l, std::chrono::milliseconds(timeout_ms), [&] { return closed || write_pos > cursor; });
         if (write_pos <= cursor) return 0;
-        uint64_t oldest = write_pos > data.size() ? write_pos - data.size() : 0;
-        if (cursor < oldest) cursor = chunk_starts.empty() ? oldest : chunk_starts.front();
+        // A client that has drifted far behind the writer (all-night listening: the player's clock
+        // runs slower than the encoder's) jumps once to a chunk start a few seconds behind live.
+        // Jumping to the oldest chunk instead left it parked at the ring's tail, where it was
+        // overrun again and again: repeated skips, heard as stutter.
+        const uint64_t max_lag = data.size() / 2;          // ~15 s at the default 30 s ring
+        const uint64_t resync_back = data.size() / 10;     // ~3 s cushion after the jump
+        if (write_pos - cursor > max_lag) {
+            uint64_t target = write_pos > resync_back ? write_pos - resync_back : 0;
+            uint64_t best = write_pos;
+            for (auto it = chunk_starts.rbegin(); it != chunk_starts.rend(); ++it) {
+                best = *it;
+                if (*it <= target) break;
+            }
+            cursor = best;
+        }
         size_t n = (size_t)std::min<uint64_t>(max, write_pos - cursor);
         for (size_t i = 0; i < n; ++i) out[i] = data[(cursor + i) % data.size()];
         cursor += n;
