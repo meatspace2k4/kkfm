@@ -501,7 +501,12 @@ def open_hls_source(sid):
 # (WXXX "artworkURL_<w>x"). Segments are cut on ADTS frame boundaries; a producer runs only
 # while a player keeps polling.
 HLS_SEGMENT_S = float(os.environ.get("SMAPI_HLS_SEGMENT_S", "2"))
-HLS_WINDOW = 8
+# Playlist window and segment retention. An all-night listener drifts behind the live edge
+# (rebuffers, clock drift); with only 8 segments (16 s) kept, its next segment fell out of the
+# window and 404'd/skipped, which is the morning stutter. Keep 15 min of segments fetchable and
+# list 2 min of them, so a lagging player keeps getting contiguous audio.
+HLS_WINDOW = int(os.environ.get("SMAPI_HLS_WINDOW", "60"))
+HLS_KEEP = max(HLS_WINDOW, int(os.environ.get("SMAPI_HLS_KEEP", "450")))
 ART_SIZES = (640, 1280)
 HLS_IDLE_S = 60
 # The segments' PRIV timestamp (90 kHz) counted up from the producer's start without limit; past
@@ -544,7 +549,7 @@ def id3_tag(pts90k, title, artist, art):
 class HlsStream:
     def __init__(self, sid):
         self.sid = sid
-        self.segments = collections.deque(maxlen=HLS_WINDOW)  # (seq, duration, bytes, discontinuity seq)
+        self.segments = collections.deque(maxlen=HLS_KEEP)  # (seq, duration, bytes, discontinuity seq)
         self.cond = threading.Condition()
         self.last_access = 0.0
         self.thread = None
@@ -611,7 +616,7 @@ class HlsStream:
         self.touch()
         with self.cond:
             self.cond.wait_for(lambda: len(self.segments) >= 3, timeout=15)
-            segs = list(self.segments)
+            segs = list(self.segments)[-HLS_WINDOW:]
         if not segs:
             return None
         lines = ["#EXTM3U", "#EXT-X-VERSION:3",
@@ -629,9 +634,11 @@ class HlsStream:
     def segment(self, seq):
         self.touch()
         with self.cond:
-            for s, _, data, _ in self.segments:
-                if s == seq:
-                    return data
+            if not self.segments:
+                return None
+            k = seq - self.segments[0][0]
+            if 0 <= k < len(self.segments) and self.segments[k][0] == seq:
+                return self.segments[k][2]
         return None
 
 
