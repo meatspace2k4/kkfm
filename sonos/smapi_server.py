@@ -32,6 +32,7 @@ UPSTREAM_HOST = os.environ.get("SMAPI_UPSTREAM_HOST", "localhost")
 KKFM_PORT = int(os.environ.get("ACNH_STREAM_PORT", "9000"))
 AUDIO_BIND = os.environ.get("SMAPI_AUDIO_BIND", "0.0.0.0")
 AUDIO_PORT = int(os.environ.get("SMAPI_AUDIO_PORT", "8777"))
+STREAM_HOST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stream_host")
 MP3_BITRATE = os.environ.get("SMAPI_MP3_BITRATE", "192k")
 AAC_BITRATE = os.environ.get("SMAPI_AAC_BITRATE", "192k")
 ART_URL = os.environ.get("SMAPI_ART_URL", "")
@@ -68,8 +69,7 @@ JACKET_ALIASES = {"kekebily": "kekebilly", "rocknroll": "rockenroll", "town": "d
 _jackets = {}
 _art_files = set()
 _journal_art = {}
-_pending_track = {}
-# Watchdog snapshots (same data the TUI dashboard shows).
+_pending_track = {}# Watchdog snapshots (same data the TUI dashboard shows).
 STATUS_FILES = {
     "kkfm": os.environ.get("SMAPI_KKFM_STATUS", "/run/kkfm-watchdog/log_status.json"),
     "hourly": os.environ.get("SMAPI_HOURLY_STATUS", "/run/kkfm-hourly/log_status.json"),
@@ -128,8 +128,27 @@ def _source_ip_toward(target):
         s.close()
 
 
+def _stream_host():
+    """The address the players reach the audio port at, when it is not one of the Pi's own:
+    SMAPI_STREAM_HOST, or the first line of the file stream_host beside this script. The Pi
+    behind a second router has no address the players can reach; they reach that router's
+    outer address, where it forwards the audio port to the Pi."""
+    host = os.environ.get("SMAPI_STREAM_HOST", "").strip()
+    if host:
+        return host
+    try:
+        with open(STREAM_HOST_FILE) as f:
+            return f.readline().strip()
+    except OSError:
+        return ""
+
+
 def lan_ip():
-    """Pi address on the interface that reaches the Sonos players (cached 10 min)."""
+    """Address the players fetch the audio from: the configured one (_stream_host), else the
+    Pi's on the interface that reaches the Sonos players (cached 10 min)."""
+    host = _stream_host()
+    if host:
+        return host
     with _lan_lock:
         if _lan_cache["ip"] and time.time() - _lan_cache["at"] < 600:
             return _lan_cache["ip"]
@@ -447,7 +466,7 @@ def open_source(sid):
     if sid == "kkfm":
         # -seekable 0: the :9000 server answers Range requests with only the WAV header.
         proc = subprocess.Popen(
-            ["nice", "-n", "19", "ffmpeg", "-nostdin", "-loglevel", "error", "-threads", "1", "-seekable", "0",
+            ["ffmpeg", "-nostdin", "-loglevel", "error", "-seekable", "0",
              "-i", f"http://{UPSTREAM_HOST}:{KKFM_PORT}/stream.wav",
              "-c:a", "libmp3lame", "-b:a", MP3_BITRATE, "-f", "mp3", "-"],
             stdout=subprocess.PIPE)
@@ -460,12 +479,21 @@ def open_source(sid):
     return upstream, upstream.close
 
 
+# The players run on the Pi's clock and the Sonos plays on its own. Each second of source
+# audio is stretched to (rate / (rate - HLS_DRIFT_HZ)) seconds (~208 ppm at 48 kHz, far below
+# hearing), so the stream always carries more audio than the Sonos plays and its buffer never
+# drains; the extra only moves it behind the live edge, which HLS_KEEP covers.
+HLS_SOURCE_RATE = 48000
+HLS_DRIFT_HZ = 10
+
+
 def open_hls_source(sid):
     """AAC (ADTS) byte source for HLS; Sonos rejects MP3 packed-audio segments."""
     src = (f"http://{UPSTREAM_HOST}:{KKFM_PORT}/stream.wav" if sid == "kkfm"
            else f"http://{UPSTREAM_HOST}:{RADIO_PORT}/radio.mp3")
     proc = subprocess.Popen(
-        ["nice", "-n", "19", "ffmpeg", "-nostdin", "-loglevel", "error", "-threads", "1", "-seekable", "0", "-i", src,
+        ["ffmpeg", "-nostdin", "-loglevel", "error", "-seekable", "0", "-i", src,
+         "-af", f"asetrate={HLS_SOURCE_RATE - HLS_DRIFT_HZ},aresample={HLS_SOURCE_RATE}",
          "-c:a", "aac", "-b:a", AAC_BITRATE, "-f", "adts", "-"],
         stdout=subprocess.PIPE)
 
@@ -480,10 +508,20 @@ def open_hls_source(sid):
 # ID3v2.4 tag carrying the MPEG-TS timestamp (PRIV), the title (TIT2) and the artwork
 # (WXXX "artworkURL_<w>x"). Segments are cut on ADTS frame boundaries; a producer runs only
 # while a player keeps polling.
-HLS_SEGMENT_S = float(os.environ.get("SMAPI_HLS_SEGMENT_S", "6"))   # long segments: the player keeps ~18 s buffered
-HLS_WINDOW = 10
+HLS_SEGMENT_S = float(os.environ.get("SMAPI_HLS_SEGMENT_S", "2"))
+# Playlist window and segment retention. An all-night listener drifts behind the live edge
+# (rebuffers, clock drift); with only 8 segments (16 s) kept, its next segment fell out of the
+# window and 404'd/skipped, which is the morning stutter. Keep 15 min of segments fetchable and
+# list 2 min of them, so a lagging player keeps getting contiguous audio.
+HLS_WINDOW = int(os.environ.get("SMAPI_HLS_WINDOW", "60"))
+HLS_KEEP = max(HLS_WINDOW, int(os.environ.get("SMAPI_HLS_KEEP", "450")))
 ART_SIZES = (640, 1280)
 HLS_IDLE_S = 60
+# The segments' PRIV timestamp (90 kHz) counted up from the producer's start without limit; past
+# 2^31 (6.6 h) or 2^32 (13.3 h) the Sonos stuttered until the stream was restarted, which set it
+# back to 0. It wraps here before 2^31, with an EXT-X-DISCONTINUITY so the player restarts its
+# timeline at the wrap instead of reading the small value as out of order.
+PTS_WRAP = 1 << 31
 _AAC_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
 
 
@@ -519,7 +557,7 @@ def id3_tag(pts90k, title, artist, art):
 class HlsStream:
     def __init__(self, sid):
         self.sid = sid
-        self.segments = collections.deque(maxlen=HLS_WINDOW)  # (seq, duration, bytes)
+        self.segments = collections.deque(maxlen=HLS_KEEP)  # (seq, duration, bytes, discontinuity seq)
         self.cond = threading.Condition()
         self.last_access = 0.0
         self.thread = None
@@ -536,7 +574,8 @@ class HlsStream:
     def _run(self):
         src, close = open_hls_source(self.sid)
         print(f"[hls] {self.sid} producer started", flush=True)
-        buf, frames, seg_samples, rate, pts = b"", [], 0, 48000, 0
+        buf, frames, seg_samples, rate, pts, epoch_samples = b"", [], 0, 48000, 0, 0
+        dseq = 0   # bumped each time the timestamp wraps (PTS_WRAP)
         try:
             while time.time() - self.last_access < HLS_IDLE_S:
                 chunk = src.read(8192)
@@ -567,10 +606,13 @@ class HlsStream:
                         title = now_playing(self.sid) or STREAMS[self.sid][0]
                         data = id3_tag(pts, title, STREAMS[self.sid][0], art_url(self.sid)) + b"".join(frames)
                         with self.cond:
-                            self.segments.append((self.seq, seg_samples / rate, data))
+                            self.segments.append((self.seq, seg_samples / rate, data, dseq))
                             self.seq += 1
                             self.cond.notify_all()
-                        pts += seg_samples * 90000 // rate
+                        epoch_samples += seg_samples
+                        pts = epoch_samples * 90000 // rate
+                        if pts >= PTS_WRAP:
+                            epoch_samples, pts, dseq = 0, 0, dseq + 1
                         frames, seg_samples = [], 0
                 buf = buf[i:]
         except OSError:
@@ -582,23 +624,30 @@ class HlsStream:
     def playlist(self):
         self.touch()
         with self.cond:
-            self.cond.wait_for(lambda: len(self.segments) >= 1, timeout=10)
-            segs = list(self.segments)
+            self.cond.wait_for(lambda: len(self.segments) >= 3, timeout=15)
+            segs = list(self.segments)[-HLS_WINDOW:]
         if not segs:
             return None
         lines = ["#EXTM3U", "#EXT-X-VERSION:3",
-                 f"#EXT-X-TARGETDURATION:{int(max(d for _, d, _ in segs)) + 1}",
-                 f"#EXT-X-MEDIA-SEQUENCE:{segs[0][0]}"]
-        for seq, dur, _ in segs:
+                 f"#EXT-X-TARGETDURATION:{int(max(s[1] for s in segs)) + 1}",
+                 f"#EXT-X-MEDIA-SEQUENCE:{segs[0][0]}",
+                 f"#EXT-X-DISCONTINUITY-SEQUENCE:{segs[0][3]}"]
+        prev = segs[0][3]
+        for seq, dur, _, dseq in segs:
+            if dseq != prev:
+                lines.append("#EXT-X-DISCONTINUITY")   # the timestamp wrapped
+                prev = dseq
             lines += [f"#EXTINF:{dur:.3f},", f"{self.sid}/{seq}.aac"]
         return "\n".join(lines) + "\n"
 
     def segment(self, seq):
         self.touch()
         with self.cond:
-            for s, _, data in self.segments:
-                if s == seq:
-                    return data
+            if not self.segments:
+                return None
+            k = seq - self.segments[0][0]
+            if 0 <= k < len(self.segments) and self.segments[k][0] == seq:
+                return self.segments[k][2]
         return None
 
 
