@@ -149,11 +149,10 @@ class WeatherReading:
         return now < self.minutes_end and any(start > now and intensity > 0.0 for start, intensity in self.minutes)
 
     def falling_condition_at(self, now: float) -> str:
-        """The condition while the chart shows precipitation: the chart's own type for `now`
-        (what the app titles "Snow for the next hour"), else the current condition."""
-        for start, end, kind in self.kinds:
-            if start <= now < end and kind in WK2_PRECIP_CONDITION:
-                return WK2_PRECIP_CONDITION[kind]
+        """The condition while the chart shows precipitation: the current condition. (The chart
+        summary's field taken as rain/snow is not one: 2 on 2026-11-17 with snow, 1 on 11-19
+        morning with light rain, 2 again on 11-20 17:03 with "Possible Light Rain" and the
+        current condition Drizzle, which played Snowy.)"""
         return self.condition
 
     def hourly_at(self, now: float) -> Optional[str]:

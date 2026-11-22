@@ -75,14 +75,22 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.sent, [RAINY, RAINY])
         self.assertEqual(sum("not sent" in s for s in self.said), 1)
 
-    def test_the_charts_snow_type_wins_over_a_rain_condition(self):
+    def test_falling_with_a_snow_condition_is_snowy(self):
         t0 = 10 * HOUR
         chart = ((t0, 2.0),)
-        r = WeatherReading(condition="Rain", as_of=t0, source="fake", minutes=chart, minutes_end=t0 + 3600,
-                           hours=((t0, "Rain"),), kinds=((t0, t0 + 3600, 2),))
+        r = WeatherReading(condition="Snow", as_of=t0, source="fake", minutes=chart, minutes_end=t0 + 3600,
+                           hours=((t0, "Rain"),), kinds=((t0, t0 + 3600, 1),))
         self.src.give(r)
         self.bridge.tick(t0 + 60)
         self.assertEqual(self.sent, [SNOWY])
+
+    def test_the_summary_field_does_not_make_drizzle_snowy(self):
+        t0 = 10 * HOUR       # 2026-11-20 17:03: summary field 2, Drizzle, "Possible Light Rain"
+        r = WeatherReading(condition="Drizzle", as_of=t0, source="fake", minutes=((t0, 0.55),), minutes_end=t0 + 3600,
+                           hours=((t0, "Snow"),), kinds=((t0, t0 + 3600, 2),))
+        self.src.give(r)
+        self.bridge.tick(t0 + 60)
+        self.assertEqual(self.sent, [RAINY])
 
     def test_a_rain_type_chart_stays_rainy(self):
         t0 = 10 * HOUR
